@@ -1,8 +1,8 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
 import { LidarDensityWorker, OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
-import { addOrUpdateTileOverlay, clearAllOverlays } from "@/overlap/overlay";
-import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters } from "@/overlap/types";
+import { addOrUpdateTileOverlay, clearAllOverlays, clearRunOverlays } from "@/overlap/overlay";
+import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters, TileResult } from "@/overlap/types";
 import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
@@ -68,6 +68,10 @@ type ExactPartitionPreview = {
 };
 
 const TERRAIN_SPLIT_DEBUG = true;
+const HEATMAP_GRADIENT = "linear-gradient(90deg, rgb(0 0 255) 0%, rgb(0 255 255) 25%, rgb(0 255 0) 50%, rgb(255 255 0) 75%, rgb(255 0 0) 100%)";
+const OVERLAY_SCALE_LOWER_QUANTILE = 0.05;
+const OVERLAY_SCALE_UPPER_QUANTILE = 0.95;
+const DENSITY_OVERLAY_MAX = 100;
 
 function splitPerfNow() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -267,6 +271,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const globalRunIdRef = useRef<string | null>(null);
   // Per-polygon, per-tile stats cache for correct cross-polygon crediting - Option B core feature
   const perPolyTileStatsRef = useRef<Map<string, Map<string, PolygonTileStats>>>(new Map());
+  const cameraTileResultsRef = useRef<Map<string, TileResult>>(new Map());
+  const lidarTileResultsRef = useRef<Map<string, TileResult>>(new Map());
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
@@ -317,16 +323,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   }, [getPerPolygonParams, mapRef]);
 
   // Helper function to generate user-friendly polygon names
-  const getPolygonDisplayName = useCallback((polygonId: string): { displayName: string; shortId: string } => {
-    if (polygonId === '__POSES__') return { displayName: 'Imported Poses Area', shortId: 'poses' };
+  const getPolygonDisplayName = useCallback((polygonId: string): string => {
+    if (polygonId === '__POSES__') return 'Imported Poses Area';
     const api = mapRef.current;
-    if (!api?.getPolygonsWithIds) return { displayName: 'Unknown', shortId: polygonId.slice(0, 8) };
+    if (!api?.getPolygonsWithIds) return 'Unknown';
     const polygons = api.getPolygonsWithIds();
     const index = polygons.findIndex((p: any) => (p.id || 'unknown') === polygonId);
-    return {
-      displayName: index >= 0 ? `Polygon ${index + 1}` : 'Unknown',
-      shortId: polygonId.slice(0, 8)
-    };
+    return index >= 0 ? `Area ${index + 1}` : 'Unknown';
   }, [mapRef]);
 
   const applyTerrainPartitionOption = useCallback(async (
@@ -647,6 +650,62 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       histogram: mergedHistogram
     } as any;
   }, [tailAreaAcres]);
+
+  const overlayRangeForStats = useCallback((stats: GSDStats | null, metricKind: MetricKind) => {
+    if (!stats || !(stats.count > 0) || !Number.isFinite(stats.min) || !Number.isFinite(stats.max)) return null;
+    let min = histogramQuantile(stats, OVERLAY_SCALE_LOWER_QUANTILE);
+    let max = Math.max(min + 1e-6, histogramQuantile(stats, OVERLAY_SCALE_UPPER_QUANTILE));
+
+    if (metricKind === 'density') {
+      max = Math.min(DENSITY_OVERLAY_MAX, max);
+      if (!(min < max)) {
+        min = Math.max(0, Math.min(stats.min, max - 1e-6));
+      }
+      if (!(min < max)) {
+        min = 0;
+      }
+    }
+
+    return { min, max: Math.max(min + 1e-6, max) };
+  }, []);
+
+  const redrawAnalysisOverlays = useCallback((statsOverride?: OverallMetricStats) => {
+    const map = mapRef.current?.getMap?.();
+    const runId = globalRunIdRef.current;
+    if (!map || !map.isStyleLoaded?.() || !runId) return;
+
+    clearRunOverlays(map, runId);
+
+    const nextStats = statsOverride ?? overallStats;
+    const gsdRange = overlayRangeForStats(nextStats.gsd, 'gsd');
+    const densityRange = overlayRangeForStats(nextStats.density, 'density');
+
+    for (const result of cameraTileResultsRef.current.values()) {
+      if (showOverlap) addOrUpdateTileOverlay(map, result, { kind: "overlap", runId, opacity });
+      if (showGsd) {
+        addOrUpdateTileOverlay(map, result, {
+          kind: "gsd",
+          runId,
+          opacity,
+          gsdMin: gsdRange?.min,
+          gsdMax: gsdRange?.max,
+        });
+      }
+    }
+
+    for (const result of lidarTileResultsRef.current.values()) {
+      if (showOverlap) addOrUpdateTileOverlay(map, result, { kind: "pass", runId, opacity });
+      if (showGsd) {
+        addOrUpdateTileOverlay(map, result, {
+          kind: "density",
+          runId,
+          opacity,
+          densityMin: densityRange?.min,
+          densityMax: densityRange?.max,
+        });
+      }
+    }
+  }, [mapRef, opacity, overallStats, overlayRangeForStats, showGsd, showOverlap]);
 
   // Re-bin the stored histogram for display so the charts stay readable while
   // the underlying stats remain detailed enough for scoring.
@@ -1693,6 +1752,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       clearAllOverlays(map);
       globalRunIdRef.current = `${now}`;
       perPolyTileStatsRef.current.clear();
+      cameraTileResultsRef.current.clear();
+      lidarTileResultsRef.current.clear();
     }
     const runId = globalRunIdRef.current ?? `${now}`;
     if (!globalRunIdRef.current) globalRunIdRef.current = runId;
@@ -1752,6 +1813,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           if (map.getLayer(id)) map.removeLayer(id);
           if (map.getSource(id)) map.removeSource(id);
         } catch {}
+      }
+    };
+
+    const pruneCachedTileResults = (cache: Map<string, TileResult>, neededTileKeys: Set<string>) => {
+      for (const key of Array.from(cache.keys())) {
+        if (!neededTileKeys.has(key)) cache.delete(key);
       }
     };
 
@@ -1873,9 +1940,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             options: { clipInnerBufferM, minOverlapForGsd: minOverlapForGsdRef.current },
           } as any);
           if (mySeq !== computeSeqRef.current) break;
+          cameraTileResultsRef.current.set(cacheKey, res);
           upsertTileStats(cacheKey, res.perPolygon);
-          if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "overlap", runId, opacity });
-          if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "gsd", runId, opacity, gsdMin: 0.005, gsdMax: 0.06 });
         }
       }
 
@@ -1900,9 +1966,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             options: { clipInnerBufferM },
           } as any);
           if (mySeq !== computeSeqRef.current) break;
+          lidarTileResultsRef.current.set(cacheKey, res);
           upsertTileStats(cacheKey, res.perPolygon);
-          if (showOverlap) addOrUpdateTileOverlay(map, res, { kind: "pass", runId, opacity });
-          if (showGsd) addOrUpdateTileOverlay(map, res, { kind: "density", runId, opacity, densityMin: 10, densityMax: 100 });
         }
       }
 
@@ -1912,6 +1977,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       const neededLidarTileKeys = buildNeededTileKeys(lidarPolygons);
       pruneOverlaysByKinds(['overlap', 'gsd'], neededCameraTileKeys);
       pruneOverlaysByKinds(['pass', 'density'], neededLidarTileKeys);
+      pruneCachedTileResults(cameraTileResultsRef.current, neededCameraTileKeys);
+      pruneCachedTileResults(lidarTileResultsRef.current, neededLidarTileKeys);
 
       const emptyPolygonIds: string[] = [];
       perPolyTileStatsRef.current.forEach((tileMap, polygonId) => {
@@ -1988,11 +2055,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         gsdSummaries.push(aggregatedGsdStats);
       });
 
-      setPerPolygonStats(nextPerPolygon);
-      setOverallStats({
+      const nextOverallStats = {
         gsd: gsdSummaries.length > 0 ? aggregateMetricStats(gsdSummaries) : null,
         density: densitySummaries.length > 0 ? aggregateMetricStats(densitySummaries) : null,
-      });
+      };
+
+      setPerPolygonStats(nextPerPolygon);
+      setOverallStats(nextOverallStats);
+      redrawAnalysisOverlays(nextOverallStats);
 
       if (showCameraPoints && poses.length > 0) {
         const importedOnly = poses.filter((pose) => !pose.polygonId);
@@ -2021,7 +2091,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         }, 0);
       }
     }
-  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, opacity, parseCameraOverride, parsePosesMeters, showCameraPoints, showGsd, showOverlap, zoom]);
+  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, showCameraPoints, zoom]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
@@ -2154,6 +2224,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       // Remove all overlays regardless of run id to be safe
       clearAllOverlays(map);
       perPolyTileStatsRef.current.clear();
+      cameraTileResultsRef.current.clear();
+      lidarTileResultsRef.current.clear();
       prevPolygonRingsRef.current = new Map();
       const now = Date.now();
       globalRunIdRef.current = `${now}`;
@@ -2187,6 +2259,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const now = Date.now();
     globalRunIdRef.current = `${now}`;
     perPolyTileStatsRef.current.clear();
+    cameraTileResultsRef.current.clear();
+    lidarTileResultsRef.current.clear();
     prevPolygonRingsRef.current = new Map();
     setOverallStats({ gsd: null, density: null });
     setPerPolygonStats(new Map());
@@ -2320,6 +2394,43 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (overallStats.density?.count) cards.push({ metricKind: 'density', stats: overallStats.density });
     return cards;
   }, [overallStats]);
+
+  const overlayLegends = useMemo(() => {
+    const legends: Array<{
+      metricKind: MetricKind;
+      title: string;
+      leftValue: number;
+      rightValue: number;
+    }> = [];
+
+    const gsdRange = overlayRangeForStats(overallStats.gsd, 'gsd');
+    const densityRange = overlayRangeForStats(overallStats.density, 'density');
+
+    if (showGsd && gsdRange) {
+      legends.push({
+        metricKind: 'gsd',
+        title: 'GSD scale (p5-p95)',
+        leftValue: gsdRange.min,
+        rightValue: gsdRange.max,
+      });
+    }
+
+    if (showGsd && densityRange) {
+      legends.push({
+        metricKind: 'density',
+        title: 'Density scale (p5-p95)',
+        leftValue: densityRange.max,
+        rightValue: densityRange.min,
+      });
+    }
+
+    return legends;
+  }, [overallStats, overlayRangeForStats, showGsd]);
+
+  React.useEffect(() => {
+    redrawAnalysisOverlays();
+  }, [redrawAnalysisOverlays]);
+
   const displayParamsMap = getMergedParamsMap();
   const lidarPolygonIds = (mapRef.current?.getPolygonsWithIds?.() ?? [])
     .map((polygon) => polygon.id || 'unknown')
@@ -2412,7 +2523,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           </Card>
         ) : (
           combinedPolygons.map(({ polygonId, analysis, stats }) => {
-            const { displayName, shortId } = getPolygonDisplayName(polygonId);
+            const displayName = getPolygonDisplayName(polygonId);
             const overrideInfo = overrides?.[polygonId];
             const directionSource = overrideInfo?.source === 'user'
               ? 'Custom'
@@ -2426,9 +2537,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             const metricStats = stats?.stats;
             const labels = metricLabels(metricKind);
             const areaAcres = stats?.areaAcres ?? 0;
-            const sampleCount = stats?.sampleCount ?? 0;
-            const sampleLabel = stats?.sampleLabel ?? (metricKind === 'density' ? 'Flight lines' : 'Images');
-            const sourceLabel = stats?.sourceLabel;
             const isSelected = activeSelectedId === polygonId;
             const isPoseArea = polygonId === '__POSES__';
 
@@ -2450,10 +2558,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
               >
                 <CardContent className="p-3 space-y-3">
                   <div className="flex items-center justify-between">
-                    <div>
-                      <div className="text-sm font-medium text-gray-900">{displayName}</div>
-                      <div className="text-xs text-gray-500 font-mono">#{shortId}</div>
-                    </div>
+                    <div className="text-sm font-medium text-gray-900">{displayName}</div>
                     <Badge variant="outline" className="text-[10px] uppercase tracking-wide">{directionSource}</Badge>
                   </div>
 
@@ -2601,7 +2706,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
                   {metricStats ? (
                     <div className="space-y-2">
-                      <div className="grid grid-cols-3 gap-3 text-xs">
+                      <div className="grid grid-cols-4 gap-3 text-xs">
                         <div className="text-center">
                           <div className="font-medium text-green-600">{formatMetricValue(metricKind, metricStats.min, metricKind === 'density' ? 0 : 1)}</div>
                           <div className="text-gray-500">{labels.min}</div>
@@ -2614,12 +2719,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                           <div className="font-medium text-red-600">{formatMetricValue(metricKind, metricStats.max, metricKind === 'density' ? 0 : 1)}</div>
                           <div className="text-gray-500">{labels.max}</div>
                         </div>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-3 text-xs text-gray-600">
-                        <div>{sampleLabel}: <span className="font-medium text-gray-900">{sampleCount}</span></div>
-                        <div>Area: <span className="font-medium text-gray-900">{areaAcres.toFixed(2)} acres</span></div>
-                        {sourceLabel && <div className="col-span-2">System: <span className="font-medium text-gray-900">{sourceLabel}</span></div>}
+                        <div className="text-center">
+                          <div className="font-medium text-gray-900">{areaAcres.toFixed(2)} acres</div>
+                          <div className="text-gray-500">Area</div>
+                        </div>
                       </div>
                     </div>
                   ) : (
@@ -2670,6 +2773,28 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
           </Card>
         );
       })}
+
+      {overlayLegends.length > 0 && (
+        <div className="rounded-md border border-gray-200 bg-gray-50/80 p-2 space-y-2">
+          <div className="flex items-center justify-between text-[11px] text-gray-500">
+            <span className="font-medium text-gray-700">Auto color scale</span>
+            <span>Blue = better, red = worse</span>
+          </div>
+          {overlayLegends.map((legend) => (
+            <div key={legend.metricKind} className="space-y-1">
+              <div className="flex items-center justify-between text-[11px] text-gray-600">
+                <span>{legend.title}</span>
+                <span>Current run</span>
+              </div>
+              <div className="h-2 rounded-sm border border-gray-200" style={{ background: HEATMAP_GRADIENT }} />
+              <div className="flex items-center justify-between text-[11px] text-gray-600">
+                <span>{formatMetricValue(legend.metricKind, legend.leftValue)}</span>
+                <span>{formatMetricValue(legend.metricKind, legend.rightValue)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-2">
         <div className="space-y-2">

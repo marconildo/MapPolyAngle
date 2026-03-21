@@ -65,13 +65,32 @@ function encodeOverlapToImage(overlap: Uint16Array, size: number, maxValue: numb
  * Convert GSD values to a heatmap visualization
  * Higher GSD = worse resolution = warmer colors (red), Lower GSD = better resolution = cooler colors (blue/green)
  */
-function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin = 0.005, gsdMax = 0.06): HTMLCanvasElement {
+function valueRange(
+  values: Float32Array,
+  isValid: (value: number) => boolean
+): { min: number; max: number } | null {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+
+  for (let index = 0; index < values.length; index++) {
+    const value = values[index];
+    if (!isValid(value)) continue;
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  return { min, max: Math.max(min + 1e-6, max) };
+}
+
+function encodeGsdToImage(gsd: Float32Array, size: number, gsdMin?: number, gsdMax?: number): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const img = ctx.createImageData(size, size);
-  const lo = Math.max(0, gsdMin);
-  const hi = Math.max(lo + 1e-6, gsdMax);
+  const autoRange = valueRange(gsd, (value) => Number.isFinite(value));
+  const lo = Math.max(0, gsdMin ?? autoRange?.min ?? 0.005);
+  const hi = Math.max(lo + 1e-6, gsdMax ?? autoRange?.max ?? 0.06);
 
   for (let i = 0, j = 0; i < gsd.length; i++, j += 4) {
     const g = gsd[i];
@@ -141,14 +160,15 @@ function smoothDensityForDisplay(density: Float32Array, size: number): Float32Ar
   return smoothed;
 }
 
-function encodeDensityToImage(density: Float32Array, size: number, densityMin = 10, densityMax = 100): HTMLCanvasElement {
+function encodeDensityToImage(density: Float32Array, size: number, densityMin?: number, densityMax?: number): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = size;
   canvas.height = size;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   const img = ctx.createImageData(size, size);
-  const lo = Math.max(0, densityMin);
-  const hi = Math.max(lo + 1e-6, densityMax);
+  const autoRange = valueRange(density, (value) => value > 0 && Number.isFinite(value));
+  const lo = Math.max(0, densityMin ?? autoRange?.min ?? 10);
+  const hi = Math.max(lo + 1e-6, densityMax ?? autoRange?.max ?? 100);
   const displayDensity = smoothDensityForDisplay(density, size);
 
   for (let i = 0, j = 0; i < density.length; i++, j += 4) {
@@ -197,9 +217,9 @@ export function addOrUpdateTileOverlay(
   if (opts.kind === "overlap" || opts.kind === "pass") {
     canvas = encodeOverlapToImage(result.overlap, result.size, result.maxOverlap || 1);
   } else if (opts.kind === "density") {
-    canvas = encodeDensityToImage(result.density ?? new Float32Array(result.size * result.size), result.size, opts.densityMin ?? 10, opts.densityMax ?? 100);
+    canvas = encodeDensityToImage(result.density ?? new Float32Array(result.size * result.size), result.size, opts.densityMin, opts.densityMax);
   } else {
-    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin ?? 0.005, opts.gsdMax ?? 0.06);
+    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin, opts.gsdMax);
   }
 
   // Convert to data URL (required for Mapbox image source)
