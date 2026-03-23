@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 
 from .geometry import clamp, lnglat_to_mercator
+from .schemas import TerrainSourceModel
 
 
 def _terrain_rgb_to_elevation(image: Image.Image) -> np.ndarray:
@@ -151,6 +152,8 @@ def fetch_dem_for_ring(
     ring: list[tuple[float, float]],
     cache_dir: Path,
     grid_step_m: float | None = None,
+    terrain_source: TerrainSourceModel | None = None,
+    dsm_store: object | None = None,
 ) -> tuple[TerrainDEM, int]:
     mercator = [lnglat_to_mercator(lng, lat) for lng, lat in ring]
     xs = [coord[0] for coord in mercator]
@@ -184,4 +187,9 @@ def fetch_dem_for_ring(
                     max_x=bounds[2],
                     max_y=bounds[3],
                 )
-    return TerrainDEM(zoom, tiles), zoom
+    dem = TerrainDEM(zoom, tiles)
+    if dsm_store is not None:
+        apply_fn = getattr(dsm_store, "apply_terrain_source_to_dem", None)
+        if callable(apply_fn):
+            apply_fn(terrain_source, dem)
+    return dem, zoom

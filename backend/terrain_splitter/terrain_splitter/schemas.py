@@ -8,6 +8,8 @@ PayloadKind = Literal["camera", "lidar"]
 AltitudeMode = Literal["legacy", "min-clearance"]
 LidarReturnMode = Literal["single", "dual", "triple"]
 LidarComparisonMode = Literal["first-return", "all-returns"]
+TerrainSourceMode = Literal["mapbox", "blended"]
+DsmProcessingStatus = Literal["ready"]
 
 
 class FlightParamsModel(BaseModel):
@@ -34,11 +36,59 @@ class FlightParamsModel(BaseModel):
     customBearingDeg: float | None = None
 
 
+class BoundsModel(BaseModel):
+    minX: float
+    minY: float
+    maxX: float
+    maxY: float
+
+
+class LngLatBoundsModel(BaseModel):
+    minLng: float
+    minLat: float
+    maxLng: float
+    maxLat: float
+
+
+class DsmSourceDescriptorModel(BaseModel):
+    id: str
+    name: str
+    fileSizeBytes: int = Field(..., ge=0)
+    width: int = Field(..., gt=0)
+    height: int = Field(..., gt=0)
+    sourceBounds: BoundsModel
+    footprint3857: BoundsModel
+    footprintLngLat: LngLatBoundsModel
+    footprintRingLngLat: list[tuple[float, float]]
+    sourceCrsCode: str | None = None
+    sourceCrsLabel: str
+    sourceProj4: str
+    horizontalUnits: str | None = None
+    verticalScaleToMeters: float = Field(1.0, gt=0)
+    noDataValue: float | None = None
+    nativeResolutionXM: float | None = Field(default=None, gt=0)
+    nativeResolutionYM: float | None = Field(default=None, gt=0)
+    validCoverageRatio: float | None = Field(default=None, ge=0, le=1)
+    loadedAtIso: str
+
+
+class TerrainSourceModel(BaseModel):
+    mode: TerrainSourceMode = "mapbox"
+    datasetId: str | None = None
+
+    @model_validator(mode="after")
+    def validate_dataset_requirement(self) -> "TerrainSourceModel":
+        if self.mode == "blended" and (self.datasetId is None or not self.datasetId.strip()):
+            raise ValueError("datasetId is required when terrainSource.mode is 'blended'.")
+        return self
+
+
 class PartitionSolveRequest(BaseModel):
     polygonId: str | None = None
     ring: list[tuple[float, float]]
     payloadKind: PayloadKind
     params: FlightParamsModel
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
     altitudeMode: AltitudeMode = "legacy"
     minClearanceM: float = Field(60, ge=0)
     turnExtendM: float = Field(96, ge=0)
@@ -89,3 +139,15 @@ class PartitionSolveResponse(BaseModel):
     requestId: str
     solutions: list[PartitionSolutionPreviewModel]
     debug: DebugArtifacts | None = None
+
+
+class DsmStatusResponse(BaseModel):
+    datasetId: str | None = None
+    descriptor: DsmSourceDescriptorModel | None = None
+    processingStatus: DsmProcessingStatus | None = None
+    reusedExisting: bool = False
+    terrainTileUrlTemplate: str | None = None
+
+
+class DsmDatasetListResponse(BaseModel):
+    datasets: list[DsmStatusResponse] = Field(default_factory=list)

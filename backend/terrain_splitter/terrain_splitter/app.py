@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import time
 import uuid
+from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+import httpx
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 
 from .debug import write_debug_artifacts
+from .dsm_store import create_dsm_dataset_store, derive_descriptor_from_payload
 from .features import compute_feature_field
 from .grid import build_grid
-from .mapbox_tiles import fetch_dem_for_ring
-from .schemas import DebugArtifacts, PartitionSolveRequest, PartitionSolveResponse
+from .mapbox_tiles import TerrainTileCache, fetch_dem_for_ring, mapbox_token
+from .schemas import (
+    DebugArtifacts,
+    DsmDatasetListResponse,
+    DsmStatusResponse,
+    PartitionSolveRequest,
+    PartitionSolveResponse,
+    TerrainSourceModel,
+)
 from .solver_graphcut import solve_partition_hierarchy
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -36,6 +49,8 @@ def _env_flag(name: str, default: bool) -> bool:
 
 CACHE_DIR = _runtime_dir("TERRAIN_SPLITTER_CACHE_DIR", ".cache")
 DEBUG_DIR = _runtime_dir("TERRAIN_SPLITTER_DEBUG_DIR", ".debug")
+DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
+DSM_DATASET_STORE = create_dsm_dataset_store(DSM_DIR)
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Terrain Splitter Backend", version="0.1.0")
@@ -54,6 +69,109 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _terrain_tile_url_template(request: Request, terrain_source: TerrainSourceModel) -> str:
+    query = urlencode(
+        {
+            "mode": terrain_source.mode,
+            **({"datasetId": terrain_source.datasetId} if terrain_source.datasetId else {}),
+        }
+    )
+    return str(request.base_url).rstrip("/") + f"/v1/terrain-rgb/{{z}}/{{x}}/{{y}}.png?{query}"
+
+
+@app.get("/v1/dsm/datasets", response_model=DsmDatasetListResponse)
+def list_dsm_datasets(request: Request) -> DsmDatasetListResponse:
+    datasets = [
+        DsmStatusResponse(
+            datasetId=descriptor.id,
+            descriptor=descriptor,
+            processingStatus="ready",
+            reusedExisting=True,
+            terrainTileUrlTemplate=_terrain_tile_url_template(
+                request,
+                TerrainSourceModel(mode="blended", datasetId=descriptor.id),
+            ),
+        )
+        for descriptor in DSM_DATASET_STORE.list_datasets()
+    ]
+    return DsmDatasetListResponse(datasets=datasets)
+
+
+@app.get("/v1/dsm/datasets/{dataset_id}", response_model=DsmStatusResponse)
+def get_dsm_dataset(request: Request, dataset_id: str) -> DsmStatusResponse:
+    descriptor = DSM_DATASET_STORE.get_dataset_descriptor(dataset_id)
+    if descriptor is None:
+        raise HTTPException(status_code=404, detail=f"DSM dataset {dataset_id} was not found.")
+    return DsmStatusResponse(
+        datasetId=descriptor.id,
+        descriptor=descriptor,
+        processingStatus="ready",
+        reusedExisting=True,
+        terrainTileUrlTemplate=_terrain_tile_url_template(
+            request,
+            TerrainSourceModel(mode="blended", datasetId=descriptor.id),
+        ),
+    )
+
+
+@app.post("/v1/dsm/upload", response_model=DsmStatusResponse)
+async def upload_dsm(request: Request, file: UploadFile = File(...)) -> DsmStatusResponse:
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="DSM upload is empty.")
+
+    try:
+        server_descriptor = derive_descriptor_from_payload(
+            payload,
+            file.filename or "surface.tiff",
+        )
+        stored_descriptor, reused_existing = DSM_DATASET_STORE.ingest_dataset(
+            payload,
+            file.filename or server_descriptor.name or "surface.tiff",
+            server_descriptor,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to ingest DSM: {exc}") from exc
+
+    return DsmStatusResponse(
+        datasetId=stored_descriptor.id,
+        descriptor=stored_descriptor,
+        processingStatus="ready",
+        reusedExisting=reused_existing,
+        terrainTileUrlTemplate=_terrain_tile_url_template(
+            request,
+            TerrainSourceModel(mode="blended", datasetId=stored_descriptor.id),
+        ),
+    )
+
+
+@app.get("/v1/terrain-rgb/{z}/{x}/{y}.png")
+def terrain_rgb_tile(z: int, x: int, y: int, mode: str = "mapbox", datasetId: str | None = None) -> Response:
+    try:
+        terrain_source = TerrainSourceModel(mode=mode, datasetId=datasetId)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    cache = TerrainTileCache(CACHE_DIR)
+    token = mapbox_token()
+    with httpx.Client(follow_redirects=True) as client:
+        payload = cache.get_or_fetch(client, token, z, x, y)
+
+    image = Image.open(io.BytesIO(payload)).convert("RGBA")
+    rgba = np.asarray(image, dtype=np.uint8).copy()
+    try:
+        changed = DSM_DATASET_STORE.apply_terrain_source_to_rgba_tile(terrain_source, z, x, y, rgba)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    headers = {"Cache-Control": "no-store"}
+    if not changed:
+        return Response(content=payload, media_type="image/png", headers=headers)
+
+    out = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(out, format="PNG")
+    return Response(content=out.getvalue(), media_type="image/png", headers=headers)
+
+
 @app.post("/v1/partition/solve", response_model=PartitionSolveResponse)
 def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
     request_id = uuid.uuid4().hex[:12]
@@ -69,7 +187,12 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
     )
     try:
         stage_started_at = time.perf_counter()
-        dem, zoom = fetch_dem_for_ring(request.ring, CACHE_DIR)
+        dem, zoom = fetch_dem_for_ring(
+            request.ring,
+            CACHE_DIR,
+            terrain_source=request.terrainSource,
+            dsm_store=DSM_DATASET_STORE,
+        )
         fetch_dem_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         stage_started_at = time.perf_counter()

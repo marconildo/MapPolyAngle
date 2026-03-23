@@ -54,6 +54,10 @@ Globals:
         MAPBOX_TOKEN: !Ref MapboxToken
         TERRAIN_SPLITTER_CACHE_DIR: /tmp/terrain-splitter/cache
         TERRAIN_SPLITTER_DEBUG_DIR: /tmp/terrain-splitter/debug
+        TERRAIN_SPLITTER_DSM_DIR: /tmp/terrain-splitter/dsm
+        TERRAIN_SPLITTER_DSM_STORE_MODE: "s3"
+        TERRAIN_SPLITTER_DSM_S3_BUCKET: !Ref TerrainSplitterDsmBucket
+        TERRAIN_SPLITTER_DSM_S3_PREFIX: !Ref StageName
         TERRAIN_SPLITTER_ENABLE_APP_CORS: "false"
         TERRAIN_SPLITTER_ROOT_PARALLEL_MODE: "lambda"
         TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS: !Ref RootParallelWorkers
@@ -65,6 +69,11 @@ Globals:
         PYTHONPATH: /var/task
 
 Resources:
+  TerrainSplitterDsmBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
   TerrainSplitterFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -78,6 +87,15 @@ Resources:
               Action:
                 - lambda:InvokeFunction
               Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter"
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt TerrainSplitterDsmBucket.Arn
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub "${TerrainSplitterDsmBucket.Arn}/*"
       EphemeralStorage:
         Size: 2048
 
@@ -110,3 +128,6 @@ Outputs:
   TerrainSplitterFunctionUrl:
     Description: Lambda Function URL for the terrain splitter backend
     Value: !GetAtt TerrainSplitterFunctionUrl.FunctionUrl
+  TerrainSplitterDsmBucketName:
+    Description: S3 bucket backing DSM datasets for the terrain splitter backend
+    Value: !Ref TerrainSplitterDsmBucket

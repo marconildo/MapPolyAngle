@@ -6,3 +6,7 @@ numpy==1.26.4
 pillow==10.4.0
 shapely==2.1.2
 httpx==0.28.1
+pyproj==3.7.2
+tifffile==2025.6.11
+imagecodecs==2026.1.1
+python-multipart==0.0.20
