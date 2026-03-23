@@ -280,9 +280,8 @@ export function addOrUpdateTileOverlay(
 }
 
 export function clearRunOverlays(map: mapboxgl.Map, runId: string) {
-  if (!map.isStyleLoaded?.()) return;
-
-  const layers = map.getStyle().layers || [];
+  const style = map.getStyle?.();
+  const layers = style?.layers || [];
   for (const layer of layers) {
     const id = layer.id;
     if (id.startsWith(`ogsd-${runId}-`)) {
@@ -300,8 +299,8 @@ export function clearRunOverlays(map: mapboxgl.Map, runId: string) {
 
 // Remove all overlays produced by the GSD/overlap pipeline, regardless of runId.
 export function clearAllOverlays(map: mapboxgl.Map) {
-  if (!map.isStyleLoaded?.()) return;
-  const layers = map.getStyle().layers || [];
+  const style = map.getStyle?.();
+  const layers = style?.layers || [];
   for (const layer of layers) {
     const id = layer.id;
     if (!id.startsWith('ogsd-')) continue;

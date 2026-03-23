@@ -22,6 +22,7 @@ import {
 } from '@/terrain/terrainSource';
 import { clearDsmFootprintPolygon, setDsmFootprintPolygon } from '@/components/MapFlightDirection/utils/mapbox-layers';
 import type { TerrainSourceState } from '@/terrain/types';
+import { createHomeClearAllState } from '@/state/clearAllState';
 
 const MapFlightDirection = lazy(async () => {
   const mod = await import('@/components/MapFlightDirection');
@@ -75,6 +76,7 @@ export default function Home() {
   const [terrainSourceState, setTerrainSourceState] = useState<TerrainSourceState>(() => getTerrainSourceState());
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
+  const [clearAllEpoch, setClearAllEpoch] = useState(0);
 
   // Auto-run GSD analysis when flight lines are updated (already wired)
   const autoRunGSDRef = useRef<((opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) | null>(null);
@@ -263,14 +265,16 @@ export default function Home() {
   }, [polygonResults.length]);
 
   const clearAllDrawings = useCallback(() => {
-    mapRef.current?.clearAllDrawings?.();
-    clearGSDRef.current?.(); // Clear GSD overlays and analysis
-    setPolygonResults([]);
-    setAnalyzingPolygons(new Set());
-    setParamsByPolygon({});
-    setImportedOriginals({});
-    setOverrides({});
-    setSelectedPolygonId(null);
+    const clearedState = createHomeClearAllState();
+    setClearAllEpoch((prev) => prev + 1);
+    setPolygonResults(clearedState.polygonResults as PolygonAnalysisResult[]);
+    setAnalyzingPolygons(clearedState.analyzingPolygons);
+    setParamsByPolygon(clearedState.paramsByPolygon as Record<string, PolygonParams>);
+    setParamsDialog(clearedState.paramsDialog);
+    setImportedOriginals(clearedState.importedOriginals as Record<string, { bearingDeg: number; lineSpacingM: number }>);
+    setOverrides(clearedState.overrides as Record<string, BearingOverride>);
+    setImportedPoseCount(clearedState.importedPoseCount);
+    setSelectedPolygonId(clearedState.selectedPolygonId);
   }, []);
 
   const fitMapToDsmDescriptor = useCallback((descriptor: NonNullable<TerrainSourceState['descriptor']>) => {
@@ -692,6 +696,7 @@ export default function Home() {
                   <OverlapGSDPanel
                     mapRef={mapRef}
                     mapboxToken={mapboxToken}
+                    clearAllEpoch={clearAllEpoch}
                     getPerPolygonParams={() => paramsByPolygon}
                     onEditPolygonParams={handleEditPolygonParams}
                     onAutoRun={handleAutoRunReceived}
@@ -716,6 +721,7 @@ export default function Home() {
           <MapFlightDirection
             ref={mapRef}
             mapboxToken={mapboxToken}
+            clearAllEpoch={clearAllEpoch}
             center={center}
             zoom={initialZoom}
             sampleStep={sampleStep}

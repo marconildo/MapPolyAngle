@@ -19,6 +19,8 @@ import type { FlightParams, LidarReturnMode, TerrainTile } from "@/domain/types"
 import { extractPoses, wgs84ToWebMercator, extractCameraModel } from "@/utils/djiGeotags";
 import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
 import { planCoverageAutoRun } from "@/overlap/coverageAutoRun";
+import { createCoveragePanelResetState } from "@/state/clearAllState";
+import { shouldRunAsyncGeneration } from "@/state/asyncUpdateGuard";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
 // @ts-ignore
 import * as turf from '@turf/turf';
@@ -26,6 +28,7 @@ import * as turf from '@turf/turf';
 type Props = {
   mapRef: React.RefObject<MapFlightDirectionAPI>;
   mapboxToken: string;
+  clearAllEpoch?: number;
   /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
   getPerPolygonParams?: () => Record<string, FlightParams>;
   onEditPolygonParams?: (polygonId: string) => void;
@@ -219,7 +222,7 @@ function lidarStripMayAffectTile(
     minYs > bounds.maxY
   );
 }
-export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
     DJI_ZENMUSE_P1_24MM,
@@ -284,7 +287,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const deferredComputeTimeoutRef = useRef<number | null>(null);
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const runningRef = useRef(false);
-  const pendingComputeRef = useRef<{ polygonId?: string; suppressMapNotReadyToast?: boolean } | null>(null);
+  const pendingComputeRef = useRef<{ polygonId?: string; suppressMapNotReadyToast?: boolean; generation?: number } | null>(null);
+  const resetGenerationRef = useRef(0);
+  const lastHandledClearAllEpochRef = useRef(clearAllEpoch);
+  const guardedTimeoutsRef = useRef<Set<number>>(new Set());
   const suppressAutoRunUntilRef = useRef(0);
   const [clipInnerBufferM] = useState(0);
   const [maxTiltDeg, setMaxTiltDeg] = useState(30); // NEW: max allowable camera tilt (deg from vertical)
@@ -296,6 +302,29 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   React.useEffect(() => {
     runningRef.current = running;
   }, [running]);
+
+  const cancelGuardedTimeout = useCallback((timeoutId: number | null) => {
+    if (timeoutId === null) return;
+    guardedTimeoutsRef.current.delete(timeoutId);
+    window.clearTimeout(timeoutId);
+  }, []);
+
+  const cancelAllGuardedTimeouts = useCallback(() => {
+    for (const timeoutId of guardedTimeoutsRef.current) {
+      window.clearTimeout(timeoutId);
+    }
+    guardedTimeoutsRef.current.clear();
+  }, []);
+
+  const scheduleGuardedTimeout = useCallback((task: () => void, delayMs = 0, generation = resetGenerationRef.current) => {
+    const timeoutId = window.setTimeout(() => {
+      guardedTimeoutsRef.current.delete(timeoutId);
+      if (!shouldRunAsyncGeneration(generation, resetGenerationRef.current)) return;
+      task();
+    }, delayMs);
+    guardedTimeoutsRef.current.add(timeoutId);
+    return timeoutId;
+  }, []);
   // NEW: altitude strategy & min clearance & turn extension (synced with map API if available)
   const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
@@ -533,8 +562,20 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const cameraMsg = camera ? (cameraKey ? ` using ${cameraKey} camera.` : ' with camera intrinsics.') : '.';
     toast({ title: "Imported poses", description: `${posesMeters.length} camera poses loaded (${sourceLabel})${cameraMsg}` });
     onPosesImported?.(posesMeters.length);
-    setTimeout(()=>{ if (poseAreaRingRef.current.length>=4) { const api = mapRef.current; const map = api?.getMap?.(); if(map){ const ring=poseAreaRingRef.current; const lngs=ring.map(c=>c[0]); const lats=ring.map(c=>c[1]); map.fitBounds([[Math.min(...lngs), Math.min(...lats)],[Math.max(...lngs), Math.max(...lats)]], { padding:50, duration:800, maxZoom:16 }); } } }, 30);
-  }, [mapRef, onPosesImported]);
+    scheduleGuardedTimeout(() => {
+      if (poseAreaRingRef.current.length < 4) return;
+      const api = mapRef.current;
+      const map = api?.getMap?.();
+      if (!map) return;
+      const ring = poseAreaRingRef.current;
+      const lngs = ring.map((c) => c[0]);
+      const lats = ring.map((c) => c[1]);
+      map.fitBounds(
+        [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
+        { padding: 50, duration: 800, maxZoom: 16 },
+      );
+    }, 30);
+  }, [mapRef, onPosesImported, scheduleGuardedTimeout]);
 
   const parseCameraOverride = useCallback((): CameraModel | null => {
     if (!useOverrideCamera) return null;
@@ -1628,7 +1669,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
    *  - a single polygon (opts.polygonId provided), or
    *  - all polygons (default)
    */
-  const compute = useCallback(async (opts?: { polygonId?: string; suppressMapNotReadyToast?: boolean }) => {
+  const compute = useCallback(async (opts?: { polygonId?: string; suppressMapNotReadyToast?: boolean; generation?: number }) => {
+    const generation = opts?.generation ?? resetGenerationRef.current;
+    if (!shouldRunAsyncGeneration(generation, resetGenerationRef.current)) {
+      splitPerfLog(opts?.polygonId ?? '__all__', 'dropping stale coverage compute before start', {
+        generation,
+        currentGeneration: resetGenerationRef.current,
+      });
+      return;
+    }
     if (runningRef.current) {
       const nextPending = pendingComputeRef.current;
       pendingComputeRef.current = {
@@ -1638,6 +1687,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         suppressMapNotReadyToast: Boolean(
           nextPending?.suppressMapNotReadyToast || opts?.suppressMapNotReadyToast
         ),
+        generation,
       };
       splitPerfLog(opts?.polygonId ?? '__all__', 'coverage compute queued while another run is active', {
         queued: pendingComputeRef.current,
@@ -1753,15 +1803,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     if (!map || !map.isStyleLoaded?.()) {
       if (opts?.suppressMapNotReadyToast) {
         if (deferredComputeTimeoutRef.current !== null) {
-          clearTimeout(deferredComputeTimeoutRef.current);
+          cancelGuardedTimeout(deferredComputeTimeoutRef.current);
         }
         splitPerfLog(opts?.polygonId ?? '__all__', 'coverage compute deferred because map is not ready', {
           polygonId: opts?.polygonId,
         });
-        deferredComputeTimeoutRef.current = window.setTimeout(() => {
+        deferredComputeTimeoutRef.current = scheduleGuardedTimeout(() => {
           deferredComputeTimeoutRef.current = null;
-          compute(opts);
-        }, 200);
+          compute({ ...opts, generation });
+        }, 200, generation);
       } else {
         toast({
           variant: "destructive",
@@ -2004,7 +2054,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         }
       }
 
-      if (mySeq !== computeSeqRef.current) return;
+      if (mySeq !== computeSeqRef.current || !shouldRunAsyncGeneration(generation, resetGenerationRef.current)) return;
 
       const neededCameraTileKeys = buildNeededTileKeys(cameraPolygons);
       const neededLidarTileKeys = buildNeededTileKeys(lidarPolygons);
@@ -2119,12 +2169,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       const pending = pendingComputeRef.current;
       if (pending) {
         pendingComputeRef.current = null;
-        window.setTimeout(() => {
+        scheduleGuardedTimeout(() => {
           compute(pending);
-        }, 0);
+        }, 0, pending.generation ?? generation);
       }
     }
-  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, showCameraPoints, toOverlayTileResult, zoom]);
+  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, cancelGuardedTimeout, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, scheduleGuardedTimeout, showCameraPoints, toOverlayTileResult, zoom]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
@@ -2165,26 +2215,30 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
     if (plan.kind === 'compute') {
       // Always defer one tick to allow React state updates (lines/tiles) to flush.
-      setTimeout(() => compute(plan.computeRequest), 0);
+      const generation = resetGenerationRef.current;
+      scheduleGuardedTimeout(() => compute({ ...plan.computeRequest, generation }), 0, generation);
       return;
     }
 
     if (plan.kind === 'retry') {
-      if (autoRunTimeoutRef.current !== null) clearTimeout(autoRunTimeoutRef.current);
-      autoRunTimeoutRef.current = window.setTimeout(() => {
+      if (autoRunTimeoutRef.current !== null) cancelGuardedTimeout(autoRunTimeoutRef.current);
+      const generation = resetGenerationRef.current;
+      autoRunTimeoutRef.current = scheduleGuardedTimeout(() => {
         if (autoGenerate || importedPoses.length > 0) autoRun(opts);
-      }, plan.delayMs);
+      }, plan.delayMs, generation);
     }
-  }, [autoGenerate, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters]);
+  }, [autoGenerate, cancelGuardedTimeout, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters, scheduleGuardedTimeout]);
 
   function rerunAnalysisForCreatedPolygons(createdIds: string[]) {
     const deadlineMs = 8000;
     const startedAt = Date.now();
     const scope = createdIds[0] ?? `split-${++splitPerfSeqRef.current}`;
+    const generation = resetGenerationRef.current;
     splitPerfLog(scope, 'waiting for child flight lines before full raster recompute', {
       createdIds,
     });
     const attempt = () => {
+      if (!shouldRunAsyncGeneration(generation, resetGenerationRef.current)) return;
       const api = mapRef.current;
       const lines = api?.getFlightLines?.();
       const tiles = api?.getPolygonTiles?.();
@@ -2218,9 +2272,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         autoRun({ reason: 'lines' });
         return;
       }
-      window.setTimeout(attempt, 150);
+      scheduleGuardedTimeout(attempt, 150, generation);
     };
-    window.setTimeout(attempt, 0);
+    scheduleGuardedTimeout(attempt, 0, generation);
   }
 
   // Provide autoRun function to parent component - register immediately and on changes
@@ -2230,62 +2284,78 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
   const clear = useCallback(() => {
     const map: any = mapRef.current?.getMap?.();
+    const clearedState = createCoveragePanelResetState(Date.now());
+    resetGenerationRef.current += 1;
+    computeSeqRef.current += 1;
+    pendingComputeRef.current = null;
+    runningRef.current = clearedState.running;
+    autoTriesRef.current = clearedState.autoRetryCount;
+    setRunning(clearedState.running);
+    cancelAllGuardedTimeouts();
+    if (autoRunTimeoutRef.current) { autoRunTimeoutRef.current = null; }
+    if (deferredComputeTimeoutRef.current !== null) {
+      deferredComputeTimeoutRef.current = null;
+    }
     if (map) {
-      // Invalidate any in-flight compute
-      computeSeqRef.current += 1;
-      if (autoRunTimeoutRef.current) { clearTimeout(autoRunTimeoutRef.current); autoRunTimeoutRef.current = null; }
-      if (deferredComputeTimeoutRef.current !== null) {
-        clearTimeout(deferredComputeTimeoutRef.current);
-        deferredComputeTimeoutRef.current = null;
-      }
-      // Remove all overlays regardless of run id to be safe
       clearAllOverlays(map);
-      perPolyTileStatsRef.current.clear();
-      cameraTileResultsRef.current.clear();
-      lidarTileResultsRef.current.clear();
-      prevPolygonRingsRef.current = new Map();
-      const now = Date.now();
-      globalRunIdRef.current = `${now}`;
       const api = mapRef.current;
       if (api?.removeCameraPoints) {
         api.removeCameraPoints('__ALL__');
         api.removeCameraPoints('__POSES__');
       }
-      setImportedPoses([]);
-      poseAreaRingRef.current = [];
-      setOverallStats({ gsd: null, density: null });
-      setPerPolygonStats(new Map());
-      onPosesImported?.(0); // notify parent
     }
+    perPolyTileStatsRef.current.clear();
+    cameraTileResultsRef.current.clear();
+    lidarTileResultsRef.current.clear();
+    tileCacheRef.current.clear();
+    prevPolygonRingsRef.current = new Map();
+    globalRunIdRef.current = clearedState.runId;
+    poseAreaRingRef.current = clearedState.poseAreaRing;
+    setImportedPoses(clearedState.importedPoses as PoseMeters[]);
+    setOverallStats(clearedState.overallStats);
+    setPerPolygonStats(clearedState.perPolygonStats as Map<string, PolygonMetricSummary>);
+    setPartitionOptionsByPolygon(clearedState.partitionOptionsByPolygon as Record<string, TerrainPartitionSolutionPreview[]>);
+    setPartitionSelectionByPolygon(clearedState.partitionSelectionByPolygon);
+    setLoadingPartitionOptionsIds(clearedState.loadingPartitionOptionsIds);
+    setApplyingPartitionIds(clearedState.applyingPartitionIds);
+    setExactPartitionPreviewByKey(clearedState.exactPartitionPreviewByKey as Record<string, ExactPartitionPreview>);
+    setSplittingPolygonIds(clearedState.splittingPolygonIds);
+    setSelection(clearedState.selectedPolygonId);
+    onPosesImported?.(0);
   }, [mapRef, onPosesImported]);
 
   const resetComputedAnalysisState = useCallback(() => {
     const map: any = mapRef.current?.getMap?.();
+    const clearedState = createCoveragePanelResetState(Date.now());
+    resetGenerationRef.current += 1;
     computeSeqRef.current += 1;
+    pendingComputeRef.current = null;
+    runningRef.current = clearedState.running;
+    autoTriesRef.current = clearedState.autoRetryCount;
+    setRunning(clearedState.running);
+    cancelAllGuardedTimeouts();
     if (autoRunTimeoutRef.current) {
-      clearTimeout(autoRunTimeoutRef.current);
       autoRunTimeoutRef.current = null;
     }
     if (deferredComputeTimeoutRef.current !== null) {
-      clearTimeout(deferredComputeTimeoutRef.current);
       deferredComputeTimeoutRef.current = null;
     }
     if (map) {
       clearAllOverlays(map);
     }
-    const now = Date.now();
-    globalRunIdRef.current = `${now}`;
     perPolyTileStatsRef.current.clear();
     cameraTileResultsRef.current.clear();
     lidarTileResultsRef.current.clear();
+    tileCacheRef.current.clear();
     prevPolygonRingsRef.current = new Map();
-    setOverallStats({ gsd: null, density: null });
-    setPerPolygonStats(new Map());
+    globalRunIdRef.current = clearedState.runId;
+    setOverallStats(clearedState.overallStats);
+    setPerPolygonStats(clearedState.perPolygonStats as Map<string, PolygonMetricSummary>);
     if (mapRef.current?.removeCameraPoints) {
       mapRef.current.removeCameraPoints('__ALL__');
       mapRef.current.removeCameraPoints('__POSES__');
     }
-  }, [mapRef]);
+  }, [cancelAllGuardedTimeouts, mapRef]);
 
   React.useEffect(() => {
     const api = mapRef.current;
@@ -2306,6 +2376,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   React.useEffect(() => {
     onClearExposed?.(clear);
   }, [clear, onClearExposed]);
+
+  React.useEffect(() => {
+    if (clearAllEpoch === lastHandledClearAllEpochRef.current) return;
+    lastHandledClearAllEpochRef.current = clearAllEpoch;
+    clear();
+  }, [clear, clearAllEpoch]);
 
   const handlePoseFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -2371,13 +2447,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   // Auto-compute when imported poses arrive (poses-only mode)
   React.useEffect(()=>{
     if (!autoGenerate && importedPoses.length>0) {
+      const generation = resetGenerationRef.current;
       const attempt = () => {
+        if (!shouldRunAsyncGeneration(generation, resetGenerationRef.current)) return;
         const map = mapRef.current?.getMap?.();
-        if (map?.isStyleLoaded?.()) compute(); else setTimeout(attempt, 200);
+        if (map?.isStyleLoaded?.()) compute({ generation });
+        else scheduleGuardedTimeout(attempt, 200, generation);
       };
       attempt();
     }
-  }, [importedPoses.length, autoGenerate, compute, mapRef]);
+  }, [autoGenerate, compute, importedPoses.length, mapRef, scheduleGuardedTimeout]);
 
   const formatMetricValue = useCallback((metricKind: MetricKind, value: number, precision = 1) => {
     if (metricKind === 'density') return `${value.toFixed(precision)} pts/m²`;
@@ -2719,7 +2798,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                       onClick={(e) => {
                         e.stopPropagation();
                         mapRef.current?.optimizePolygonDirection?.(polygonId);
-                        setTimeout(() => setSelection(polygonId), 0);
+                        scheduleGuardedTimeout(() => setSelection(polygonId), 0);
                       }}
                       title="Automatically choose the terrain-optimal direction"
                     >
@@ -2734,7 +2813,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                         onClick={(e) => {
                           e.stopPropagation();
                           mapRef.current?.clearPolygon?.(polygonId);
-                          setTimeout(() => setSelection(null), 0);
+                          scheduleGuardedTimeout(() => setSelection(null), 0);
                         }}
                         title="Delete polygon"
                       >
@@ -2852,7 +2931,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                 setAltitudeModeUI(m);
                 const api = mapRef.current as any;
                 if (api?.setAltitudeMode) api.setAltitudeMode(m);
-                setTimeout(()=>{ compute(); }, 0);
+                scheduleGuardedTimeout(() => { compute(); }, 0);
               }}
             >
               <option value="legacy">Legacy (highest ground + AGL)</option>
@@ -2870,7 +2949,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                 setMinClearanceUI(v);
                 const api = mapRef.current as any;
                 if (api?.setMinClearance) api.setMinClearance(v);
-                setTimeout(()=>{ compute(); }, 0);
+                scheduleGuardedTimeout(() => { compute(); }, 0);
               }}
             />
           </label>
@@ -2885,7 +2964,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                 setTurnExtendUI(v);
                 const api = mapRef.current as any;
                 if (api?.setTurnExtend) api.setTurnExtend(v);
-                setTimeout(()=>{ compute(); }, 0);
+                scheduleGuardedTimeout(() => { compute(); }, 0);
               }}
             />
           </label>
@@ -2928,7 +3007,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                 const v = Math.max(1, Math.min(10, Math.round(parseFloat(e.target.value || '3'))));
                 minOverlapForGsdRef.current = v;
                 setMinOverlapForGsd(v);
-                setTimeout(()=>{ compute(); }, 0);
+                scheduleGuardedTimeout(() => { compute(); }, 0);
               }}
             />
           </label>

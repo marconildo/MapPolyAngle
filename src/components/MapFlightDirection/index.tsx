@@ -43,6 +43,8 @@ import * as turf from '@turf/turf';
 // NEW: Wingtra import helpers
 import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
 import { exportToWingtraFlightPlan, areasFromState } from '@/interop/wingtra/convert';
+import { shouldApplyAsyncPolygonUpdate, shouldRunAsyncGeneration } from '@/state/asyncUpdateGuard';
+import { shouldConsumeClearAllEpoch } from '@/state/clearAllState';
 
 const CAMERA_REGISTRY: Record<string, any> = {
   SONY_RX1R2,
@@ -512,6 +514,7 @@ function getForwardSpacingForParams(params: PolygonParams): number | null {
 
 interface Props {
   mapboxToken: string;
+  clearAllEpoch?: number;
   center?: LngLatLike;
   zoom?: number;
   sampleStep?: number;
@@ -531,6 +534,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
   (
     {
       mapboxToken,
+      clearAllEpoch = 0,
       center = [8.54, 47.37],
       zoom = 13,
       sampleStep = 2,
@@ -605,6 +609,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
     const pendingOptimizeRef = React.useRef<Set<string>>(new Set());
+    const resetGenerationRef = React.useRef(0);
+    const lastHandledClearAllEpochRef = React.useRef(clearAllEpoch);
+    const guardedTimeoutsRef = React.useRef<Set<number>>(new Set());
     const pendingProgrammaticDeletesRef = React.useRef<Set<string>>(new Set());
     const suppressSelectionDialogUntilRef = React.useRef(0);
     const suppressNextEmptySelectionRef = React.useRef(0);
@@ -668,13 +675,31 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       startProcessingPerimeterAnimation();
     }, [startProcessingPerimeterAnimation, stopProcessingPerimeterAnimation, syncProcessingPerimeterOverlay]);
 
+    const cancelAllGuardedTimeouts = useCallback(() => {
+      for (const timeoutId of guardedTimeoutsRef.current) {
+        window.clearTimeout(timeoutId);
+      }
+      guardedTimeoutsRef.current.clear();
+    }, []);
+
+    const scheduleGuardedTimeout = useCallback((task: () => void, delayMs = 0, generation = resetGenerationRef.current) => {
+      const timeoutId = window.setTimeout(() => {
+        guardedTimeoutsRef.current.delete(timeoutId);
+        if (generation !== resetGenerationRef.current) return;
+        task();
+      }, delayMs);
+      guardedTimeoutsRef.current.add(timeoutId);
+      return timeoutId;
+    }, []);
+
     // Debounced callback to prevent React render conflicts when multiple analyses complete
     const debouncedAnalysisComplete = useCallback(() => {
-      const timeoutId = setTimeout(() => {
+      const generation = resetGenerationRef.current;
+      const timeoutId = scheduleGuardedTimeout(() => {
         onAnalysisComplete?.(Array.from(polygonResultsRef.current.values()));
-      }, 0);
+      }, 0, generation);
       return timeoutId;
-    }, [onAnalysisComplete]);
+    }, [onAnalysisComplete, scheduleGuardedTimeout]);
 
     const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
       const safeParams = sanitizePolygonParams(params);
@@ -784,18 +809,20 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const nextId = rest[0];
           const nextRes = polygonResultsRef.current.get(nextId);
           if (nextRes) {
-            setTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
+            scheduleGuardedTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
           } else {
             const draw = drawRef.current as any;
-            const f = draw?.get?.(nextId);
-            if (f?.geometry?.type === 'Polygon') setTimeout(() => onRequestParams?.(nextId, f.geometry.coordinates[0]), 0);
+            scheduleGuardedTimeout(() => {
+              const f = draw?.get?.(nextId);
+              if (f?.geometry?.type === 'Polygon') onRequestParams?.(nextId, f.geometry.coordinates[0]);
+            }, 0);
           }
         } else if (rest.length === 0) {
           bulkPresetParamsRef.current = null;
         }
         return rest;
       });
-    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, turnExtendM]);
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, scheduleGuardedTimeout, turnExtendM]);
 
     const applyPolygonParamsBatch = useCallback((updates: Array<{ polygonId: string; params: PolygonParams }>) => {
       const latestByPolygon = new Map<string, PolygonParams>();
@@ -829,6 +856,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         setProcessingPolygonIds(Array.from(endIds));
       }
     }, [setProcessingPolygonIds]);
+
+    const isAsyncPolygonUpdateStillValid = useCallback((polygonId: string, generation: number) => {
+      const draw = drawRef.current as any;
+      return shouldApplyAsyncPolygonUpdate({
+        startedGeneration: generation,
+        currentGeneration: resetGenerationRef.current,
+        polygonStillExists: !!draw?.get?.(polygonId),
+      });
+    }, []);
+
+    const isAsyncGenerationStillValid = useCallback((generation: number) => {
+      return shouldRunAsyncGeneration(generation, resetGenerationRef.current);
+    }, []);
 
     type ExactBearingCandidate = {
       bearingDeg: number;
@@ -1273,6 +1313,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       params: PolygonParams,
       result: PolygonAnalysisResult,
       tiles: any[],
+      generation: number,
     ) => {
       const ring = result.polygon.coordinates as [number, number][];
       const { best, evaluated, seedBearingDeg, lineSpacingM, safeParams } = await searchExactBearingNearSeed({
@@ -1283,6 +1324,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         seedBearingDeg: result.result.contourDirDeg,
         mode: 'global',
       });
+
+      if (!isAsyncPolygonUpdateStillValid(polygonId, generation)) {
+        splitPerfLog(polygonId, 'dropping stale optimized bearing result after reset', {
+          generation,
+          currentGeneration: resetGenerationRef.current,
+        });
+        return;
+      }
 
       if (!best || !Number.isFinite(best.bearingDeg)) {
         splitPerfLog(polygonId, 'optimizePolygonDirection fallback to plane-fit bearing', {
@@ -1327,7 +1376,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       nextOverrides.set(polygonId, optimizedOverride);
       bearingOverridesRef.current = nextOverrides;
       applyPolygonParams(polygonId, safeParams, { skipQueue: true });
-    }, [applyPolygonParams, searchExactBearingNearSeed]);
+    }, [applyPolygonParams, isAsyncPolygonUpdateStillValid, searchExactBearingNearSeed]);
 
     // Rebuild 3D paths when altitude mode, minimum clearance, or turn extension changes
     useEffect(() => {
@@ -1423,7 +1472,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             const next = [...prev, result.polygonId];
             if (next.length === 1) {
               // defer to avoid render phase state update warning
-              setTimeout(() => onRequestParams?.(result.polygonId, result.polygon.coordinates), 0);
+              scheduleGuardedTimeout(() => onRequestParams?.(result.polygonId, result.polygon.coordinates), 0);
             }
             return next;
           });
@@ -1495,12 +1544,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const currentParams = polygonParamsRef.current.get(result.polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
           const paramsToApply: PolygonParams = { ...currentParams, useCustomBearing: false };
           if ('customBearingDeg' in paramsToApply) delete (paramsToApply as any).customBearingDeg;
+          const generation = resetGenerationRef.current;
           void withProcessingPolygon(result.polygonId, () =>
-            runOptimizedBearingSearch(result.polygonId, paramsToApply, result, tiles),
+            runOptimizedBearingSearch(result.polygonId, paramsToApply, result, tiles, generation),
           );
         }
       },
-      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams, altitudeMode, minClearanceM, runOptimizedBearingSearch, withProcessingPolygon]
+      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams, altitudeMode, minClearanceM, runOptimizedBearingSearch, scheduleGuardedTimeout, withProcessingPolygon]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -1592,7 +1642,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
       }
 
-      setTimeout(() => {
+      scheduleGuardedTimeout(() => {
         const draw = drawRef.current as any;
         const remainingPolygonIds = Array.isArray(draw?.getAll?.()?.features)
           ? draw.getAll().features
@@ -1614,7 +1664,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           if (!hasAny) onClearGSD?.();
         } catch {}
       }, 0);
-    }, [cancelAnalysis, debouncedAnalysisComplete, onClearGSD, onFlightLinesUpdated, onPolygonSelected]);
+    }, [cancelAnalysis, debouncedAnalysisComplete, onClearGSD, onFlightLinesUpdated, onPolygonSelected, scheduleGuardedTimeout]);
 
     const deletePolygonFeature = useCallback((polygonId: string) => {
       const draw = drawRef.current as any;
@@ -1682,7 +1732,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           : [],
       });
       attemptDelete();
-      setTimeout(() => {
+      scheduleGuardedTimeout(() => {
         if (draw.get?.(polygonId)) {
           splitPerfLog(polygonId, 'deletePolygonFeature retrying after initial failure');
           attemptDelete();
@@ -1691,7 +1741,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           cleanupPolygonState(polygonId);
         }
       }, 0);
-    }, [cleanupPolygonState]);
+    }, [cleanupPolygonState, scheduleGuardedTimeout]);
 
     const editPolygonBoundary = useCallback((polygonId: string) => {
       const draw = drawRef.current as any;
@@ -1699,13 +1749,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (!draw || feature?.geometry?.type !== 'Polygon') return;
 
       suppressSelectionDialogUntilRef.current = Date.now() + 1000;
-      setTimeout(() => onPolygonSelected?.(polygonId), 0);
+      scheduleGuardedTimeout(() => onPolygonSelected?.(polygonId), 0);
 
       try {
         draw.changeMode('simple_select', { featureIds: [polygonId] });
       } catch {}
 
-      setTimeout(() => {
+      scheduleGuardedTimeout(() => {
         try {
           draw.changeMode('direct_select', { featureId: polygonId });
         } catch {
@@ -1714,7 +1764,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } catch {}
         }
       }, 0);
-    }, [onPolygonSelected]);
+    }, [onPolygonSelected, scheduleGuardedTimeout]);
 
     const clearDrawSelectionForPan = useCallback(() => {
       const draw = drawRef.current as any;
@@ -1794,7 +1844,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
                 suppressNextEmptySelectionRef.current -= 1;
                 return;
               }
-              setTimeout(() => onPolygonSelected?.(null), 0);
+              scheduleGuardedTimeout(() => onPolygonSelected?.(null), 0);
               return;
             }
             const pid = f.id as string;
@@ -1804,19 +1854,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               const shouldSuppressDialog =
                 drawMode === 'direct_select' || Date.now() < suppressSelectionDialogUntilRef.current;
               // Defer to avoid selection-change re-entrancy
-              setTimeout(() => onPolygonSelected?.(pid), 0);
+              scheduleGuardedTimeout(() => onPolygonSelected?.(pid), 0);
               if (!shouldSuppressDialog) {
-                setTimeout(()=> onRequestParams?.(pid, ring), 0);
+                scheduleGuardedTimeout(() => onRequestParams?.(pid, ring), 0);
                 // Keep normal polygon clicks lightweight: once the app has recorded the
                 // selection, clear Draw's internal feature selection so left-drag pans
                 // the map again instead of staying in feature-move mode.
-                setTimeout(() => clearDrawSelectionForPan(), 0);
+                scheduleGuardedTimeout(() => clearDrawSelectionForPan(), 0);
               }
             }
           } catch {}
         });
       },
-      [clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected]
+      [clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected, scheduleGuardedTimeout]
     );
 
     useEffect(() => {
@@ -1939,6 +1989,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     // ---------- Wingtra flightplan import ----------
     const importWingtraFromText = useCallback(async (json: string): Promise<{ added: number; total: number; areas: ImportedFlightplanArea[] }> => {
+      const generation = resetGenerationRef.current;
       try {
         console.log(`📥 Importing Wingtra flightplan...`);
         const parsed = JSON.parse(json);
@@ -2109,6 +2160,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
         // Ensure effects updating polygonResultsRef have flushed before emitting final results
         await new Promise(r => setTimeout(r, 0));
+        if (!isAsyncGenerationStillValid(generation)) {
+          return { added: 0, total: imported.items.length, areas: [] };
+        }
         onAnalysisComplete?.(Array.from(polygonResultsRef.current.values()));
 
         // 5) Allow per‑polygon events again & emit a single aggregate update
@@ -2123,7 +2177,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         suspendAutoAnalysisRef.current = false;
         return { added: 0, total: 0, areas: [] };
       }
-    }, [mapboxToken, addRingAsDrawFeature, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, onFlightLinesUpdated, onError]);
+    }, [mapboxToken, addRingAsDrawFeature, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, isAsyncGenerationStillValid, onFlightLinesUpdated, onError]);
 
     const handleFlightplanFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = e.target.files;
@@ -2260,8 +2314,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
 
       const tiles = polygonTilesRef.current.get(polygonId) || [];
+      const generation = resetGenerationRef.current;
       void withProcessingPolygon(polygonId, () =>
-        runOptimizedBearingSearch(polygonId, params, result, tiles),
+        runOptimizedBearingSearch(polygonId, params, result, tiles, generation),
       );
     }, [analyzePolygon, runOptimizedBearingSearch, withProcessingPolygon]);
 
@@ -2483,6 +2538,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       partitionRegions: TerrainPartitionRegionApplication[],
       inheritedParams: PolygonParams,
     ): Promise<{ createdIds: string[]; replaced: boolean }> => {
+      const generation = resetGenerationRef.current;
       const startedAt = splitPerfNow();
       splitPerfLog(polygonId, 'begin applyTerrainPartitionRings', {
         requestedRegionCount: partitionRegions.length,
@@ -2642,6 +2698,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           analyzedChildCount: analysisPromises.length,
         });
         await new Promise((resolve) => setTimeout(resolve, 0));
+        if (!isAsyncGenerationStillValid(generation)) {
+          return { createdIds: [], replaced: false };
+        }
         for (const { id, region } of createdRegions) {
           applyPolygonParams(id, {
             ...inheritedParams,
@@ -2675,7 +2734,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           onFlightLinesUpdated?.('__all__');
         }
       }
-    }, [addRingAsDrawFeature, analyzePolygon, applyPolygonParams, deletePolygonFeature, fitMapToRings, onError, onFlightLinesUpdated, onPolygonSelected]);
+    }, [addRingAsDrawFeature, analyzePolygon, applyPolygonParams, deletePolygonFeature, fitMapToRings, isAsyncGenerationStillValid, onError, onFlightLinesUpdated, onPolygonSelected]);
 
     const refineTerrainPartitionPreview = useCallback(async (
       polygonId: string,
@@ -2850,40 +2909,44 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       return fallbackResult;
     }, [applyTerrainPartitionRings, getTerrainPartitionContext, getTerrainPartitionSolutions, pickDefaultPartitionSolution]);
 
-	    React.useImperativeHandle(ref, () => ({
-      clearAllDrawings: () => {
-        setProcessingPolygonIds([]);
-        if (drawRef.current) drawRef.current.deleteAll();
-        if (deckOverlayRef.current) {
-          setDeckLayers([]);
-          deckOverlayRef.current.setProps({ layers: [] });
-        }
-        if (mapRef.current) {
-          clearAllFlightLines(mapRef.current);
-          clearAllTriggerPoints(mapRef.current);
-        }
-        setPolygonResults(new Map());
-        polygonResultsRef.current = new Map();
-        setPolygonTiles(new Map());
-        polygonTilesRef.current = new Map();
-        setPolygonFlightLines(new Map());
-        polygonFlightLinesRef.current = new Map();
-        setPolygonParams(new Map());
-        polygonParamsRef.current = new Map();
-        setBearingOverrides(new Map());
-        bearingOverridesRef.current = new Map();
-        setImportedOriginals(new Map());
-        importedOriginalsRef.current = new Map();
-        setPendingParamPolygons([]);
-        pendingProgrammaticDeletesRef.current.clear();
-        suppressSelectionDialogUntilRef.current = 0;
+    const resetAllDrawingsState = useCallback(() => {
+      resetGenerationRef.current += 1;
+      cancelAllGuardedTimeouts();
+      setProcessingPolygonIds([]);
+      if (drawRef.current) drawRef.current.deleteAll();
+      if (deckOverlayRef.current) {
+        setDeckLayers([]);
+        deckOverlayRef.current.setProps({ layers: [] });
+      }
+      if (mapRef.current) {
+        clearAllFlightLines(mapRef.current);
+        clearAllTriggerPoints(mapRef.current);
+      }
+      setPolygonResults(new Map());
+      polygonResultsRef.current = new Map();
+      setPolygonTiles(new Map());
+      polygonTilesRef.current = new Map();
+      setPolygonFlightLines(new Map());
+      polygonFlightLinesRef.current = new Map();
+      setPolygonParams(new Map());
+      polygonParamsRef.current = new Map();
+      setBearingOverrides(new Map());
+      bearingOverridesRef.current = new Map();
+      setImportedOriginals(new Map());
+      importedOriginalsRef.current = new Map();
+      setPendingParamPolygons([]);
+      pendingOptimizeRef.current.clear();
+      pendingProgrammaticDeletesRef.current.clear();
+      suppressSelectionDialogUntilRef.current = 0;
 
-        cancelAllAnalyses();
-        onClearGSD?.();
-        onPolygonSelected?.(null);
-        // Notify parent that results are cleared
-        onAnalysisComplete?.([]);
-      },
+      cancelAllAnalyses();
+      onClearGSD?.();
+      onPolygonSelected?.(null);
+      onAnalysisComplete?.([]);
+    }, [cancelAllAnalyses, cancelAllGuardedTimeouts, onAnalysisComplete, onClearGSD, onPolygonSelected, setProcessingPolygonIds]);
+
+	    React.useImperativeHandle(ref, () => ({
+      clearAllDrawings: resetAllDrawingsState,
       clearPolygon: (polygonId: string) => {
         if (processingPolygonIdsRef.current.has(polygonId)) {
           setProcessingPolygonIds(Array.from(processingPolygonIdsRef.current).filter((id) => id !== polygonId));
@@ -3020,17 +3083,24 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
     }), [
       polygonResults, polygonFlightLines, polygonTiles, polygonParams,
-      cancelAllAnalyses, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, deletePolygonFeature, editPolygonBoundary, setProcessingPolygonIds, autoSplitPolygonByTerrain,
+      cancelAllAnalyses, cancelAllGuardedTimeouts, applyPolygonParams, applyPolygonParamsBatch, cleanupPolygonState, deletePolygonFeature, editPolygonBoundary, setProcessingPolygonIds, autoSplitPolygonByTerrain,
       getTerrainPartitionSolutions, refineTerrainPartitionPreview, applyTerrainPartitionSolution, applyTerrainPartitionPreview,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
-      optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons,
+      optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons, resetAllDrawingsState,
       lastImportedFlightplan
     ]);
 
+    React.useEffect(() => {
+      if (!shouldConsumeClearAllEpoch(lastHandledClearAllEpochRef.current, clearAllEpoch)) return;
+      lastHandledClearAllEpochRef.current = clearAllEpoch;
+      resetAllDrawingsState();
+    }, [clearAllEpoch, resetAllDrawingsState]);
+
     React.useEffect(() => () => {
+      cancelAllGuardedTimeouts();
       stopProcessingPerimeterAnimation();
-    }, [stopProcessingPerimeterAnimation]);
+    }, [cancelAllGuardedTimeouts, stopProcessingPerimeterAnimation]);
 
     return (
       <div style={{ position: 'relative', width: '100%', height: '100%' }}>
