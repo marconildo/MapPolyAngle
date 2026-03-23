@@ -179,16 +179,50 @@ function calculateDensityStats(
 
   const mean = totalAreaM2 > 0 ? (sum / totalAreaM2) : 0;
   const MAX_BINS = 20;
-  const histogram = new Array<{ bin: number; count: number; areaM2?: number }>(MAX_BINS);
-  for (let i = 0; i < MAX_BINS; i++) histogram[i] = { bin: 0, count: 0, areaM2: 0 };
+  const exactZeroBucket = { bin: 0, count: 0, areaM2: 0 };
+  const positiveValues: number[] = [];
 
-  const span = max - min;
-  if (span <= 0) {
-    histogram[0].bin = min;
-    histogram[0].count = count;
-    histogram[0].areaM2 = totalAreaM2;
+  if (includeZeroDensity) {
+    for (let i = 0; i < activeIdxs.length; i++) {
+      const idx = activeIdxs[i];
+      const rawValue = density[idx];
+      const value = Number.isFinite(rawValue) && rawValue > 0 ? rawValue : 0;
+      if (!Number.isFinite(value)) continue;
+      const row = (idx / size) | 0;
+      const cosPhi = cosLatPerRow[row];
+      const areaM2 = pixelAreaEquator * cosPhi * cosPhi;
+      if (value === 0) {
+        exactZeroBucket.count += 1;
+        exactZeroBucket.areaM2 += areaM2;
+      } else {
+        positiveValues.push(value);
+      }
+    }
+  }
+
+  const positiveBinCount = exactZeroBucket.count > 0 ? MAX_BINS - 1 : MAX_BINS;
+  const histogram = new Array<{ bin: number; count: number; areaM2?: number }>();
+
+  const positiveMin = includeZeroDensity && exactZeroBucket.count > 0
+    ? (positiveValues.length > 0 ? Math.min(...positiveValues) : 0)
+    : min;
+  const positiveMax = max;
+  const positiveSpan = positiveMax - positiveMin;
+
+  if (!(positiveValues.length > 0) && exactZeroBucket.count > 0) {
+    histogram.push(exactZeroBucket);
+  } else if (positiveSpan <= 0) {
+    if (exactZeroBucket.count > 0) histogram.push(exactZeroBucket);
+    histogram.push({
+      bin: positiveMin,
+      count: count - exactZeroBucket.count,
+      areaM2: totalAreaM2 - exactZeroBucket.areaM2,
+    });
   } else {
-    const binSize = span / MAX_BINS;
+    if (exactZeroBucket.count > 0) histogram.push(exactZeroBucket);
+    const binSize = positiveSpan / positiveBinCount;
+    const positiveBins = new Array<{ bin: number; count: number; areaM2?: number }>(positiveBinCount);
+    for (let i = 0; i < positiveBinCount; i++) positiveBins[i] = { bin: 0, count: 0, areaM2: 0 };
     for (let i = 0; i < activeIdxs.length; i++) {
       const idx = activeIdxs[i];
       const rawValue = density[idx];
@@ -197,15 +231,17 @@ function calculateDensityStats(
         : rawValue;
       if (!(includeZeroDensity || (value > 0 && Number.isFinite(value)))) continue;
       if (!Number.isFinite(value)) continue;
-      let binIndex = Math.floor((value - min) / binSize);
-      if (binIndex >= MAX_BINS) binIndex = MAX_BINS - 1;
+      if (exactZeroBucket.count > 0 && value === 0) continue;
+      let binIndex = Math.floor((value - positiveMin) / binSize);
+      if (binIndex >= positiveBinCount) binIndex = positiveBinCount - 1;
       const row = (idx / size) | 0;
       const cosPhi = cosLatPerRow[row];
       const areaM2 = pixelAreaEquator * cosPhi * cosPhi;
-      histogram[binIndex].count += 1;
-      histogram[binIndex].areaM2 = (histogram[binIndex].areaM2 || 0) + areaM2;
+      positiveBins[binIndex].count += 1;
+      positiveBins[binIndex].areaM2 = (positiveBins[binIndex].areaM2 || 0) + areaM2;
     }
-    for (let i = 0; i < MAX_BINS; i++) histogram[i].bin = min + (i + 0.5) * binSize;
+    for (let i = 0; i < positiveBinCount; i++) positiveBins[i].bin = positiveMin + (i + 0.5) * binSize;
+    histogram.push(...positiveBins);
   }
 
   return {

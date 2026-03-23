@@ -119,7 +119,7 @@ export function useMapInitialization({
           displayControlsDefault: true,
           controls: {
             polygon: true,
-            trash: true,
+            trash: false,
             line_string: false,
             point: false,
             combine_features: false,
@@ -131,7 +131,14 @@ export function useMapInitialization({
         map.on('load', () => {
           ensureMapboxDemSource(map);
           map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
-          map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), 'top-right');
+          map.addControl(
+            new mapboxgl.NavigationControl({
+              showZoom: false,
+              showCompass: true,
+              visualizePitch: true,
+            }),
+            'top-left'
+          );
           map.addControl(draw, 'top-left');
 
           const deckOverlay = new MapboxOverlay({

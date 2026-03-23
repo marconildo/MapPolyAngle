@@ -19,6 +19,7 @@ import type { FlightParams, LidarReturnMode, TerrainTile } from "@/domain/types"
 import { extractPoses, wgs84ToWebMercator, extractCameraModel } from "@/utils/djiGeotags";
 import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
 import { planCoverageAutoRun } from "@/overlap/coverageAutoRun";
+import { aggregateMetricStats as aggregateMetricStatsBase, aggregateOverallMetricStats } from "@/overlap/metricAggregation";
 import { createCoveragePanelResetState } from "@/state/clearAllState";
 import { shouldRunAsyncGeneration } from "@/state/asyncUpdateGuard";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
@@ -73,7 +74,8 @@ type ExactPartitionPreview = {
 };
 
 const TERRAIN_SPLIT_DEBUG = true;
-const HEATMAP_GRADIENT = "linear-gradient(90deg, rgb(0 0 255) 0%, rgb(0 255 255) 25%, rgb(0 255 0) 50%, rgb(255 255 0) 75%, rgb(255 0 0) 100%)";
+const HEATMAP_GRADIENT_GSD = "linear-gradient(90deg, rgb(0 0 255) 0%, rgb(0 255 255) 25%, rgb(0 255 0) 50%, rgb(255 255 0) 75%, rgb(255 0 0) 100%)";
+const HEATMAP_GRADIENT_DENSITY = "linear-gradient(90deg, rgb(255 0 0) 0%, rgb(255 255 0) 25%, rgb(0 255 0) 50%, rgb(0 255 255) 75%, rgb(0 0 255) 100%)";
 const OVERLAY_SCALE_LOWER_QUANTILE = 0.05;
 const OVERLAY_SCALE_UPPER_QUANTILE = 0.95;
 const CARD_SUMMARY_LOWER_QUANTILE = 0.05;
@@ -131,6 +133,10 @@ function histogramAreaBelow(stats: GSDStats, threshold: number) {
   for (let index = 0; index < bins.length; index++) {
     const areaM2 = bins[index].areaM2 || 0;
     if (!(areaM2 > 0)) continue;
+    if (index === 0 && bins[index].bin === 0) {
+      if (threshold > 0) areaBelow += areaM2;
+      continue;
+    }
     const lower = edges[index];
     const upper = edges[index + 1];
     if (threshold <= lower) continue;
@@ -154,6 +160,7 @@ function histogramQuantile(stats: GSDStats, q: number) {
     const areaM2 = bins[index].areaM2 || 0;
     cumulative += areaM2;
     if (cumulative >= target) {
+      if (index === 0 && bins[index].bin === 0) return 0;
       const previous = cumulative - areaM2;
       const fraction = areaM2 > 0 ? Math.max(0, Math.min(1, (target - previous) / areaM2)) : 0;
       const lower = edges[index];
@@ -243,6 +250,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const [showGsd, setShowGsd] = useState(true);
   const [running, setRunning] = useState(false);
   const [autoGenerate, setAutoGenerate] = useState(true);
+  const [showFlightParameters, setShowFlightParameters] = useState(false);
   const [showCameraPoints, setShowCameraPoints] = useState(false); // Changed default to false
   const [overallStats, setOverallStats] = useState<OverallMetricStats>({ gsd: null, density: null });
   const [perPolygonStats, setPerPolygonStats] = useState<Map<string, PolygonMetricSummary>>(new Map());
@@ -628,76 +636,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const tailAreaAcres = 1; // trim per side (acres)
 
   const aggregateMetricStats = useCallback((tileStats: GSDStats[]): GSDStats => {
-    // Filter valid tile stats
-    const valid = tileStats.filter(s => s && s.count > 0 && isFinite(s.min) && isFinite(s.max) && s.max > 0);
-    if (valid.length === 0) return { min:0, max:0, mean:0, count:0, totalAreaM2:0, histogram: [] } as any;
-
-    // Calculate accurate aggregated statistics using original data
-    let totalCount = 0, totalArea = 0, weightedSum = 0;
-    let globalMin = +Infinity, globalMax = -Infinity;
-
-    for (const s of valid) {
-      totalCount += s.count;
-      const areaWeight = (s.totalAreaM2 && s.totalAreaM2 > 0) ? s.totalAreaM2 : s.count;
-      totalArea += areaWeight;
-      weightedSum += s.mean * areaWeight;
-      if (s.min < globalMin) globalMin = s.min;
-      if (s.max > globalMax) globalMax = s.max;
-    }
-
-    const accurateMean = totalArea > 0 ? weightedSum / totalArea : 0;
-
-    // Merge histograms into a higher-fidelity set of bins. The exact partition
-    // reranker reads these stats directly, so an 8-bin display histogram is too
-    // coarse and can hide severe lidar holes inside the first bucket.
-    const span = globalMax - globalMin;
-    if (!(span > 0)) {
-      return { min: globalMin, max: globalMax, mean: accurateMean, count: totalCount, totalAreaM2: totalArea, histogram: [{ bin: globalMin, count: totalCount, areaM2: totalArea }] } as any;
-    }
-    const targetBins = 20;
-    const binSize = span / targetBins;
-    const bins = new Array<{ bin: number; count: number; areaM2: number }>(targetBins);
-    for (let i = 0; i < targetBins; i++) bins[i] = { bin: globalMin + (i + 0.5) * binSize, count: 0, areaM2: 0 };
-
-    for (const s of valid) {
-      if (!s.histogram || s.histogram.length === 0) continue;
-      for (const hb of s.histogram) {
-        if (!hb || hb.count === 0) continue;
-        let bi = Math.floor((hb.bin - globalMin) / binSize);
-        if (bi < 0) bi = 0; if (bi >= targetBins) bi = targetBins - 1;
-        bins[bi].count += hb.count;
-        bins[bi].areaM2 += (hb.areaM2 || 0);
-      }
-    }
-
-    // Trim tails by area: each side at most tailAreaAcres
-    const ACRE_TO_M2 = 4046.8564224;
-    const tailAreaM2 = Math.max(0, (tailAreaAcres || 0) * ACRE_TO_M2);
-    const areaSum = bins.reduce((a,b)=> a + (b.areaM2 || 0), 0);
-    let minTrim = globalMin, maxTrim = globalMax;
-    if (areaSum > 0 && tailAreaM2 > 0 && tailAreaM2 * 2 < areaSum) {
-      // left trim
-      let cum = 0, i = 0;
-      for (; i < bins.length; i++) { const a = bins[i].areaM2 || 0; if (cum + a >= tailAreaM2) break; cum += a; }
-      if (i < bins.length) minTrim = bins[i].bin;
-      // right trim
-      cum = 0; let j = bins.length - 1;
-      for (; j >= 0; j--) { const a = bins[j].areaM2 || 0; if (cum + a >= tailAreaM2) break; cum += a; }
-      if (j >= 0) maxTrim = bins[j].bin;
-      if (!(maxTrim > minTrim)) { minTrim = globalMin; maxTrim = globalMax; }
-    }
-
-    // Remove completely empty bins for display cleanliness
-    const mergedHistogram = bins.filter(b => b.count > 0 || (b.areaM2 || 0) > 0);
-
-    return {
-      min: minTrim,
-      max: maxTrim,
-      mean: accurateMean,
-      count: totalCount,
-      totalAreaM2: totalArea,
-      histogram: mergedHistogram
-    } as any;
+    return aggregateMetricStatsBase(tileStats, tailAreaAcres);
   }, [tailAreaAcres]);
 
   const overlayRangeForStats = useCallback((stats: GSDStats | null, metricKind: MetricKind) => {
@@ -769,26 +708,38 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
   // Re-bin the stored histogram for display so the charts stay readable while
   // the underlying stats remain detailed enough for scoring.
-  const convertHistogramToArea = useCallback((stats: GSDStats): { bin: number; areaM2: number }[] => {
+  const convertHistogramToArea = useCallback((stats: GSDStats, metricKind: MetricKind): { bin: number; areaM2: number; isZeroBucket?: boolean }[] => {
     if (!stats || !stats.histogram.length) return [];
     const bins = sortedHistogramBins(stats);
-    if (bins.length <= 8) return bins.map((bin) => ({ bin: bin.bin, areaM2: bin.areaM2 || 0 }));
-    const min = bins[0].bin;
-    const max = bins[bins.length - 1].bin;
+    const hasExactZeroBucket = metricKind === 'density' && bins[0]?.bin === 0 && (bins[0]?.areaM2 || 0) > 0;
+    const zeroBucket = hasExactZeroBucket ? { bin: 0, areaM2: bins[0].areaM2 || 0, isZeroBucket: true } : null;
+    const positiveBins = hasExactZeroBucket ? bins.slice(1) : bins;
+
+    if (positiveBins.length === 0) return zeroBucket ? [zeroBucket] : [];
+
+    const maxDisplayBins = hasExactZeroBucket ? 7 : 8;
+    if (positiveBins.length <= maxDisplayBins) {
+      const direct = positiveBins.map((bin) => ({ bin: bin.bin, areaM2: bin.areaM2 || 0 }));
+      return zeroBucket ? [zeroBucket, ...direct] : direct;
+    }
+
+    const min = positiveBins[0].bin;
+    const max = positiveBins[positiveBins.length - 1].bin;
     const span = Math.max(1e-6, max - min);
-    const displayBins = 8;
+    const displayBins = maxDisplayBins;
     const binSize = span / displayBins;
     const compact = new Array<{ bin: number; areaM2: number }>(displayBins);
     for (let index = 0; index < displayBins; index++) {
       compact[index] = { bin: min + (index + 0.5) * binSize, areaM2: 0 };
     }
-    for (const bin of bins) {
+    for (const bin of positiveBins) {
       let index = Math.floor((bin.bin - min) / binSize);
       if (index < 0) index = 0;
       if (index >= displayBins) index = displayBins - 1;
       compact[index].areaM2 += bin.areaM2 || 0;
     }
-    return compact.filter((bin) => bin.areaM2 > 0);
+    const compactBins = compact.filter((bin) => bin.areaM2 > 0);
+    return zeroBucket ? [zeroBucket, ...compactBins] : compactBins;
   }, []);
 
   const ACRE_M2 = 4046.8564224;
@@ -2074,8 +2025,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       emptyPolygonIds.forEach((polygonId) => perPolyTileStatsRef.current.delete(polygonId));
 
       const nextPerPolygon = new Map<string, PolygonMetricSummary>();
-      const gsdSummaries: GSDStats[] = [];
-      const densitySummaries: GSDStats[] = [];
+      const overallMetricGroups: Array<{ metricKind: MetricKind; tileStats: GSDStats[] }> = [];
 
       perPolyTileStatsRef.current.forEach((polygonTileStatsMap, polygonId) => {
         const polygon = polygonMap.get(polygonId);
@@ -2106,7 +2056,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
             sampleLabel: 'Flight lines',
             sourceLabel: `${model.key} · ${comparisonLabel}`,
           });
-          densitySummaries.push(aggregatedDensityStats);
+          overallMetricGroups.push({ metricKind: 'density', tileStats: densityStatList });
           return;
         }
 
@@ -2135,13 +2085,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
           sampleLabel: 'Images',
           sourceLabel: cameraLabel,
         });
-        gsdSummaries.push(aggregatedGsdStats);
+        overallMetricGroups.push({ metricKind: 'gsd', tileStats: gsdStatList });
       });
 
-      const nextOverallStats = {
-        gsd: gsdSummaries.length > 0 ? aggregateMetricStats(gsdSummaries) : null,
-        density: densitySummaries.length > 0 ? aggregateMetricStats(densitySummaries) : null,
-      };
+      const nextOverallStats = aggregateOverallMetricStats(overallMetricGroups, tailAreaAcres);
 
       setPerPolygonStats(nextPerPolygon);
       setOverallStats(nextOverallStats);
@@ -2475,10 +2422,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   }, []);
 
   const metricValueColorClass = useCallback((metricKind: MetricKind, statKind: "min" | "mean" | "max") => {
-    if (statKind === "mean") return "text-blue-600";
     if (metricKind === "density") {
-      return statKind === "min" ? "text-red-600" : "text-green-600";
+      if (statKind === "min") return "text-red-600";
+      if (statKind === "mean") return "text-green-600";
+      return "text-blue-600";
     }
+    if (statKind === "mean") return "text-blue-600";
     return statKind === "min" ? "text-green-600" : "text-red-600";
   }, []);
 
@@ -2534,8 +2483,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       legends.push({
         metricKind: 'density',
         title: 'Density scale (p5-p95)',
-        leftValue: densityRange.max,
-        rightValue: densityRange.min,
+        leftValue: densityRange.min,
+        rightValue: densityRange.max,
       });
     }
 
@@ -2863,6 +2812,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       {overallCards.map(({ metricKind, stats }) => {
         const labels = metricLabels(metricKind);
         const displayStats = metricSummaryValues(stats);
+        const totalAreaM2 = statsTotalAreaM2(stats);
         return (
           <Card className="mt-2" key={metricKind}>
             <CardHeader className="pb-3">
@@ -2877,13 +2827,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
               </div>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={convertHistogramToArea(stats).map(bin => ({ metric: metricKind === 'density' ? bin.bin.toFixed(0) : (bin.bin * 100).toFixed(1), areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2 }))}>
+                  <BarChart data={convertHistogramToArea(stats, metricKind).map(bin => ({ metric: metricKind === 'density' ? (bin.isZeroBucket ? '0' : bin.bin.toFixed(0)) : (bin.bin * 100).toFixed(1), metricLabel: metricKind === 'density' ? (bin.isZeroBucket ? 'Holes / 0 pts/m²' : `${bin.bin.toFixed(0)} pts/m²`) : `${(bin.bin * 100).toFixed(1)} cm`, areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2, isZeroBucket: !!bin.isZeroBucket }))}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis dataKey="metric" tick={{ fontSize: 10 }} label={{ value: labels.xAxis, position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
                     <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
                     <Tooltip
-                      formatter={(value)=>{ const m2=value as number; const acres=m2/ACRE_M2; return [`${acres.toFixed(2)} acres (${m2.toFixed(0)} m²)`, 'Area']; }}
-                      labelFormatter={(label)=> `${labels.tooltipLabel}: ${label}${metricKind === 'density' ? ' pts/m²' : ' cm'}`}
+                      formatter={(value)=>{
+                        const m2 = value as number;
+                        const acres = m2 / ACRE_M2;
+                        const areaPct = totalAreaM2 > 0 ? (m2 / totalAreaM2) * 100 : 0;
+                        return [`${acres.toFixed(2)} acres (${areaPct.toFixed(1)}%)`, 'Area'];
+                      }}
+                      labelFormatter={(_, payload) => {
+                        const first = payload?.[0]?.payload as { metricLabel?: string } | undefined;
+                        return `${labels.tooltipLabel}: ${first?.metricLabel ?? ''}`;
+                      }}
                       labelStyle={{ fontSize: '11px' }}
                       contentStyle={{ fontSize: '11px' }}
                     />
@@ -2908,7 +2866,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                 <span>{legend.title}</span>
                 <span>Current run</span>
               </div>
-              <div className="h-2 rounded-sm border border-gray-200" style={{ background: HEATMAP_GRADIENT }} />
+              <div
+                className="h-2 rounded-sm border border-gray-200"
+                style={{ background: legend.metricKind === 'density' ? HEATMAP_GRADIENT_DENSITY : HEATMAP_GRADIENT_GSD }}
+              />
               <div className="flex items-center justify-between text-[11px] text-gray-600">
                 <span>{formatMetricValue(legend.metricKind, legend.leftValue)}</span>
                 <span>{formatMetricValue(legend.metricKind, legend.rightValue)}</span>
@@ -2919,99 +2880,110 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       )}
 
       <div className="grid grid-cols-1 gap-2">
-        <div className="space-y-2">
-          <div className="text-xs font-medium mb-1">Flight Parameters</div>
-          <label className="text-xs text-gray-600 block">
-            Altitude mode
-            <select
-              className="w-full border rounded px-2 py-1 text-xs mt-1"
-              value={altitudeModeUI}
-              onChange={(e)=>{
-                const m = (e.target.value as 'legacy'|'min-clearance');
-                setAltitudeModeUI(m);
-                const api = mapRef.current as any;
-                if (api?.setAltitudeMode) api.setAltitudeMode(m);
-                scheduleGuardedTimeout(() => { compute(); }, 0);
-              }}
-            >
-              <option value="legacy">Legacy (highest ground + AGL)</option>
-              <option value="min-clearance">Min-clearance (lowest + AGL; enforce clearance)</option>
-            </select>
-          </label>
-          <label className="text-xs text-gray-600 block">Min clearance (m)
-            <input
-              className="w-full border rounded px-2 py-1 text-xs"
-              type="number"
-              min={0}
-              value={minClearanceUI}
-              onChange={(e)=>{
-                const v = Math.max(0, parseFloat(e.target.value||'60'));
-                setMinClearanceUI(v);
-                const api = mapRef.current as any;
-                if (api?.setMinClearance) api.setMinClearance(v);
-                scheduleGuardedTimeout(() => { compute(); }, 0);
-              }}
-            />
-          </label>
-          <label className="text-xs text-gray-600 block">Turn extend (m)
-            <input
-              className="w-full border rounded px-2 py-1 text-xs"
-              type="number"
-              min={0}
-              value={turnExtendUI}
-              onChange={(e)=>{
-                const v = Math.max(0, parseFloat(e.target.value||'96'));
-                setTurnExtendUI(v);
-                const api = mapRef.current as any;
-                if (api?.setTurnExtend) api.setTurnExtend(v);
-                scheduleGuardedTimeout(() => { compute(); }, 0);
-              }}
-            />
-          </label>
-          {lidarPolygonIds.length > 0 && (
-            <label className="text-xs text-gray-600 block">
-              Max lidar range for all areas (m)
-              <input
-                className="w-full border rounded px-2 py-1 text-xs"
-                type="number"
-                min={1}
-                step={1}
-                value={bulkLidarRangeInput}
-                placeholder={lidarRangeMixed ? 'Mixed' : undefined}
-                onChange={(e) => setBulkLidarRangeInput(e.target.value)}
-                onBlur={(e) => applyBulkLidarRange(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    applyBulkLidarRange((e.target as HTMLInputElement).value);
-                  }
-                }}
-              />
-              <span className="block mt-1 text-[11px] text-gray-500">
-                {lidarRangeMixed
-                  ? `Different values are set across ${lidarPolygonIds.length} lidar areas. Enter one value and press Enter or click away to apply it to all.`
-                  : `Applies to all ${lidarPolygonIds.length} lidar area${lidarPolygonIds.length === 1 ? '' : 's'}.`}
-              </span>
-            </label>
+        <div className="overflow-hidden rounded-md border border-gray-200 bg-gray-50/80">
+          <button
+            type="button"
+            onClick={() => setShowFlightParameters((current) => !current)}
+            className="flex w-full items-center justify-between px-3 py-2 text-left"
+          >
+            <span className="text-xs font-medium text-gray-700">Flight Parameters</span>
+            <span className="text-[11px] text-gray-500">{showFlightParameters ? 'Hide' : 'Show'}</span>
+          </button>
+          {showFlightParameters && (
+            <div className="space-y-2 border-t border-gray-200 px-3 py-2">
+              <label className="text-xs text-gray-600 block">
+                Altitude mode
+                <select
+                  className="w-full border rounded px-2 py-1 text-xs mt-1"
+                  value={altitudeModeUI}
+                  onChange={(e)=>{
+                    const m = (e.target.value as 'legacy'|'min-clearance');
+                    setAltitudeModeUI(m);
+                    const api = mapRef.current as any;
+                    if (api?.setAltitudeMode) api.setAltitudeMode(m);
+                    scheduleGuardedTimeout(() => { compute(); }, 0);
+                  }}
+                >
+                  <option value="legacy">Legacy (highest ground + AGL)</option>
+                  <option value="min-clearance">Min-clearance (lowest + AGL; enforce clearance)</option>
+                </select>
+              </label>
+              <label className="text-xs text-gray-600 block">Min clearance (m)
+                <input
+                  className="w-full border rounded px-2 py-1 text-xs"
+                  type="number"
+                  min={0}
+                  value={minClearanceUI}
+                  onChange={(e)=>{
+                    const v = Math.max(0, parseFloat(e.target.value||'60'));
+                    setMinClearanceUI(v);
+                    const api = mapRef.current as any;
+                    if (api?.setMinClearance) api.setMinClearance(v);
+                    scheduleGuardedTimeout(() => { compute(); }, 0);
+                  }}
+                />
+              </label>
+              <label className="text-xs text-gray-600 block">Turn extend (m)
+                <input
+                  className="w-full border rounded px-2 py-1 text-xs"
+                  type="number"
+                  min={0}
+                  value={turnExtendUI}
+                  onChange={(e)=>{
+                    const v = Math.max(0, parseFloat(e.target.value||'96'));
+                    setTurnExtendUI(v);
+                    const api = mapRef.current as any;
+                    if (api?.setTurnExtend) api.setTurnExtend(v);
+                    scheduleGuardedTimeout(() => { compute(); }, 0);
+                  }}
+                />
+              </label>
+              {lidarPolygonIds.length > 0 && (
+                <label className="text-xs text-gray-600 block">
+                  Max lidar range for all areas (m)
+                  <input
+                    className="w-full border rounded px-2 py-1 text-xs"
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={bulkLidarRangeInput}
+                    placeholder={lidarRangeMixed ? 'Mixed' : undefined}
+                    onChange={(e) => setBulkLidarRangeInput(e.target.value)}
+                    onBlur={(e) => applyBulkLidarRange(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        applyBulkLidarRange((e.target as HTMLInputElement).value);
+                      }
+                    }}
+                  />
+                  <span className="block mt-1 text-[11px] text-gray-500">
+                    {lidarRangeMixed
+                      ? `Different values are set across ${lidarPolygonIds.length} lidar areas. Enter one value and press Enter or click away to apply it to all.`
+                      : `Applies to all ${lidarPolygonIds.length} lidar area${lidarPolygonIds.length === 1 ? '' : 's'}.`}
+                  </span>
+                </label>
+              )}
+              <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
+              <label className="text-xs text-gray-600 block">
+                Min overlap for GSD (images)
+                <input
+                  className="w-full border rounded px-2 py-1 text-xs"
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={minOverlapForGsd}
+                  onChange={(e)=>{
+                    const v = Math.max(1, Math.min(10, Math.round(parseFloat(e.target.value || '3'))));
+                    minOverlapForGsdRef.current = v;
+                    setMinOverlapForGsd(v);
+                    scheduleGuardedTimeout(() => { compute(); }, 0);
+                  }}
+                />
+              </label>
+              {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
+            </div>
           )}
-          <label className="text-xs text-gray-600 block">Max tilt (deg)<input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={90} value={maxTiltDeg} onChange={e=>setMaxTiltDeg(Math.max(0, Math.min(90, parseFloat(e.target.value||'10'))))} /></label>
-          <label className="text-xs text-gray-600 block">
-            Min overlap for GSD (images)
-            <input
-              className="w-full border rounded px-2 py-1 text-xs"
-              type="number"
-              min={1}
-              max={10}
-              value={minOverlapForGsd}
-              onChange={(e)=>{
-                const v = Math.max(1, Math.min(10, Math.round(parseFloat(e.target.value || '3'))));
-                minOverlapForGsdRef.current = v;
-                setMinOverlapForGsd(v);
-                scheduleGuardedTimeout(() => { compute(); }, 0);
-              }}
-            />
-          </label>
-          {autoGenerate && <div className="text-xs text-gray-500">{parsePosesMeters()?.length || 0} poses generated</div>}
         </div>
       </div>
 

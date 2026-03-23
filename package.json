@@ -18,7 +18,8 @@
     "test:coverage-autorun": "npx --yes tsx src/tests/coverage_autorun.test.ts",
     "test:clear-all-reset": "npx --yes tsx src/tests/clear_all_reset.test.ts",
     "test:async-update-guard": "npx --yes tsx src/tests/async_update_guard.test.ts",
-    "test:overlay-clear": "npx --yes tsx src/tests/overlay_clear.test.ts"
+    "test:overlay-clear": "npx --yes tsx src/tests/overlay_clear.test.ts",
+    "test:metric-aggregation": "npx --yes tsx src/tests/metric_aggregation.test.ts"
   },
   "dependencies": {
     "@deck.gl/core": "^9.1.14",
