@@ -1,16 +1,24 @@
 import type { PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
 import { lngLatToTile, tileCornersLngLat } from "./mercator";
+import { applyActiveDsmToTerrainRgbTile } from "@/terrain/dsmSource";
+import { getTerrainTileUrlForCurrentSource } from "@/terrain/terrainSource";
 
 export async function fetchTerrainRGBA(
   z: number, x: number, y: number, token: string, _size = 512, signal?: AbortSignal
 ): Promise<ImageData> {
-  const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`;
+  const terrainUrl = getTerrainTileUrlForCurrentSource(z, x, y);
+  const url = terrainUrl
+    ?? `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`;
   const img = await loadImage(url, signal);
   const canvas = document.createElement("canvas");
   canvas.width = img.width; canvas.height = img.height;
   const ctx = canvas.getContext("2d")!;
   ctx.drawImage(img, 0, 0);
-  return ctx.getImageData(0, 0, img.width, img.height);
+  const imageData = ctx.getImageData(0, 0, img.width, img.height);
+  if (!terrainUrl) {
+    await applyActiveDsmToTerrainRgbTile(z, x, y, img.width, imageData.data);
+  }
+  return imageData;
 }
 
 function loadImage(url: string, signal?: AbortSignal): Promise<HTMLImageElement> {

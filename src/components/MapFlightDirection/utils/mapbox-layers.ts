@@ -34,6 +34,9 @@ const PROCESSING_PERIMETER_SOURCE_ID = 'terrain-processing-perimeter-source';
 const PROCESSING_PERIMETER_GLOW_LAYER_ID = 'terrain-processing-perimeter-glow';
 const PROCESSING_PERIMETER_CORE_LAYER_ID = 'terrain-processing-perimeter-core';
 const PROCESSING_PERIMETER_PULSE_LAYER_ID = 'terrain-processing-perimeter-pulse';
+const DSM_FOOTPRINT_SOURCE_ID = 'uploaded-dsm-footprint-source';
+const DSM_FOOTPRINT_FILL_LAYER_ID = 'uploaded-dsm-footprint-fill';
+const DSM_FOOTPRINT_LINE_LAYER_ID = 'uploaded-dsm-footprint-line';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -214,6 +217,71 @@ export function animateProcessingPerimeter(map: MapboxMap, timestampMs: number) 
   if (map.getLayer(PROCESSING_PERIMETER_PULSE_LAYER_ID)) {
     map.setPaintProperty(PROCESSING_PERIMETER_PULSE_LAYER_ID, 'line-gradient', buildProcessingPulseGradient(phase));
   }
+}
+
+export function setDsmFootprintPolygon(
+  map: MapboxMap,
+  dsmId: string,
+  ring: [number, number][],
+) {
+  const closedRing = ensureClosedRing(ring);
+  if (closedRing.length < 4) return;
+  const data = {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [closedRing],
+        },
+        properties: {
+          dsmId,
+        },
+      },
+    ],
+  } as const;
+
+  if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) {
+    (map.getSource(DSM_FOOTPRINT_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(DSM_FOOTPRINT_SOURCE_ID, {
+      type: 'geojson',
+      data,
+    } as any);
+  }
+
+  const beforeId = getDrawLayerAnchor(map);
+  if (!map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) {
+    map.addLayer({
+      id: DSM_FOOTPRINT_FILL_LAYER_ID,
+      type: 'fill',
+      source: DSM_FOOTPRINT_SOURCE_ID,
+      paint: {
+        'fill-color': '#0ea5e9',
+        'fill-opacity': 0.08,
+      },
+    }, beforeId);
+  }
+  if (!map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) {
+    map.addLayer({
+      id: DSM_FOOTPRINT_LINE_LAYER_ID,
+      type: 'line',
+      source: DSM_FOOTPRINT_SOURCE_ID,
+      paint: {
+        'line-color': '#0284c7',
+        'line-width': 2,
+        'line-dasharray': [2, 2],
+        'line-opacity': 0.9,
+      },
+    }, beforeId);
+  }
+}
+
+export function clearDsmFootprintPolygon(map: MapboxMap) {
+  try { if (map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_LINE_LAYER_ID); } catch {}
+  try { if (map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_FILL_LAYER_ID); } catch {}
+  try { if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) map.removeSource(DSM_FOOTPRINT_SOURCE_ID); } catch {}
 }
 
 export function generateFlightLinesForPolygon(

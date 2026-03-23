@@ -13,7 +13,8 @@
     "compare:lidar": "python3 scripts/compare_lidar_mission.py",
     "test:terrain-split": "npx --yes tsx src/tests/terrain_face_partition.test.ts",
     "test:terrain-objective": "npx --yes tsx src/tests/terrain_partition_objective.test.ts",
-    "test:terrain-graph": "npx --yes tsx src/tests/terrain_partition_graph.test.ts"
+    "test:terrain-graph": "npx --yes tsx src/tests/terrain_partition_graph.test.ts",
+    "test:terrain-source": "npx --yes tsx src/tests/terrain_source.test.ts"
   },
   "dependencies": {
     "@deck.gl/core": "^9.1.14",
@@ -57,11 +58,14 @@
     "egm96-universal": "^1.1.1",
     "embla-carousel-react": "^8.5.2",
     "framer-motion": "^11.13.1",
+    "geotiff": "^3.0.5",
+    "geotiff-geokeys-to-proj4": "^2024.4.13",
     "input-otp": "^1.4.2",
     "jszip": "^3.10.1",
     "lucide-react": "^0.453.0",
     "mapbox-gl": "^3.14.0",
     "next-themes": "^0.4.6",
+    "proj4": "^2.20.4",
     "react": "^18.3.1",
     "react-day-picker": "^8.10.1",
     "react-dom": "^18.3.1",
@@ -92,8 +96,8 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.17",
     "ts-node": "^10.9.2",
-    "typescript-eslint": "^8.26.1",
     "typescript": "5.6.3",
+    "typescript-eslint": "^8.26.1",
     "vite": "^5.4.19"
   }
 }

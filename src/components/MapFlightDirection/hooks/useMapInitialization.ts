@@ -11,6 +11,49 @@ import mapboxgl, { Map as MapboxMap, LngLatLike } from 'mapbox-gl';
 import MapboxDraw from '@mapbox/mapbox-gl-draw';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 
+const MAPBOX_DEM_SOURCE_ID = 'mapbox-dem';
+const BACKEND_DEM_SOURCE_ID = 'backend-dem';
+
+function ensureMapboxDemSource(map: MapboxMap) {
+  if (map.getSource(MAPBOX_DEM_SOURCE_ID)) return;
+  map.addSource(MAPBOX_DEM_SOURCE_ID, {
+    type: 'raster-dem',
+    url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
+    tileSize: 512,
+    maxzoom: 14,
+  });
+}
+
+export function setTerrainDemSourceOnMap(map: MapboxMap, tileUrlTemplate: string | null) {
+  try {
+    if (!map.getStyle()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  ensureMapboxDemSource(map);
+  map.setTerrain(null);
+
+  if (tileUrlTemplate) {
+    if (map.getSource(BACKEND_DEM_SOURCE_ID)) {
+      map.removeSource(BACKEND_DEM_SOURCE_ID);
+    }
+    map.addSource(BACKEND_DEM_SOURCE_ID, {
+      type: 'raster-dem',
+      tiles: [tileUrlTemplate],
+      tileSize: 512,
+      maxzoom: 14,
+      encoding: 'mapbox',
+    });
+    map.setTerrain({ source: BACKEND_DEM_SOURCE_ID, exaggeration: 1 });
+    return;
+  }
+
+  map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
+}
+
 interface UseMapInitializationProps {
   mapboxToken: string;
   center: LngLatLike;
@@ -86,13 +129,8 @@ export function useMapInitialization({
         drawRef.current = draw;
 
         map.on('load', () => {
-          map.addSource('mapbox-dem', {
-            type: 'raster-dem',
-            url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
-            tileSize: 512,
-            maxzoom: 14,
-          });
-          map.setTerrain({ source: 'mapbox-dem', exaggeration: 1 });
+          ensureMapboxDemSource(map);
+          map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
           map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), 'top-right');
           map.addControl(draw, 'top-left');
 

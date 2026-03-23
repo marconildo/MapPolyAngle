@@ -9,6 +9,19 @@ import { Map, Trash2, AlertCircle, Upload, Download } from 'lucide-react';
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
+import {
+  clearTerrainSourceSelection,
+  getTerrainDemUrlTemplateForCurrentSource,
+  getTerrainSourceState,
+  initializeTerrainSourceState,
+  loadTerrainSourceFromFile,
+  refreshTerrainSourceDatasets,
+  selectTerrainSourceDataset,
+  setTerrainSourceMode,
+  subscribeTerrainSource,
+} from '@/terrain/terrainSource';
+import { clearDsmFootprintPolygon, setDsmFootprintPolygon } from '@/components/MapFlightDirection/utils/mapbox-layers';
+import type { TerrainSourceState } from '@/terrain/types';
 
 const MapFlightDirection = lazy(async () => {
   const mod = await import('@/components/MapFlightDirection');
@@ -45,6 +58,8 @@ function DeferredMapFallback() {
 export default function Home() {
   const isMobile = useIsMobile();
   const mapRef = useRef<MapFlightDirectionAPI>(null);
+  const dsmInputRef = useRef<HTMLInputElement>(null);
+  const previousTerrainSourceKeyRef = useRef<string | undefined>(undefined);
 
   const [polygonResults, setPolygonResults] = useState<PolygonAnalysisResult[]>([]);
   const [analyzingPolygons, setAnalyzingPolygons] = useState<Set<string>>(new Set());
@@ -57,6 +72,7 @@ export default function Home() {
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
   const [overrides, setOverrides] = useState<Record<string, BearingOverride>>({});
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
+  const [terrainSourceState, setTerrainSourceState] = useState<TerrainSourceState>(() => getTerrainSourceState());
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
 
@@ -87,6 +103,56 @@ export default function Home() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, []);
+
+  React.useEffect(() => {
+    const unsubscribe = subscribeTerrainSource(() => {
+      setTerrainSourceState(getTerrainSourceState());
+    });
+    void initializeTerrainSourceState().catch((error) => {
+      toast({
+        variant: 'destructive',
+        title: 'DSM library load failed',
+        description: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    const map = mapRef.current?.getMap?.();
+    if (!map) return;
+
+    const syncOverlay = () => {
+      if (terrainSourceState.descriptor) {
+        setDsmFootprintPolygon(map, terrainSourceState.descriptor.id, terrainSourceState.descriptor.footprintRingLngLat);
+      } else {
+        clearDsmFootprintPolygon(map);
+      }
+    };
+
+    if (map.isStyleLoaded()) {
+      syncOverlay();
+      return;
+    }
+
+    map.once('load', syncOverlay);
+    return () => {
+      map.off('load', syncOverlay);
+    };
+  }, [terrainSourceState.descriptor]);
+
+  React.useEffect(() => {
+    if (terrainSourceState.isLoading) return;
+    const currentKey = `${terrainSourceState.source.mode}:${terrainSourceState.source.datasetId ?? ''}`;
+    const previousKey = previousTerrainSourceKeyRef.current;
+    previousTerrainSourceKeyRef.current = currentKey;
+    if (previousKey === undefined || previousKey === currentKey) return;
+
+    clearGSDRef.current?.();
+    mapRef.current?.refreshTerrainForAllPolygons?.();
+  }, [terrainSourceState.isLoading, terrainSourceState.source.datasetId, terrainSourceState.source.mode]);
 
   // Memoize handlers to prevent unnecessary re-renders
   const handleAnalysisStart = useCallback((polygonId: string) => {
@@ -207,6 +273,103 @@ export default function Home() {
     setSelectedPolygonId(null);
   }, []);
 
+  const fitMapToDsmDescriptor = useCallback((descriptor: NonNullable<TerrainSourceState['descriptor']>) => {
+    const map = mapRef.current?.getMap?.();
+    if (!descriptor || !map) return;
+    map.fitBounds(
+      [
+        [descriptor.footprintLngLat.minLng, descriptor.footprintLngLat.minLat],
+        [descriptor.footprintLngLat.maxLng, descriptor.footprintLngLat.maxLat],
+      ],
+      { padding: 60, duration: 900, maxZoom: 18 }
+    );
+  }, []);
+
+  const zoomToDsm = useCallback(() => {
+    if (!terrainSourceState.descriptor) return;
+    fitMapToDsmDescriptor(terrainSourceState.descriptor);
+  }, [terrainSourceState.descriptor, fitMapToDsmDescriptor]);
+
+  const handleOpenDsmPicker = useCallback(() => {
+    dsmInputRef.current?.click();
+  }, []);
+
+  const handleDsmFileChange = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const descriptor = await loadTerrainSourceFromFile(file);
+      fitMapToDsmDescriptor(descriptor);
+      toast({
+        title: 'DSM loaded',
+        description: `${descriptor.name} is active as the blended terrain source for mesh, analysis, and autosplit.`,
+      });
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: 'DSM load failed',
+        description: error instanceof Error ? error.message : 'Unknown error',
+      });
+    } finally {
+      if (dsmInputRef.current) dsmInputRef.current.value = '';
+    }
+  }, [fitMapToDsmDescriptor]);
+
+  const handleClearDsm = useCallback(async () => {
+    clearTerrainSourceSelection();
+    toast({
+      title: 'DSM cleared',
+      description: 'Terrain source is back to Mapbox only.',
+    });
+  }, []);
+
+  const handleRefreshDsmLibrary = useCallback(async () => {
+    try {
+      await refreshTerrainSourceDatasets();
+      toast({
+        title: 'DSM library refreshed',
+        description: 'Available backend DSM datasets have been updated.',
+      });
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: 'DSM refresh failed',
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
+  const handleSelectExistingDsm = useCallback(async (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const datasetId = event.target.value;
+    if (!datasetId) return;
+    try {
+      const descriptor = await selectTerrainSourceDataset(datasetId, 'blended');
+      fitMapToDsmDescriptor(descriptor);
+      toast({
+        title: 'DSM selected',
+        description: `${descriptor.name} is active as the blended terrain source for mesh, analysis, and autosplit.`,
+      });
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: 'DSM selection failed',
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [fitMapToDsmDescriptor]);
+
+  const formatBytes = useCallback((bytes: number) => {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unitIdx = 0;
+    while (value >= 1024 && unitIdx < units.length - 1) {
+      value /= 1024;
+      unitIdx += 1;
+    }
+    return `${value >= 100 || unitIdx === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIdx]}`;
+  }, []);
+
   // helper to export Wingtra flight plan
   const handleExportWingtra = useCallback(() => {
     const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
@@ -247,6 +410,12 @@ export default function Home() {
   const hasImportedPolygons = Object.keys(importedOriginals).length > 0;
   const hasPolygonsToAnalyze = hasResults || hasImportedPolygons;
   const panelEnabled = hasPolygonsToAnalyze || importedPoseCount>0; // enable if poses-only
+  const terrainDescriptor = terrainSourceState.descriptor;
+  const availableTerrainDatasets = terrainSourceState.datasets;
+  const terrainMode = terrainSourceState.source.mode;
+  const terrainCoverageRatio = terrainDescriptor?.validCoverageRatio ?? null;
+  const terrainCoverageWarning = terrainCoverageRatio != null && terrainCoverageRatio < 0.8;
+  const terrainAnalysisDisabled = terrainSourceState.isLoading;
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
@@ -281,6 +450,9 @@ export default function Home() {
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => mapRef.current?.openKmlFilePicker?.()}>
                   KML Polygons (.kml)
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={handleOpenDsmPicker}>
+                  Surface model (.tif/.tiff)
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => openDJIImporterRef.current?.('dji')}>
                   DJI Camera JSON (input_cameras.json)
@@ -325,6 +497,13 @@ export default function Home() {
       </header>
 
       <div className="flex-1 relative">
+        <input
+          ref={dsmInputRef}
+          type="file"
+          accept=".tif,.tiff,image/tiff"
+          onChange={handleDsmFileChange}
+          style={{ display: 'none' }}
+        />
         {/* PER‑POLYGON PARAMS DIALOG */}
         <Suspense fallback={null}>
         {(() => {
@@ -374,6 +553,120 @@ export default function Home() {
                 <h3 className="text-sm font-medium text-gray-900">Analysis</h3>
               </div>
 
+              <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-medium text-slate-900">Terrain source</div>
+                    <div className="mt-2 flex gap-2">
+                      <Button
+                        size="sm"
+                        variant={terrainMode === 'mapbox' ? 'default' : 'outline'}
+                        className="h-7 px-2 text-[11px]"
+                        onClick={() => setTerrainSourceMode('mapbox')}
+                        disabled={terrainSourceState.isLoading}
+                      >
+                        Mapbox
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={terrainMode === 'blended' ? 'default' : 'outline'}
+                        className="h-7 px-2 text-[11px]"
+                        onClick={() => setTerrainSourceMode('blended')}
+                        disabled={terrainSourceState.isLoading || !terrainDescriptor}
+                      >
+                        Blended DSM
+                      </Button>
+                    </div>
+                    {terrainDescriptor ? (
+                      <div className="mt-1 space-y-1 text-[11px] text-slate-600">
+                        <div className="font-medium text-slate-800">{terrainDescriptor.name}</div>
+                        <div>
+                          {terrainDescriptor.width.toLocaleString()} x {terrainDescriptor.height.toLocaleString()} px · {formatBytes(terrainDescriptor.fileSizeBytes)}
+                        </div>
+                        <div>{terrainDescriptor.sourceCrsLabel}</div>
+                        {(terrainDescriptor.nativeResolutionXM || terrainDescriptor.nativeResolutionYM) && (
+                          <div>
+                            Native resolution: {(terrainDescriptor.nativeResolutionXM ?? 0).toFixed(2)} m × {(terrainDescriptor.nativeResolutionYM ?? 0).toFixed(2)} m
+                          </div>
+                        )}
+                        {terrainCoverageRatio != null && (
+                          <div>
+                            Valid DSM coverage: {(terrainCoverageRatio * 100).toFixed(1)}%
+                          </div>
+                        )}
+                        <div className="text-slate-500">
+                          {terrainMode === 'blended'
+                            ? 'Mesh, polygon analysis, GSD, lidar density, and autosplit use the blended DSM source.'
+                            : 'Mapbox terrain is active. The uploaded DSM is kept available for switching back.'}
+                        </div>
+                        {terrainCoverageWarning && (
+                          <div className="text-amber-700">
+                            Large invalid regions will fall back to Mapbox terrain outside the valid DSM coverage.
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        {availableTerrainDatasets.length > 0
+                          ? 'Using Mapbox terrain. Select a saved DSM below or import a new GeoTIFF to enable a blended DSM terrain source.'
+                          : 'Using Mapbox terrain. Import a GeoTIFF DSM to enable a blended DSM terrain source.'}
+                      </div>
+                    )}
+                    {terrainSourceState.backendEnabled && (
+                      <div className="mt-2 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="text-[11px] font-medium text-slate-700">
+                            Saved DSMs {terrainSourceState.isDatasetListLoading ? '…' : `(${availableTerrainDatasets.length})`}
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-[10px]"
+                            onClick={handleRefreshDsmLibrary}
+                            disabled={terrainSourceState.isLoading || terrainSourceState.isDatasetListLoading}
+                          >
+                            Refresh
+                          </Button>
+                        </div>
+                        <select
+                          className="h-8 w-full rounded-md border border-slate-200 bg-white px-2 text-[11px] text-slate-700"
+                          value={terrainDescriptor?.id ?? ''}
+                          onChange={handleSelectExistingDsm}
+                          disabled={terrainSourceState.isLoading || terrainSourceState.isDatasetListLoading || availableTerrainDatasets.length === 0}
+                        >
+                          <option value="">
+                            {availableTerrainDatasets.length === 0 ? 'No DSMs uploaded on this backend yet' : 'Select a saved DSM'}
+                          </option>
+                          {availableTerrainDatasets.map((dataset) => (
+                            <option key={dataset.id} value={dataset.id}>
+                              {dataset.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {terrainSourceState.error && (
+                      <div className="mt-1 text-[11px] text-red-600">{terrainSourceState.error}</div>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={handleOpenDsmPicker} disabled={terrainSourceState.isLoading}>
+                      {terrainSourceState.isLoading ? 'Loading…' : terrainDescriptor ? 'Replace' : 'Load DSM'}
+                    </Button>
+                    {terrainDescriptor && (
+                      <>
+                        <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToDsm}>
+                          Zoom
+                        </Button>
+                        <Button size="sm" variant="ghost" className="h-7 px-2 text-[11px]" onClick={handleClearDsm}>
+                          Clear
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
               {isAnalyzing && (
                 <div className="flex items-center justify-center py-4 border-b mb-3">
                   <div className="text-center">
@@ -394,7 +687,7 @@ export default function Home() {
 
               {/* Multiple Polygon Results */}
 
-              <div className={panelEnabled ? '' : 'opacity-50 pointer-events-none'}>
+              <div className={panelEnabled && !terrainAnalysisDisabled ? '' : 'opacity-50 pointer-events-none'}>
                 <Suspense fallback={<DeferredPanelFallback />}>
                   <OverlapGSDPanel
                     mapRef={mapRef}
@@ -426,6 +719,8 @@ export default function Home() {
             center={center}
             zoom={initialZoom}
             sampleStep={sampleStep}
+            terrainDemUrlTemplate={getTerrainDemUrlTemplateForCurrentSource()}
+            terrainSource={terrainSourceState.source}
             onAnalysisStart={handleAnalysisStart}
             onAnalysisComplete={handleAnalysisComplete}
             onError={handleError}

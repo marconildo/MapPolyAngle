@@ -1,11 +1,13 @@
 import type { TerrainPartitionSolutionPreview } from '@/components/MapFlightDirection/api';
 import type { FlightParams } from '@/domain/types';
+import type { TerrainSourceSelection } from '@/terrain/types';
 
 export interface TerrainPartitionBackendRequest {
   polygonId?: string;
   ring: [number, number][];
   payloadKind: 'camera' | 'lidar';
   params: FlightParams;
+  terrainSource: TerrainSourceSelection;
   altitudeMode: 'legacy' | 'min-clearance';
   minClearanceM: number;
   turnExtendM: number;

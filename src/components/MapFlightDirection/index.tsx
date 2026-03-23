@@ -10,7 +10,7 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
-import { useMapInitialization } from './hooks/useMapInitialization';
+import { setTerrainDemSourceOnMap, useMapInitialization } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import {
   addFlightLinesForPolygon,
@@ -32,6 +32,7 @@ import { fetchTilesForPolygon } from './utils/terrain';
 import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
 import { buildPartitionFrontier } from '@/utils/terrainPartitionGraph';
 import { isTerrainPartitionBackendEnabled, solveTerrainPartitionWithBackend } from '@/services/terrainPartitionBackend';
+import type { TerrainSourceSelection } from '@/terrain/types';
 // @ts-ignore Turf typings are inconsistent in this repo.
 import * as turf from '@turf/turf';
 
@@ -267,6 +268,8 @@ interface Props {
   center?: LngLatLike;
   zoom?: number;
   sampleStep?: number;
+  terrainDemUrlTemplate?: string | null;
+  terrainSource?: TerrainSourceSelection;
 
   onRequestParams?: (polygonId: string, ring: [number, number][]) => void;
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
@@ -284,6 +287,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       center = [8.54, 47.37],
       zoom = 13,
       sampleStep = 2,
+      terrainDemUrlTemplate = null,
+      terrainSource = { mode: 'mapbox', datasetId: null },
       onRequestParams,
       onAnalysisComplete,
       onAnalysisStart,
@@ -298,6 +303,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const mapRef = useRef<MapboxMap>();
     const drawRef = useRef<MapboxDraw>();
     const deckOverlayRef = useRef<MapboxOverlay>();
+    const terrainDemSourceTemplateRef = useRef<string | null>(terrainDemUrlTemplate);
 
     // File inputs
     const kmlInputRef = useRef<HTMLInputElement>(null);
@@ -992,6 +998,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         mapRef.current = map;
         drawRef.current = draw;
         deckOverlayRef.current = overlay;
+        setTerrainDemSourceOnMap(map, terrainDemSourceTemplateRef.current);
         map.on('draw.create', handleDrawCreate);
         map.on('draw.update', handleDrawUpdate);
         map.on('draw.delete', handleDrawDelete);
@@ -1028,6 +1035,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
       [handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected]
     );
+
+    useEffect(() => {
+      terrainDemSourceTemplateRef.current = terrainDemUrlTemplate;
+      if (mapRef.current && mapRef.current.isStyleLoaded()) {
+        setTerrainDemSourceOnMap(mapRef.current, terrainDemUrlTemplate);
+      }
+    }, [terrainDemUrlTemplate]);
 
     useMapInitialization({
       mapboxToken,
@@ -1538,6 +1552,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
     }, [analyzePolygon]);
 
+    const refreshTerrainForAllPolygons = useCallback(() => {
+      console.log('🔄 Refreshing terrain analysis for all polygons using current terrain source');
+      cancelAllAnalyses();
+      const draw = drawRef.current as any;
+      const features = draw?.getAll?.()?.features ?? [];
+      for (const feature of features) {
+        if (feature?.geometry?.type !== 'Polygon' || !feature.id) continue;
+        analyzePolygon(String(feature.id), feature);
+      }
+    }, [analyzePolygon, cancelAllAnalyses]);
+
     const getTerrainPartitionContext = useCallback(async (polygonId: string) => {
       const draw = drawRef.current as any;
       const feature = draw?.get?.(polygonId);
@@ -1638,6 +1663,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             ring,
             payloadKind: isLidarParams(params) ? 'lidar' : 'camera',
             params,
+            terrainSource,
             altitudeMode,
             minClearanceM,
             turnExtendM,
@@ -1665,7 +1691,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       });
       backendPartitionSolutionsRef.current.set(polygonId, local);
       return local;
-    }, [altitudeMode, getLocalTerrainPartitionSolutions, getTerrainPartitionContext, minClearanceM, turnExtendM]);
+    }, [altitudeMode, getLocalTerrainPartitionSolutions, getTerrainPartitionContext, minClearanceM, terrainSource, turnExtendM]);
 
     const applyTerrainPartitionRings = useCallback(async (
       polygonId: string,
@@ -2032,6 +2058,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       },
       getPolygonResults: () => Array.from(polygonResultsRef.current.values()),
       getMap: () => mapRef.current,
+      refreshTerrainForAllPolygons,
+      setTerrainDemSource: (tileUrlTemplate: string | null) => {
+        terrainDemSourceTemplateRef.current = tileUrlTemplate;
+        if (mapRef.current && mapRef.current.isStyleLoaded()) {
+          setTerrainDemSourceOnMap(mapRef.current, tileUrlTemplate);
+        }
+      },
       getPolygons: (): [number,number][][] => {
         const draw = drawRef.current;
         if (!draw) return [];
@@ -2142,7 +2175,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       getTerrainPartitionSolutions, applyTerrainPartitionSolution,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
-      optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis,
+      optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons,
       lastImportedFlightplan
     ]);
 
