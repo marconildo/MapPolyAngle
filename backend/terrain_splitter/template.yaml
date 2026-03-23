@@ -66,6 +66,7 @@ Globals:
         TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC: !Ref LambdaInvokeReadTimeoutSec
         TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS: !Ref NestedLambdaMinCells
         TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT: !Ref NestedLambdaMaxInflight
+        TERRAIN_SPLITTER_EXACT_LAMBDA_FUNCTION_NAME: !Sub "${AWS::StackName}-terrain-splitter-exact"
         PYTHONPATH: /var/task
 
 Resources:
@@ -89,6 +90,10 @@ Resources:
               Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter"
             - Effect: Allow
               Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter-exact"
+            - Effect: Allow
+              Action:
                 - s3:ListBucket
               Resource: !GetAtt TerrainSplitterDsmBucket.Arn
             - Effect: Allow
@@ -98,6 +103,32 @@ Resources:
               Resource: !Sub "${TerrainSplitterDsmBucket.Arn}/*"
       EphemeralStorage:
         Size: 2048
+      Environment:
+        Variables:
+          TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP: "false"
+
+  TerrainSplitterExactFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-terrain-splitter-exact"
+      Runtime: nodejs20.x
+      Timeout: 900
+      MemorySize: 4096
+      Handler: index.handler
+      CodeUri: ../..
+      Environment:
+        Variables:
+          EXACT_RUNTIME_PROVIDER_MODE: lambda
+          EXACT_RUNTIME_TERRAIN_BATCH_FUNCTION_NAME: !Ref TerrainSplitterFunction
+          TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP: "false"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter"
 
   TerrainSplitterFunctionUrl:
     Type: AWS::Lambda::Url

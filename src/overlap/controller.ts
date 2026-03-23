@@ -1,7 +1,10 @@
 import type { PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
-import { lngLatToTile, tileCornersLngLat } from "./mercator";
+import { tileCornersLngLat } from "./mercator";
+import { tilesCoveringPolygon } from "./tileCoverage";
 import { applyActiveDsmToTerrainRgbTile } from "@/terrain/dsmSource";
 import { getTerrainTileUrlForCurrentSource } from "@/terrain/terrainSource";
+
+export { tilesCoveringPolygon } from "./tileCoverage";
 
 export async function fetchTerrainRGBA(
   z: number, x: number, y: number, token: string, _size = 512, signal?: AbortSignal
@@ -38,20 +41,6 @@ function loadImage(url: string, signal?: AbortSignal): Promise<HTMLImageElement>
     }
     img.src = url;
   });
-}
-
-export function tilesCoveringPolygon(polygon: PolygonLngLat, z: number, pad: number = 0) {
-  const lons = polygon.ring.map(p=>p[0]);
-  const lats = polygon.ring.map(p=>p[1]);
-  const min = { lon: Math.min(...lons), lat: Math.min(...lats) };
-  const max = { lon: Math.max(...lons), lat: Math.max(...lats) };
-  const tMin = lngLatToTile(min.lon, max.lat, z);
-  const tMax = lngLatToTile(max.lon, min.lat, z);
-  const tiles: {x:number;y:number}[] = [];
-  for (let x=tMin.x - pad; x<=tMax.x + pad; x++) {
-    for (let y=tMin.y - pad; y<=tMax.y + pad; y++) tiles.push({x,y});
-  }
-  return tiles;
 }
 
 export function tileCornersForImageSource(z:number,x:number,y:number) {

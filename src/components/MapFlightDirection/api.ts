@@ -7,7 +7,10 @@ import type { Map as MapboxMap } from 'mapbox-gl';
 import type {
   FlightParams
 } from '@/domain/types';
+import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { PolygonAnalysisResult } from './types';
+
+export type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 
 export interface PolygonWithId {
   id?: string;
@@ -30,29 +33,6 @@ export interface ImportedFlightplanArea {
     triggerDistanceM: number;
     source: 'wingtra';
   };
-}
-
-export interface TerrainPartitionSolutionPreview {
-  signature: string;
-  tradeoff: number;
-  regionCount: number;
-  totalMissionTimeSec: number;
-  normalizedQualityCost: number;
-  weightedMeanMismatchDeg: number;
-  hierarchyLevel: number;
-  largestRegionFraction: number;
-  meanConvexity: number;
-  boundaryBreakAlignment: number;
-  isFirstPracticalSplit: boolean;
-  regions: Array<{
-    areaM2: number;
-    bearingDeg: number;
-    atomCount: number;
-    ring: [number, number][];
-    convexity: number;
-    compactness: number;
-    baseAltitudeAGL?: number;
-  }>;
 }
 
 export interface MapFlightDirectionAPI {
@@ -92,6 +72,7 @@ export interface MapFlightDirectionAPI {
   applyParamsToAllPending(params: FlightParams): void; // bulk apply same params to queued polygons
   getFlightLines(): Map<string, {
     flightLines: number[][][];
+    sweepIndices?: number[];
     lineSpacing: number;
     altitudeAGL: number
   }>;

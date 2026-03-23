@@ -1,5 +1,5 @@
-import type { TerrainPartitionSolutionPreview } from '@/components/MapFlightDirection/api';
 import type { FlightParams } from '@/domain/types';
+import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { TerrainSourceSelection } from '@/terrain/types';
 
 export interface TerrainPartitionBackendRequest {

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import importlib
 import io
+import json
+import threading
+from base64 import b64encode
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
 import tifffile
 from fastapi.testclient import TestClient
+from PIL import Image
+import main as main_module
 
 from terrain_splitter import app as app_module
 from terrain_splitter.dsm_store import DsmDatasetStore, S3BackedDsmDatasetStore, create_dsm_dataset_store
+from terrain_splitter.exact_bridge import LocalExactRuntimeSidecarBridge
 from terrain_splitter.mapbox_tiles import TerrainTile
-from terrain_splitter.schemas import DsmSourceDescriptorModel, TerrainSourceModel
+from terrain_splitter.schemas import DsmSourceDescriptorModel, PartitionSolutionPreviewModel, TerrainBatchResponseModel, TerrainSourceModel
 
 
 def _descriptor() -> DsmSourceDescriptorModel:
@@ -191,6 +199,129 @@ class _FakeS3Client:
     def get_paginator(self, name: str):
         assert name == "list_objects_v2"
         return _FakePaginator(self)
+
+
+class _FakeExactBridge:
+    def __init__(self, optimize_response: dict | None = None, rerank_response: dict | None = None):
+        self.optimize_response = optimize_response or {}
+        self.rerank_response = rerank_response or {}
+        self.optimize_requests: list[dict] = []
+        self.rerank_requests: list[dict] = []
+
+    def optimize_bearing(self, request: dict) -> dict:
+        self.optimize_requests.append(request)
+        return self.optimize_response
+
+    def rerank_solutions(self, request: dict) -> dict:
+        self.rerank_requests.append(request)
+        return self.rerank_response
+
+
+def _encode_png_bytes(size: int, rgba_value: int = 128) -> bytes:
+    rgba = np.full((size, size, 4), rgba_value, dtype=np.uint8)
+    rgba[:, :, 3] = 255
+    out = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(out, format="PNG")
+    return out.getvalue()
+
+
+def _encode_terrain_png_bytes(size: int) -> bytes:
+    rgba = np.zeros((size, size, 4), dtype=np.uint8)
+    for row in range(size):
+        for col in range(size):
+            elevation = 220.0 + row * 0.4 + col * 0.3
+            encoded = max(0, min(16777215, round((elevation + 10000.0) * 10.0)))
+            rgba[row, col, 0] = (encoded >> 16) & 255
+            rgba[row, col, 1] = (encoded >> 8) & 255
+            rgba[row, col, 2] = encoded & 255
+            rgba[row, col, 3] = 255
+    out = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(out, format="PNG")
+    return out.getvalue()
+
+
+class _TerrainBatchStubServer:
+    def __init__(self, png_payload: bytes):
+        self.png_payload = png_payload
+        self.requests: list[dict] = []
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self.base_url: str | None = None
+
+    def __enter__(self):
+        outer = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                if self.path != "/v1/internal/terrain-batch":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                outer.requests.append(payload)
+                tiles = []
+                for tile in payload.get("tiles", []):
+                    tiles.append(
+                        {
+                            "z": tile["z"],
+                            "x": tile["x"],
+                            "y": tile["y"],
+                            "size": 64,
+                            "pngBase64": b64encode(outer.png_payload).decode("ascii"),
+                            "demPngBase64": None,
+                            "demSize": None,
+                            "demPadTiles": tile.get("padTiles"),
+                        }
+                    )
+                body = json.dumps({"operation": "terrain-batch", "tiles": tiles}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):  # noqa: A003
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        host, port = self._server.server_address
+        self.base_url = f"http://{host}:{port}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
+def _exact_request_payload() -> dict:
+    return {
+        "polygonId": "poly-1",
+        "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+        "payloadKind": "camera",
+        "params": {
+            "payloadKind": "camera",
+            "altitudeAGL": 110,
+            "frontOverlap": 75,
+            "sideOverlap": 70,
+        },
+        "terrainSource": {"mode": "mapbox"},
+        "altitudeMode": "legacy",
+        "minClearanceM": 0,
+        "turnExtendM": 0,
+        "seedBearingDeg": 17,
+        "mode": "global",
+        "halfWindowDeg": 90,
+    }
+
+
+def _route_paths(module) -> set[str]:
+    return {route.path for route in module.app.routes}
 
 
 def test_dataset_store_overlays_terrain_tile_with_explicit_source(tmp_path: Path) -> None:
@@ -541,3 +672,453 @@ def test_dsm_upload_accepts_model_transformation_geotiff(tmp_path: Path) -> None
     finally:
         app_module.DSM_DIR = original_dir
         app_module.DSM_DATASET_STORE = original_store
+
+
+def test_internal_terrain_batch_returns_png_payloads(monkeypatch) -> None:
+    png_payload = _encode_png_bytes(4, 64)
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr(app_module, "TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr(app_module, "mapbox_token", lambda: "test-token")
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    try:
+        app_module.EXACT_RUNTIME_BRIDGE = None
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/internal/terrain-batch",
+                json={
+                    "terrainSource": {"mode": "mapbox"},
+                    "tiles": [{"z": 0, "x": 0, "y": 0, "padTiles": 1}],
+                },
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["operation"] == "terrain-batch"
+            assert len(payload["tiles"]) == 1
+            tile = payload["tiles"][0]
+            assert tile["pngBase64"]
+            assert tile["demPngBase64"]
+            assert tile["demSize"] == 12
+            assert tile["demPadTiles"] == 1
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_internal_terrain_batch_http_route_only_mounts_in_local_mode(monkeypatch) -> None:
+    try:
+        with monkeypatch.context() as local_ctx:
+            local_ctx.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+            local_ctx.delenv("TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP", raising=False)
+            local_ctx.setenv("TERRAIN_SPLITTER_DISABLE_EXACT_POSTPROCESS", "true")
+            local_module = importlib.reload(app_module)
+            assert "/v1/internal/terrain-batch" in _route_paths(local_module)
+
+        with monkeypatch.context() as lambda_ctx:
+            lambda_ctx.setenv("AWS_LAMBDA_FUNCTION_NAME", "terrain-splitter")
+            lambda_ctx.delenv("TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP", raising=False)
+            lambda_ctx.setenv("TERRAIN_SPLITTER_DISABLE_EXACT_POSTPROCESS", "true")
+            lambda_module = importlib.reload(app_module)
+            assert "/v1/internal/terrain-batch" not in _route_paths(lambda_module)
+            with TestClient(lambda_module.app) as client:
+                response = client.post(
+                    "/v1/internal/terrain-batch",
+                    json={"terrainSource": {"mode": "mapbox"}, "tiles": [{"z": 0, "x": 0, "y": 0}]},
+                )
+                assert response.status_code == 404
+    finally:
+        monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+        monkeypatch.delenv("TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP", raising=False)
+        monkeypatch.delenv("TERRAIN_SPLITTER_DISABLE_EXACT_POSTPROCESS", raising=False)
+        importlib.reload(app_module)
+
+
+def test_lambda_internal_terrain_batch_event_still_works(monkeypatch) -> None:
+    captured = {}
+
+    def _fake_build_response(request):
+        captured["request"] = request
+        return TerrainBatchResponseModel.model_validate(
+            {
+                "operation": "terrain-batch",
+                "tiles": [
+                    {
+                        "z": 0,
+                        "x": 0,
+                        "y": 0,
+                        "size": 4,
+                        "pngBase64": "Zm9v",
+                        "demPngBase64": None,
+                        "demSize": None,
+                        "demPadTiles": None,
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(main_module, "_build_terrain_batch_response", _fake_build_response)
+    response = main_module.lambda_handler(
+        {
+            "terrainSplitterInternal": "terrain-batch",
+            "payload": {
+                "terrainSource": {"mode": "mapbox"},
+                "tiles": [{"z": 0, "x": 0, "y": 0}],
+            },
+        },
+        None,
+    )
+    assert response["operation"] == "terrain-batch"
+    assert captured["request"].terrainSource.mode == "mapbox"
+    assert captured["request"].tiles[0].z == 0
+
+
+def test_exact_optimize_endpoint_uses_bridge() -> None:
+    bridge = _FakeExactBridge(
+        optimize_response={
+            "best": {
+                "bearingDeg": 27.5,
+                "exactCost": 1.2,
+                "qualityCost": 0.8,
+                "missionTimeSec": 90.0,
+                "normalizedTimeCost": 0.5,
+                "metricKind": "gsd",
+                "diagnostics": {"q90": 0.03},
+            },
+            "seedBearingDeg": 10.0,
+            "lineSpacingM": 34.0,
+        }
+    )
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/exact/optimize-bearing",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[7.0, 47.0], [7.01, 47.0], [7.01, 47.01], [7.0, 47.01], [7.0, 47.0]],
+                    "payloadKind": "camera",
+                    "params": {
+                        "payloadKind": "camera",
+                        "altitudeAGL": 100,
+                        "frontOverlap": 75,
+                        "sideOverlap": 70,
+                    },
+                    "terrainSource": {"mode": "mapbox"},
+                    "seedBearingDeg": 10,
+                },
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["bearingDeg"] == 27.5
+            assert payload["metricKind"] == "gsd"
+            assert payload["diagnostics"]["q90"] == 0.03
+            assert bridge.optimize_requests and bridge.optimize_requests[0]["polygonId"] == "poly-1"
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_exact_optimize_endpoint_matches_local_exact_runtime(monkeypatch) -> None:
+    png_payload = _encode_terrain_png_bytes(64)
+    repo_root = Path(__file__).resolve().parents[3]
+    with _TerrainBatchStubServer(png_payload) as terrain_server:
+        monkeypatch.setenv("TERRAIN_SPLITTER_INTERNAL_BASE_URL", terrain_server.base_url)
+        bridge = LocalExactRuntimeSidecarBridge(repo_root)
+        original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+        app_module.EXACT_RUNTIME_BRIDGE = bridge
+        request_payload = _exact_request_payload()
+        try:
+            expected = bridge.optimize_bearing(request_payload)
+            with TestClient(app_module.app) as client:
+                response = client.post("/v1/exact/optimize-bearing", json=request_payload)
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["bearingDeg"] == expected["best"]["bearingDeg"]
+            assert payload["exactScore"] == expected["best"]["exactCost"]
+            assert payload["qualityCost"] == expected["best"]["qualityCost"]
+            assert payload["missionTimeSec"] == expected["best"]["missionTimeSec"]
+            assert payload["metricKind"] == expected["best"]["metricKind"]
+            assert payload["seedBearingDeg"] == expected["seedBearingDeg"]
+            assert terrain_server.requests, "exact runtime should request terrain batches through the stub server"
+        finally:
+            bridge.close()
+            app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_returns_backend_exact_reranked_solutions(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.5,
+                "regionCount": 2,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.4,
+                "weightedMeanMismatchDeg": 4.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 0.6,
+                "meanConvexity": 0.9,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 20.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                    {"areaM2": 12.0, "bearingDeg": 25.0, "atomCount": 2, "ring": [[1, 0], [2, 0], [2, 1], [1, 0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 2,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 0.6,
+                "meanConvexity": 0.9,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                    {"areaM2": 12.0, "bearingDeg": 45.0, "atomCount": 2, "ring": [[1, 0], [2, 0], [2, 1], [1, 0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+    app_module.EXACT_POSTPROCESS_TOP_K = 1
+
+    bridge = _FakeExactBridge(
+        rerank_response={
+            "solutions": [
+                {
+                    **surrogate_solutions[1].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 0.2,
+                    "exactMetricKind": "density",
+                    "regions": [
+                        {**surrogate_solutions[1].regions[0].model_dump(mode="json"), "bearingDeg": 41.0, "exactScore": 0.1, "exactSeedBearingDeg": 40.0},
+                        {**surrogate_solutions[1].regions[1].model_dump(mode="json"), "bearingDeg": 46.0, "exactScore": 0.1, "exactSeedBearingDeg": 45.0},
+                    ],
+                }
+            ]
+        }
+    )
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[7.0, 47.0], [7.01, 47.0], [7.01, 47.01], [7.0, 47.01], [7.0, 47.0]],
+                    "payloadKind": "lidar",
+                    "params": {
+                        "payloadKind": "lidar",
+                        "altitudeAGL": 120,
+                        "frontOverlap": 0,
+                        "sideOverlap": 40,
+                    },
+                    "terrainSource": {"mode": "mapbox"},
+                },
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert len(payload["solutions"]) == 1
+            assert payload["solutions"][0]["rankingSource"] == "backend-exact"
+            assert payload["solutions"][0]["regions"][0]["bearingDeg"] == 41.0
+            assert bridge.rerank_requests and bridge.rerank_requests[0]["polygonId"] == "poly-1"
+            assert len(bridge.rerank_requests[0]["solutions"]) == 1
+    finally:
+        app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_preserves_surrogate_only_behavior_when_exact_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.5,
+                "regionCount": 2,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.4,
+                "weightedMeanMismatchDeg": 4.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 0.6,
+                "meanConvexity": 0.9,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 20.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                    {"areaM2": 12.0, "bearingDeg": 25.0, "atomCount": 2, "ring": [[1, 0], [2, 0], [2, 1], [1, 0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 2,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 0.6,
+                "meanConvexity": 0.9,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                    {"areaM2": 12.0, "bearingDeg": 45.0, "atomCount": 2, "ring": [[1, 0], [2, 0], [2, 1], [1, 0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    app_module.EXACT_RUNTIME_BRIDGE = None
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[7.0, 47.0], [7.01, 47.0], [7.01, 47.01], [7.0, 47.01], [7.0, 47.0]],
+                    "payloadKind": "camera",
+                    "params": {
+                        "payloadKind": "camera",
+                        "altitudeAGL": 120,
+                        "frontOverlap": 75,
+                        "sideOverlap": 70,
+                    },
+                    "terrainSource": {"mode": "mapbox"},
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert [solution["signature"] for solution in payload["solutions"]] == ["surrogate-a", "surrogate-b"]
+        assert payload["solutions"][0]["regions"][0]["bearingDeg"] == 20.0
+        assert payload["solutions"][1]["regions"][0]["bearingDeg"] == 40.0
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_exact_rerank_matches_local_exact_runtime(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.5,
+                "regionCount": 1,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.4,
+                "weightedMeanMismatchDeg": 4.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 90.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 0.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+
+    png_payload = _encode_terrain_png_bytes(64)
+    repo_root = Path(__file__).resolve().parents[3]
+    with _TerrainBatchStubServer(png_payload) as terrain_server:
+        monkeypatch.setenv("TERRAIN_SPLITTER_INTERNAL_BASE_URL", terrain_server.base_url)
+        bridge = LocalExactRuntimeSidecarBridge(repo_root)
+        original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+        original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+        app_module.EXACT_RUNTIME_BRIDGE = bridge
+        app_module.EXACT_POSTPROCESS_TOP_K = 2
+        try:
+            request_json = {
+                "polygonId": "poly-1",
+                "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+                "payloadKind": "camera",
+                "params": {
+                    "payloadKind": "camera",
+                    "altitudeAGL": 110,
+                    "frontOverlap": 75,
+                    "sideOverlap": 70,
+                },
+                "terrainSource": {"mode": "mapbox"},
+                "altitudeMode": "legacy",
+                "minClearanceM": 0,
+                "turnExtendM": 0,
+            }
+            expected = bridge.rerank_solutions(
+                {
+                    "polygonId": "poly-1",
+                    "payloadKind": "camera",
+                    "terrainSource": {"mode": "mapbox"},
+                    "params": request_json["params"],
+                    "ring": request_json["ring"],
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                    "solutions": [solution.model_dump(mode="json") for solution in surrogate_solutions],
+                    "rankingSource": "backend-exact",
+                }
+            )
+            with TestClient(app_module.app) as client:
+                response = client.post("/v1/partition/solve", json=request_json)
+            assert response.status_code == 200
+            payload = response.json()
+            assert [solution["signature"] for solution in payload["solutions"]] == [
+                solution["signature"] for solution in expected["solutions"]
+            ]
+            assert payload["solutions"][0]["rankingSource"] == "backend-exact"
+            assert payload["solutions"][0]["regions"][0]["bearingDeg"] == expected["solutions"][0]["regions"][0]["bearingDeg"]
+            assert payload["solutions"][1]["regions"][0]["bearingDeg"] == expected["solutions"][1]["regions"][0]["bearingDeg"]
+            assert payload["solutions"][0]["exactScore"] == expected["solutions"][0]["exactScore"]
+            assert payload["solutions"][1]["exactScore"] == expected["solutions"][1]["exactScore"]
+            assert terrain_server.requests, "exact rerank should fetch terrain through the stub server"
+        finally:
+            bridge.close()
+            app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+            app_module.EXACT_RUNTIME_BRIDGE = original_bridge

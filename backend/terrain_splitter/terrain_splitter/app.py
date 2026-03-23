@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import logging
 import os
 import time
@@ -17,6 +18,7 @@ from PIL import Image
 
 from .debug import write_debug_artifacts
 from .dsm_store import create_dsm_dataset_store, derive_descriptor_from_payload
+from .exact_bridge import create_exact_runtime_bridge
 from .features import compute_feature_field
 from .grid import build_grid
 from .mapbox_tiles import TerrainTileCache, fetch_dem_for_ring, mapbox_token
@@ -24,9 +26,15 @@ from .schemas import (
     DebugArtifacts,
     DsmDatasetListResponse,
     DsmStatusResponse,
+    ExactOptimizeBearingRequest,
+    ExactOptimizeBearingResponse,
     PartitionSolveRequest,
     PartitionSolveResponse,
+    PartitionSolutionPreviewModel,
     TerrainSourceModel,
+    TerrainBatchRequestModel,
+    TerrainBatchResponseModel,
+    TerrainBatchTileResponseModel,
 )
 from .solver_graphcut import solve_partition_hierarchy
 
@@ -47,10 +55,18 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _should_enable_internal_http() -> bool:
+    default_enabled = not bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    return _env_flag("TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP", default_enabled)
+
+
 CACHE_DIR = _runtime_dir("TERRAIN_SPLITTER_CACHE_DIR", ".cache")
 DEBUG_DIR = _runtime_dir("TERRAIN_SPLITTER_DEBUG_DIR", ".debug")
 DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
 DSM_DATASET_STORE = create_dsm_dataset_store(DSM_DIR)
+EXACT_RUNTIME_BRIDGE = create_exact_runtime_bridge()
+EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_K", "3")))
+ENABLE_INTERNAL_TERRAIN_BATCH_HTTP = _should_enable_internal_http()
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Terrain Splitter Backend", version="0.1.0")
@@ -67,6 +83,92 @@ if _env_flag("TERRAIN_SPLITTER_ENABLE_APP_CORS", True):
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _normalize_tile_ref(z: int, x: int, y: int) -> tuple[int, int, int]:
+    tiles_per_axis = 1 << z
+    wrapped_x = ((x % tiles_per_axis) + tiles_per_axis) % tiles_per_axis
+    clamped_y = max(0, min(tiles_per_axis - 1, y))
+    return z, wrapped_x, clamped_y
+
+
+def _encode_rgba_png_bytes(rgba: np.ndarray) -> bytes:
+    out = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(out, format="PNG")
+    return out.getvalue()
+
+
+def _fetch_terrain_rgba_tile(
+    cache: TerrainTileCache,
+    client: httpx.Client,
+    terrain_source: TerrainSourceModel,
+    z: int,
+    x: int,
+    y: int,
+) -> np.ndarray:
+    z, x, y = _normalize_tile_ref(z, x, y)
+    payload = cache.get_or_fetch(client, mapbox_token(), z, x, y)
+    image = Image.open(io.BytesIO(payload)).convert("RGBA")
+    rgba = np.asarray(image, dtype=np.uint8).copy()
+    DSM_DATASET_STORE.apply_terrain_source_to_rgba_tile(terrain_source, z, x, y, rgba)
+    return rgba
+
+
+def _build_padded_dem_rgba(
+    cache: TerrainTileCache,
+    client: httpx.Client,
+    terrain_source: TerrainSourceModel,
+    z: int,
+    x: int,
+    y: int,
+    pad_tiles: int,
+) -> np.ndarray:
+    center_rgba = _fetch_terrain_rgba_tile(cache, client, terrain_source, z, x, y)
+    tile_size = center_rgba.shape[0]
+    if pad_tiles <= 0:
+        return center_rgba
+    span = pad_tiles * 2 + 1
+    dem_size = tile_size * span
+    dem_rgba = np.zeros((dem_size, dem_size, 4), dtype=np.uint8)
+    for dy in range(-pad_tiles, pad_tiles + 1):
+        for dx in range(-pad_tiles, pad_tiles + 1):
+            _, nx, ny = _normalize_tile_ref(z, x + dx, y + dy)
+            tile_rgba = _fetch_terrain_rgba_tile(cache, client, terrain_source, z, nx, ny)
+            offset_x = (dx + pad_tiles) * tile_size
+            offset_y = (dy + pad_tiles) * tile_size
+            dem_rgba[offset_y : offset_y + tile_size, offset_x : offset_x + tile_size, :] = tile_rgba
+    return dem_rgba
+
+
+def _build_terrain_batch_response(request: TerrainBatchRequestModel) -> TerrainBatchResponseModel:
+    cache = TerrainTileCache(CACHE_DIR)
+    entries: list[TerrainBatchTileResponseModel] = []
+    with httpx.Client(follow_redirects=True) as client:
+        for tile in request.tiles:
+            z, x, y = _normalize_tile_ref(tile.z, tile.x, tile.y)
+            rgba = _fetch_terrain_rgba_tile(cache, client, request.terrainSource, z, x, y)
+            png_bytes = _encode_rgba_png_bytes(rgba)
+            dem_png_base64: str | None = None
+            dem_size: int | None = None
+            dem_pad_tiles: int | None = None
+            if tile.padTiles and tile.padTiles > 0:
+                dem_rgba = _build_padded_dem_rgba(cache, client, request.terrainSource, z, x, y, tile.padTiles)
+                dem_png_base64 = base64.b64encode(_encode_rgba_png_bytes(dem_rgba)).decode("ascii")
+                dem_size = int(dem_rgba.shape[0])
+                dem_pad_tiles = tile.padTiles
+            entries.append(
+                TerrainBatchTileResponseModel(
+                    z=z,
+                    x=x,
+                    y=y,
+                    size=int(rgba.shape[0]),
+                    pngBase64=base64.b64encode(png_bytes).decode("ascii"),
+                    demPngBase64=dem_png_base64,
+                    demSize=dem_size,
+                    demPadTiles=dem_pad_tiles,
+                )
+            )
+    return TerrainBatchResponseModel(tiles=entries)
 
 
 def _terrain_tile_url_template(request: Request, terrain_source: TerrainSourceModel) -> str:
@@ -172,6 +274,34 @@ def terrain_rgb_tile(z: int, x: int, y: int, mode: str = "mapbox", datasetId: st
     return Response(content=out.getvalue(), media_type="image/png", headers=headers)
 
 
+if ENABLE_INTERNAL_TERRAIN_BATCH_HTTP:
+    @app.post("/v1/internal/terrain-batch", response_model=TerrainBatchResponseModel)
+    def terrain_batch(request: TerrainBatchRequestModel) -> TerrainBatchResponseModel:
+        return _build_terrain_batch_response(request)
+
+
+@app.post("/v1/exact/optimize-bearing", response_model=ExactOptimizeBearingResponse)
+def optimize_bearing_exact(request: ExactOptimizeBearingRequest) -> ExactOptimizeBearingResponse:
+    if EXACT_RUNTIME_BRIDGE is None:
+        raise HTTPException(status_code=503, detail="Backend exact optimization is not available.")
+    try:
+        payload = EXACT_RUNTIME_BRIDGE.optimize_bearing(request.model_dump(mode="json"))
+        best = payload.get("best") or {}
+        return ExactOptimizeBearingResponse(
+            bearingDeg=best.get("bearingDeg"),
+            exactScore=best.get("exactCost"),
+            qualityCost=best.get("qualityCost"),
+            missionTimeSec=best.get("missionTimeSec"),
+            normalizedTimeCost=best.get("normalizedTimeCost"),
+            metricKind=best.get("metricKind"),
+            seedBearingDeg=float(payload.get("seedBearingDeg", request.seedBearingDeg)),
+            lineSpacingM=payload.get("lineSpacingM"),
+            diagnostics=best.get("diagnostics") or {},
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/v1/partition/solve", response_model=PartitionSolveResponse)
 def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
     request_id = uuid.uuid4().hex[:12]
@@ -216,6 +346,41 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         )
         solve_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
+        stage_started_at = time.perf_counter()
+        exact_postprocess_ms = 0.0
+        if EXACT_RUNTIME_BRIDGE is not None and len(solutions) > 1:
+            try:
+                exact_candidates = solutions[: min(EXACT_POSTPROCESS_TOP_K, len(solutions))]
+                # Exact-enabled responses intentionally replace the surrogate tail with the
+                # exact-reranked shortlist instead of appending discarded surrogate options.
+                exact_response = EXACT_RUNTIME_BRIDGE.rerank_solutions(
+                    {
+                        "polygonId": request.polygonId or request_id,
+                        "payloadKind": request.payloadKind,
+                        "terrainSource": request.terrainSource.model_dump(mode="json"),
+                        "params": request.params.model_dump(mode="json"),
+                        "ring": request.ring,
+                        "altitudeMode": request.altitudeMode,
+                        "minClearanceM": request.minClearanceM,
+                        "turnExtendM": request.turnExtendM,
+                        "solutions": [solution.model_dump(mode="json") for solution in exact_candidates],
+                        "rankingSource": "backend-exact",
+                    }
+                )
+                exact_solutions = [
+                    PartitionSolutionPreviewModel.model_validate(solution_payload)
+                    for solution_payload in exact_response.get("solutions", [])
+                ]
+                if exact_solutions:
+                    solutions = exact_solutions
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[terrain-split-backend][%s] exact partition rerank failed; using surrogate ordering error=%s",
+                    request_id,
+                    exc,
+                )
+        exact_postprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
+
         debug_payload = None
         if request.debug:
             stage_started_at = time.perf_counter()
@@ -251,6 +416,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                         "buildGridMs": round(build_grid_ms, 3),
                         "computeFeaturesMs": round(compute_features_ms, 3),
                         "solveMs": round(solve_ms, 3),
+                        "exactPostprocessMs": round(exact_postprocess_ms, 3),
                         "totalMs": round((time.perf_counter() - started_at) * 1000.0, 3),
                     },
                 },
@@ -264,7 +430,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
 
         total_ms = (time.perf_counter() - started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solve request finished polygonId=%s payload=%s solutions=%d fetchDemMs=%.1f buildGridMs=%.1f computeFeaturesMs=%.1f solveMs=%.1f debugArtifactsMs=%.1f totalMs=%.1f",
+            "[terrain-split-backend][%s] solve request finished polygonId=%s payload=%s solutions=%d fetchDemMs=%.1f buildGridMs=%.1f computeFeaturesMs=%.1f solveMs=%.1f exactPostprocessMs=%.1f debugArtifactsMs=%.1f totalMs=%.1f",
             request_id,
             request.polygonId or "<none>",
             request.payloadKind,
@@ -273,6 +439,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
             build_grid_ms,
             compute_features_ms,
             solve_ms,
+            exact_postprocess_ms,
             debug_artifacts_ms,
             total_ms,
         )

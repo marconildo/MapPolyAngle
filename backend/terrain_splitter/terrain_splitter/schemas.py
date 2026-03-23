@@ -10,6 +10,8 @@ LidarReturnMode = Literal["single", "dual", "triple"]
 LidarComparisonMode = Literal["first-return", "all-returns"]
 TerrainSourceMode = Literal["mapbox", "blended"]
 DsmProcessingStatus = Literal["ready"]
+PartitionRankingSource = Literal["surrogate", "backend-exact", "frontend-exact"]
+ExactMetricKind = Literal["gsd", "density"]
 
 
 class FlightParamsModel(BaseModel):
@@ -112,6 +114,8 @@ class RegionPreview(BaseModel):
     convexity: float
     compactness: float
     baseAltitudeAGL: float | None = None
+    exactScore: float | None = None
+    exactSeedBearingDeg: float | None = None
 
 
 class DebugArtifacts(BaseModel):
@@ -131,6 +135,11 @@ class PartitionSolutionPreviewModel(BaseModel):
     meanConvexity: float
     boundaryBreakAlignment: float
     isFirstPracticalSplit: bool
+    rankingSource: PartitionRankingSource | None = None
+    exactScore: float | None = None
+    exactQualityCost: float | None = None
+    exactMissionTimeSec: float | None = None
+    exactMetricKind: ExactMetricKind | None = None
     regions: list[RegionPreview]
     debug: DebugArtifacts | None = None
 
@@ -151,3 +160,66 @@ class DsmStatusResponse(BaseModel):
 
 class DsmDatasetListResponse(BaseModel):
     datasets: list[DsmStatusResponse] = Field(default_factory=list)
+
+
+class TerrainBatchTileRequestModel(BaseModel):
+    z: int = Field(..., ge=0)
+    x: int
+    y: int
+    padTiles: int = Field(0, ge=0, le=2)
+
+
+class TerrainBatchRequestModel(BaseModel):
+    operation: Literal["terrain-batch"] = "terrain-batch"
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
+    tiles: list[TerrainBatchTileRequestModel] = Field(default_factory=list)
+
+
+class TerrainBatchTileResponseModel(BaseModel):
+    z: int
+    x: int
+    y: int
+    size: int = Field(..., gt=0)
+    pngBase64: str
+    demPngBase64: str | None = None
+    demSize: int | None = Field(default=None, gt=0)
+    demPadTiles: int | None = Field(default=None, ge=0)
+
+
+class TerrainBatchResponseModel(BaseModel):
+    operation: Literal["terrain-batch"] = "terrain-batch"
+    tiles: list[TerrainBatchTileResponseModel] = Field(default_factory=list)
+
+
+class ExactOptimizeBearingRequest(BaseModel):
+    polygonId: str | None = None
+    ring: list[tuple[float, float]]
+    payloadKind: PayloadKind
+    params: FlightParamsModel
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
+    altitudeMode: AltitudeMode = "legacy"
+    minClearanceM: float = Field(60, ge=0)
+    turnExtendM: float = Field(96, ge=0)
+    seedBearingDeg: float = 0
+    mode: Literal["local", "global"] = "global"
+    halfWindowDeg: float | None = Field(default=None, gt=0, le=180)
+
+    @model_validator(mode="after")
+    def validate_ring_and_payload(self) -> "ExactOptimizeBearingRequest":
+        if len(self.ring) < 3:
+            raise ValueError("Polygon ring must have at least 3 coordinates.")
+        if self.params.payloadKind != self.payloadKind:
+            self.params.payloadKind = self.payloadKind
+        return self
+
+
+class ExactOptimizeBearingResponse(BaseModel):
+    bearingDeg: float | None = None
+    exactScore: float | None = None
+    qualityCost: float | None = None
+    missionTimeSec: float | None = None
+    normalizedTimeCost: float | None = None
+    metricKind: ExactMetricKind | None = None
+    seedBearingDeg: float
+    lineSpacingM: float | None = None
+    diagnostics: dict[str, float] = Field(default_factory=dict)
