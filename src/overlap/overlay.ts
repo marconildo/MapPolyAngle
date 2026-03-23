@@ -1,5 +1,5 @@
 import type mapboxgl from "mapbox-gl";
-import type { TileResult } from "./types";
+import type { OverlayTileResult } from "./types";
 import { tileCornersForImageSource } from "./controller";
 
 /**
@@ -196,7 +196,7 @@ function encodeDensityToImage(density: Float32Array, size: number, densityMin?: 
 
 export function addOrUpdateTileOverlay(
   map: mapboxgl.Map,
-  result: TileResult,
+  result: OverlayTileResult,
   opts: {
     kind: "overlap" | "pass" | "gsd" | "density";
     runId: string;
@@ -215,11 +215,11 @@ export function addOrUpdateTileOverlay(
 
   let canvas: HTMLCanvasElement;
   if (opts.kind === "overlap" || opts.kind === "pass") {
-    canvas = encodeOverlapToImage(result.overlap, result.size, result.maxOverlap || 1);
+    canvas = encodeOverlapToImage(result.overlap ?? new Uint16Array(result.size * result.size), result.size, result.maxOverlap || 1);
   } else if (opts.kind === "density") {
     canvas = encodeDensityToImage(result.density ?? new Float32Array(result.size * result.size), result.size, opts.densityMin, opts.densityMax);
   } else {
-    canvas = encodeGsdToImage(result.gsdMin, result.size, opts.gsdMin, opts.gsdMax);
+    canvas = encodeGsdToImage(result.gsdMin ?? new Float32Array(result.size * result.size), result.size, opts.gsdMin, opts.gsdMax);
   }
 
   // Convert to data URL (required for Mapbox image source)

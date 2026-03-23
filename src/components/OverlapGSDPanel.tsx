@@ -2,7 +2,7 @@ import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
 import { LidarDensityWorker, OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
 import { addOrUpdateTileOverlay, clearAllOverlays, clearRunOverlays } from "@/overlap/overlay";
-import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters, TileResult } from "@/overlap/types";
+import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters, OverlayTileResult, TileResult } from "@/overlap/types";
 import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
@@ -272,8 +272,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
   const globalRunIdRef = useRef<string | null>(null);
   // Per-polygon, per-tile stats cache for correct cross-polygon crediting - Option B core feature
   const perPolyTileStatsRef = useRef<Map<string, Map<string, PolygonTileStats>>>(new Map());
-  const cameraTileResultsRef = useRef<Map<string, TileResult>>(new Map());
-  const lidarTileResultsRef = useRef<Map<string, TileResult>>(new Map());
+  const cameraTileResultsRef = useRef<Map<string, OverlayTileResult>>(new Map());
+  const lidarTileResultsRef = useRef<Map<string, OverlayTileResult>>(new Map());
   // Cache raw tile data (width, height, and cloned pixel data) to avoid ArrayBuffer transfer issues
   const tileCacheRef = useRef<Map<string, { width: number; height: number; data: Uint8ClampedArray }>>(new Map());
   const autoTriesRef = useRef(0);
@@ -711,6 +711,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       }
     }
   }, [mapRef, opacity, overallStats, overlayRangeForStats, showGsd, showOverlap]);
+
+  const toOverlayTileResult = useCallback((result: TileResult): OverlayTileResult => ({
+    z: result.z,
+    x: result.x,
+    y: result.y,
+    size: result.size,
+    maxOverlap: result.maxOverlap,
+    overlap: result.overlap,
+    gsdMin: result.gsdMin,
+    density: result.density,
+  }), []);
 
   // Re-bin the stored histogram for display so the charts stay readable while
   // the underlying stats remain detailed enough for scoring.
@@ -1835,7 +1846,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       }
     };
 
-    const pruneCachedTileResults = (cache: Map<string, TileResult>, neededTileKeys: Set<string>) => {
+    const pruneCachedTileResults = (cache: Map<string, OverlayTileResult>, neededTileKeys: Set<string>) => {
       for (const key of Array.from(cache.keys())) {
         if (!neededTileKeys.has(key)) cache.delete(key);
       }
@@ -1959,7 +1970,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             options: { clipInnerBufferM, minOverlapForGsd: minOverlapForGsdRef.current },
           } as any);
           if (mySeq !== computeSeqRef.current) break;
-          cameraTileResultsRef.current.set(cacheKey, res);
+          cameraTileResultsRef.current.set(cacheKey, toOverlayTileResult(res));
           upsertTileStats(cacheKey, res.perPolygon);
         }
       }
@@ -1985,7 +1996,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
             options: { clipInnerBufferM },
           } as any);
           if (mySeq !== computeSeqRef.current) break;
-          lidarTileResultsRef.current.set(cacheKey, res);
+          lidarTileResultsRef.current.set(cacheKey, toOverlayTileResult(res));
           upsertTileStats(cacheKey, res.perPolygon);
         }
       }
@@ -2110,7 +2121,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
         }, 0);
       }
     }
-  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, showCameraPoints, zoom]);
+  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, showCameraPoints, toOverlayTileResult, zoom]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
