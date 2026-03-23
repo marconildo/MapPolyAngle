@@ -14,7 +14,8 @@
     "test:terrain-split": "npx --yes tsx src/tests/terrain_face_partition.test.ts",
     "test:terrain-objective": "npx --yes tsx src/tests/terrain_partition_objective.test.ts",
     "test:terrain-graph": "npx --yes tsx src/tests/terrain_partition_graph.test.ts",
-    "test:terrain-source": "npx --yes tsx src/tests/terrain_source.test.ts"
+    "test:terrain-source": "npx --yes tsx src/tests/terrain_source.test.ts",
+    "test:coverage-autorun": "npx --yes tsx src/tests/coverage_autorun.test.ts"
   },
   "dependencies": {
     "@deck.gl/core": "^9.1.14",

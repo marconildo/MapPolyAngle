@@ -18,6 +18,7 @@ import type { BearingOverride, MapFlightDirectionAPI, TerrainPartitionSolutionPr
 import type { FlightParams, LidarReturnMode, TerrainTile } from "@/domain/types";
 import { extractPoses, wgs84ToWebMercator, extractCameraModel } from "@/utils/djiGeotags";
 import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
+import { planCoverageAutoRun } from "@/overlap/coverageAutoRun";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
 // @ts-ignore
 import * as turf from '@turf/turf';
@@ -72,6 +73,8 @@ const TERRAIN_SPLIT_DEBUG = true;
 const HEATMAP_GRADIENT = "linear-gradient(90deg, rgb(0 0 255) 0%, rgb(0 255 255) 25%, rgb(0 255 0) 50%, rgb(255 255 0) 75%, rgb(255 0 0) 100%)";
 const OVERLAY_SCALE_LOWER_QUANTILE = 0.05;
 const OVERLAY_SCALE_UPPER_QUANTILE = 0.95;
+const CARD_SUMMARY_LOWER_QUANTILE = 0.05;
+const CARD_SUMMARY_UPPER_QUANTILE = 0.95;
 const DENSITY_OVERLAY_MAX = 100;
 
 function splitPerfNow() {
@@ -2125,7 +2128,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
-    if (running) return;
     if (suppressAutoRunUntilRef.current > Date.now()) return;
     const api = mapRef.current;
     const map = api?.getMap?.();
@@ -2133,23 +2135,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     const poses = parsePosesMeters();
     const paramsMap = getMergedParamsMap();
 
-    // Poses-only mode auto-run
-    if (!autoGenerate && importedPoses.length > 0) {
-      if (ready) {
-        autoTriesRef.current = 0;
-        compute({ suppressMapNotReadyToast: true });
-        return;
-      }
-    }
-
-    if (!autoGenerate) return; // nothing else to auto-run
-
     const rings: [number, number][][] = api?.getPolygons?.() ?? [];
-    const requiresGlobalRasterRefresh = !!(
-      opts?.polygonId &&
-      opts.reason &&
-      ['lines', 'spacing', 'alt'].includes(opts.reason)
-    );
     const fl = api?.getFlightLines?.();
     const haveLines = !!fl && (
       opts?.polygonId
@@ -2161,34 +2147,35 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
       ? [opts.polygonId]
       : (api?.getPolygonsWithIds?.() ?? []).map((polygon: any) => polygon.id || 'unknown');
     const haveLidarPolys = relevantIds.some((polygonId) => isLidarPayload(polygonId, paramsMap));
+    const plan = planCoverageAutoRun({
+      request: opts,
+      nowMs: Date.now(),
+      suppressAutoRunUntilMs: suppressAutoRunUntilRef.current,
+      autoGenerate,
+      importedPosesCount: importedPoses.length,
+      ready,
+      havePolys,
+      haveLines,
+      haveLidarPolys,
+      posesCount: poses?.length ?? 0,
+      retryCount: autoTriesRef.current,
+    });
 
-    if (ready && !havePolys && importedPoses.length === 0) {
-      autoTriesRef.current = 0;
+    autoTriesRef.current = plan.nextRetryCount;
+
+    if (plan.kind === 'compute') {
+      // Always defer one tick to allow React state updates (lines/tiles) to flush.
+      setTimeout(() => compute(plan.computeRequest), 0);
       return;
     }
 
-    // Run as soon as map is ready, polygons exist, and flight lines are present.
-    // We no longer gate on MapFlightDirection's polygonTiles since GSD panel fetches its own tiles.
-    if (ready && havePolys && haveLines) {
-      if (!poses?.length && !haveLidarPolys) return;
-      autoTriesRef.current = 0;
-      // Recompute from scratch; defer one tick for state flush after edits/deletes
-      // Always defer one tick to allow React state updates (lines/tiles) to flush
-      setTimeout(
-        () => compute({
-          polygonId: requiresGlobalRasterRefresh ? undefined : opts?.polygonId,
-          suppressMapNotReadyToast: true,
-        }),
-        0,
-      );
-      return;
-    }
-    if (autoTriesRef.current < 15) {
-      autoTriesRef.current += 1;
+    if (plan.kind === 'retry') {
       if (autoRunTimeoutRef.current !== null) clearTimeout(autoRunTimeoutRef.current);
-      autoRunTimeoutRef.current = window.setTimeout(()=>{ if ((autoGenerate || importedPoses.length>0) && !running) autoRun(opts); }, 250);
-    } else { autoTriesRef.current = 0; }
-  }, [running, autoGenerate, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters]);
+      autoRunTimeoutRef.current = window.setTimeout(() => {
+        if (autoGenerate || importedPoses.length > 0) autoRun(opts);
+      }, plan.delayMs);
+    }
+  }, [autoGenerate, importedPoses, compute, getMergedParamsMap, isLidarPayload, mapRef, parsePosesMeters]);
 
   function rerunAnalysisForCreatedPolygons(createdIds: string[]) {
     const deadlineMs = 8000;
@@ -2397,22 +2384,41 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
     return `${(value * 100).toFixed(precision)} cm`;
   }, []);
 
+  const metricSummaryValues = useCallback((stats: GSDStats) => {
+    if (!(stats.count > 0)) {
+      return { low: 0, mean: 0, high: 0 };
+    }
+    return {
+      low: histogramQuantile(stats, CARD_SUMMARY_LOWER_QUANTILE),
+      mean: stats.mean,
+      high: histogramQuantile(stats, CARD_SUMMARY_UPPER_QUANTILE),
+    };
+  }, []);
+
+  const metricValueColorClass = useCallback((metricKind: MetricKind, statKind: "min" | "mean" | "max") => {
+    if (statKind === "mean") return "text-blue-600";
+    if (metricKind === "density") {
+      return statKind === "min" ? "text-red-600" : "text-green-600";
+    }
+    return statKind === "min" ? "text-green-600" : "text-red-600";
+  }, []);
+
   const metricLabels = useCallback((metricKind: MetricKind) => {
     if (metricKind === 'density') {
       return {
         title: 'Predicted Point Density',
-        min: 'Min density',
+        min: 'P5 density',
         mean: 'Mean density',
-        max: 'Max density',
+        max: 'P95 density',
         xAxis: 'Density (pts/m²)',
         tooltipLabel: 'Predicted density',
       };
     }
     return {
       title: 'GSD',
-      min: 'Min GSD',
+      min: 'P5 GSD',
       mean: 'Mean GSD',
-      max: 'Max GSD',
+      max: 'P95 GSD',
       xAxis: 'GSD (cm)',
       tooltipLabel: 'GSD',
     };
@@ -2610,9 +2616,26 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                           setSelection(polygonId);
                           onEditPolygonParams?.(polygonId);
                         }}
-                        title="Edit flight parameters for this area"
+                        title="Edit payload settings for this area"
                       >
-                        Edit setup
+                        Edit Payload
+                      </Button>
+                    )}
+
+                    {!isPoseArea && (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="h-6 px-1.5 text-[11px] border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelection(polygonId);
+                          highlightPolygon(polygonId);
+                          mapRef.current?.editPolygonBoundary?.(polygonId);
+                        }}
+                        title="Edit area boundary on the map"
+                      >
+                        Edit Area
                       </Button>
                     )}
 
@@ -2682,31 +2705,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                             });
                           }
                         }}
-                        title="Split this area into a few terrain-aligned faces"
+                        title="Auto split this area into a few terrain-aligned faces"
                       >
-                        {!!splittingPolygonIds[polygonId] ? 'Splitting…' : 'Auto split'}
-                      </Button>
-                    )}
-
-                    {!isPoseArea && (
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        className="h-6 px-1.5 text-[11px]"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelection(polygonId);
-                          highlightPolygon(polygonId);
-                          mapRef.current?.editPolygonBoundary?.(polygonId);
-                        }}
-                        title="Edit polygon vertices on the map"
-                      >
-                        Edit boundary
+                        {!!splittingPolygonIds[polygonId] ? 'Splitting…' : 'Auto Split'}
                       </Button>
                     )}
 
                     <Button
                       size="sm"
+                      variant="outline"
                       className="h-6 px-1.5 text-[11px]"
                       disabled={isPoseArea}
                       onClick={(e) => {
@@ -2714,16 +2721,16 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                         mapRef.current?.optimizePolygonDirection?.(polygonId);
                         setTimeout(() => setSelection(polygonId), 0);
                       }}
-                      title="Use terrain-optimal direction"
+                      title="Automatically choose the terrain-optimal direction"
                     >
-                      🎯 Optimize
+                      Auto Direction
                     </Button>
 
                     {!isPoseArea && (
                       <Button
                         size="sm"
-                        variant="ghost"
-                        className="h-6 px-1.5 text-[11px] ml-auto text-red-500"
+                        variant="outline"
+                        className="h-6 px-1.5 text-[11px] ml-auto border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
                         onClick={(e) => {
                           e.stopPropagation();
                           mapRef.current?.clearPolygon?.(polygonId);
@@ -2736,19 +2743,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                     )}
                   </div>
 
-                  {metricStats ? (
+                  {metricStats ? (() => {
+                    const displayStats = metricSummaryValues(metricStats);
+                    return (
                     <div className="space-y-2">
                       <div className="grid grid-cols-4 gap-3 text-xs">
                         <div className="text-center">
-                          <div className="font-medium text-green-600">{formatMetricValue(metricKind, metricStats.min, metricKind === 'density' ? 0 : 1)}</div>
+                          <div className={`font-medium ${metricValueColorClass(metricKind, 'min')}`}>{formatMetricValue(metricKind, displayStats.low, metricKind === 'density' ? 0 : 1)}</div>
                           <div className="text-gray-500">{labels.min}</div>
                         </div>
                         <div className="text-center">
-                          <div className="font-medium text-blue-600">{formatMetricValue(metricKind, metricStats.mean, metricKind === 'density' ? 1 : 2)}</div>
+                          <div className={`font-medium ${metricValueColorClass(metricKind, 'mean')}`}>{formatMetricValue(metricKind, displayStats.mean, metricKind === 'density' ? 1 : 2)}</div>
                           <div className="text-gray-500">{labels.mean}</div>
                         </div>
                         <div className="text-center">
-                          <div className="font-medium text-red-600">{formatMetricValue(metricKind, metricStats.max, metricKind === 'density' ? 0 : 1)}</div>
+                          <div className={`font-medium ${metricValueColorClass(metricKind, 'max')}`}>{formatMetricValue(metricKind, displayStats.high, metricKind === 'density' ? 0 : 1)}</div>
                           <div className="text-gray-500">{labels.max}</div>
                         </div>
                         <div className="text-center">
@@ -2757,7 +2766,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
                         </div>
                       </div>
                     </div>
-                  ) : (
+                    );
+                  })() : (
                     <div className="text-xs text-gray-500">
                       {metricKind === 'density'
                         ? 'Point density analysis will appear after lidar flight lines are generated.'
@@ -2773,17 +2783,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, getPerPolygonParams, onEd
 
       {overallCards.map(({ metricKind, stats }) => {
         const labels = metricLabels(metricKind);
+        const displayStats = metricSummaryValues(stats);
         return (
           <Card className="mt-2" key={metricKind}>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm">Overall {labels.title} Analysis</CardTitle>
-              <CardDescription className="text-xs">Cumulative {labels.title.toLowerCase()} statistics for {stats.count.toLocaleString()} pixels</CardDescription>
+              <CardDescription className="text-xs">Cumulative {labels.title.toLowerCase()} statistics for {stats.count.toLocaleString()} pixels, with p5/p95 summary tails.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="grid grid-cols-3 gap-4 text-xs">
-                <div className="text-center"><div className="font-medium text-green-600">{formatMetricValue(metricKind, stats.min, metricKind === 'density' ? 0 : 1)}</div><div className="text-gray-500">{labels.min}</div></div>
-                <div className="text-center"><div className="font-medium text-blue-600">{formatMetricValue(metricKind, stats.mean, metricKind === 'density' ? 1 : 2)}</div><div className="text-gray-500">{labels.mean}</div></div>
-                <div className="text-center"><div className="font-medium text-red-600">{formatMetricValue(metricKind, stats.max, metricKind === 'density' ? 0 : 1)}</div><div className="text-gray-500">{labels.max}</div></div>
+                <div className="text-center"><div className={`font-medium ${metricValueColorClass(metricKind, 'min')}`}>{formatMetricValue(metricKind, displayStats.low, metricKind === 'density' ? 0 : 1)}</div><div className="text-gray-500">{labels.min}</div></div>
+                <div className="text-center"><div className={`font-medium ${metricValueColorClass(metricKind, 'mean')}`}>{formatMetricValue(metricKind, displayStats.mean, metricKind === 'density' ? 1 : 2)}</div><div className="text-gray-500">{labels.mean}</div></div>
+                <div className="text-center"><div className={`font-medium ${metricValueColorClass(metricKind, 'max')}`}>{formatMetricValue(metricKind, displayStats.high, metricKind === 'density' ? 0 : 1)}</div><div className="text-gray-500">{labels.max}</div></div>
               </div>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
