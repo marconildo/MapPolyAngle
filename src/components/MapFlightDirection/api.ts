@@ -14,7 +14,7 @@ export interface PolygonWithId {
   ring: [number, number][];
 }
 
-export type BearingOverrideSource = 'wingtra' | 'user' | 'partition';
+export type BearingOverrideSource = 'wingtra' | 'user' | 'partition' | 'optimized';
 
 export interface BearingOverride {
   bearingDeg: number;
@@ -66,7 +66,15 @@ export interface MapFlightDirectionAPI {
     options?: { skipBackend?: boolean }
   ): Promise<{ createdIds: string[]; replaced: boolean }>;
   getTerrainPartitionSolutions(polygonId: string): Promise<TerrainPartitionSolutionPreview[]>;
+  refineTerrainPartitionPreview(
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+  ): Promise<TerrainPartitionSolutionPreview>;
   applyTerrainPartitionSolution(polygonId: string, signature: string): Promise<{ createdIds: string[]; replaced: boolean }>;
+  applyTerrainPartitionPreview(
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+  ): Promise<{ createdIds: string[]; replaced: boolean }>;
   startPolygonDrawing(): void;
   getMap(): MapboxMap | undefined;
 

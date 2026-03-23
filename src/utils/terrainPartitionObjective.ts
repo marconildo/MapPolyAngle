@@ -160,6 +160,23 @@ export type RegionOrientationObjective = {
   guidance: TerrainGuidanceField;
 };
 
+export type PreparedRegionOrientationContext = {
+  options: Required<TerrainPartitionTradeoffOptions>;
+  ring: Ring;
+  tiles: TerrainTile[];
+  params: FlightParams;
+  guidance: TerrainGuidanceField;
+  areaM2: number;
+};
+
+export type OptimizedRegionOrientationResult = {
+  best: RegionOrientationObjective | null;
+  evaluated: RegionOrientationObjective[];
+  seedBearingDeg: number;
+  coarseCandidatesDeg: number[];
+  refineStepsDeg: number[];
+};
+
 export type PartitionObjective = {
   tradeoff: number;
   regionCount: number;
@@ -841,12 +858,12 @@ function evaluateQuality(
       1,
     );
     const normalizedQualityCost =
-      Math.max(0, 1 - meanPredictedDensityPtsM2 / Math.max(1e-6, targetDensityPtsM2)) +
-      1.6 * Math.max(0, 1 - p10PredictedDensityPtsM2 / Math.max(1e-6, targetDensityPtsM2)) +
-      1.3 * holeAreaFraction +
-      0.9 * underTargetAreaFraction +
-      0.55 * lineLift.elevatedAreaFraction +
-      1.1 * lineLift.severeLiftAreaFraction;
+      0.85 * Math.max(0, 1 - meanPredictedDensityPtsM2 / Math.max(1e-6, targetDensityPtsM2)) +
+      1.95 * Math.max(0, 1 - p10PredictedDensityPtsM2 / Math.max(1e-6, targetDensityPtsM2)) +
+      1.65 * holeAreaFraction +
+      1.05 * underTargetAreaFraction +
+      0.5 * lineLift.elevatedAreaFraction +
+      1.15 * lineLift.severeLiftAreaFraction;
 
     return {
       meanDirectionMismatchDeg,
@@ -878,11 +895,11 @@ function evaluateQuality(
     1,
   );
   const normalizedQualityCost =
-    Math.max(0, meanPredictedGsdM / Math.max(1e-6, targetGsdM) - 1) +
-    1.4 * Math.max(0, p90PredictedGsdM / Math.max(1e-6, targetGsdM) - 1) +
-    1.1 * underTargetAreaFraction +
-    0.4 * lineLift.elevatedAreaFraction +
-    0.8 * lineLift.severeLiftAreaFraction +
+    0.9 * Math.max(0, meanPredictedGsdM / Math.max(1e-6, targetGsdM) - 1) +
+    1.7 * Math.max(0, p90PredictedGsdM / Math.max(1e-6, targetGsdM) - 1) +
+    1.2 * underTargetAreaFraction +
+    0.35 * lineLift.elevatedAreaFraction +
+    0.9 * lineLift.severeLiftAreaFraction +
     0.4 * flightTime.shortLineFraction;
 
   return {
@@ -1014,33 +1031,149 @@ export function evaluateRegionOrientation(
   bearingDeg: number,
   options: TerrainPartitionTradeoffOptions = {},
 ): RegionOrientationObjective | null {
+  const prepared = prepareRegionOrientationContext(ring, tiles, params, options);
+  if (!prepared) return null;
+  return evaluatePreparedRegionOrientation(prepared, bearingDeg);
+}
+
+export function prepareRegionOrientationContext(
+  ring: Ring,
+  tiles: TerrainTile[],
+  params: FlightParams,
+  options: TerrainPartitionTradeoffOptions = {},
+): PreparedRegionOrientationContext | null {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const normalized = normalizeRing(ring);
   if (!normalized) return null;
   const guidance = buildTerrainGuidanceField(normalized, tiles, opts);
   const areaM2 = guidance.areaM2;
   if (!(areaM2 > 0) || guidance.cells.length < 4) return null;
-  const flightTime = estimateRegionFlightTime(normalized, bearingDeg, params, tiles, opts);
-  const regularization = evaluateRegularization(normalized, areaM2, bearingDeg, flightTime, flightTime.lineSpacingM, opts);
+  return {
+    options: opts,
+    ring: normalized,
+    tiles,
+    params,
+    guidance,
+    areaM2,
+  };
+}
+
+export function evaluatePreparedRegionOrientation(
+  prepared: PreparedRegionOrientationContext,
+  bearingDeg: number,
+): RegionOrientationObjective | null {
+  const {
+    options,
+    ring,
+    tiles,
+    params,
+    guidance,
+    areaM2,
+  } = prepared;
+  const flightTime = estimateRegionFlightTime(ring, bearingDeg, params, tiles, options);
+  const regularization = evaluateRegularization(ring, areaM2, bearingDeg, flightTime, flightTime.lineSpacingM, options);
   const quality = evaluateQuality(guidance, bearingDeg, params, flightTime);
   const normalizedTimeCost = flightTime.totalMissionTimeSec / 180;
   const totalCost =
-    opts.tradeoff * quality.normalizedQualityCost +
-    (1 - opts.tradeoff) * normalizedTimeCost +
+    options.tradeoff * quality.normalizedQualityCost +
+    (1 - options.tradeoff) * normalizedTimeCost +
     regularization.penalty +
     (regularization.isHardInvalid ? 50 : 0);
 
   return {
     bearingDeg: normalizedAxialBearing(bearingDeg),
-    tradeoff: opts.tradeoff,
+    tradeoff: options.tradeoff,
     totalCost,
     normalizedQualityCost: quality.normalizedQualityCost,
     normalizedTimeCost,
-    ring: normalized,
+    ring,
     quality,
     flightTime,
     regularization,
     guidance,
+  };
+}
+
+export function optimizeRegionOrientationNearSeed(
+  ring: Ring,
+  tiles: TerrainTile[],
+  params: FlightParams,
+  seedBearingDeg: number,
+  options: TerrainPartitionTradeoffOptions = {},
+  searchOptions?: {
+    windowDeg?: number;
+    coarseCandidatesDeg?: number[];
+    refineStepsDeg?: number[];
+    minImprovement?: number;
+  },
+): OptimizedRegionOrientationResult | null {
+  const prepared = prepareRegionOrientationContext(ring, tiles, params, options);
+  if (!prepared) return null;
+
+  const windowDeg = Math.max(1, searchOptions?.windowDeg ?? 30);
+  const coarseOffsets = searchOptions?.coarseCandidatesDeg ?? [-30, -20, -10, 0, 10, 20, 30];
+  const refineStepsDeg = searchOptions?.refineStepsDeg ?? [8, 4, 2, 1];
+  const minImprovement = searchOptions?.minImprovement ?? 1e-4;
+  const normalizedSeed = normalizedAxialBearing(seedBearingDeg);
+  const cache = new Map<number, RegionOrientationObjective | null>();
+
+  const evaluateOffset = (offsetDeg: number) => {
+    if (Math.abs(offsetDeg) > windowDeg + 1e-6) return null;
+    const bearingDeg = normalizedAxialBearing(normalizedSeed + offsetDeg);
+    const cacheKey = Math.round(bearingDeg * 1000);
+    if (!cache.has(cacheKey)) {
+      cache.set(cacheKey, evaluatePreparedRegionOrientation(prepared, bearingDeg));
+    }
+    return cache.get(cacheKey) ?? null;
+  };
+
+  let bestOffset = 0;
+  let best = evaluateOffset(0);
+  for (const offsetDeg of coarseOffsets) {
+    const candidate = evaluateOffset(offsetDeg);
+    if (!candidate) continue;
+    if (!best || candidate.totalCost < best.totalCost) {
+      best = candidate;
+      bestOffset = Math.max(-windowDeg, Math.min(windowDeg, offsetDeg));
+    }
+  }
+  if (!best) {
+    return null;
+  }
+
+  for (const stepDeg of refineStepsDeg) {
+    let improved = true;
+    while (improved) {
+      improved = false;
+      const leftOffset = bestOffset - stepDeg;
+      const rightOffset = bestOffset + stepDeg;
+      const left = evaluateOffset(leftOffset);
+      const right = evaluateOffset(rightOffset);
+      const nextBest =
+        [
+          { offsetDeg: leftOffset, objective: left },
+          { offsetDeg: rightOffset, objective: right },
+        ]
+          .filter((value): value is { offsetDeg: number; objective: RegionOrientationObjective } => value.objective !== null)
+          .sort((a, b) => a.objective.totalCost - b.objective.totalCost)[0] ?? null;
+      if (nextBest && nextBest.objective.totalCost + minImprovement < best.totalCost) {
+        best = nextBest.objective;
+        bestOffset = nextBest.offsetDeg;
+        improved = true;
+      }
+    }
+  }
+
+  const evaluated = [...cache.values()]
+    .filter((value): value is RegionOrientationObjective => value !== null)
+    .sort((a, b) => a.totalCost - b.totalCost);
+
+  return {
+    best,
+    evaluated,
+    seedBearingDeg: normalizedSeed,
+    coarseCandidatesDeg: coarseOffsets.map((offset) => normalizedAxialBearing(normalizedSeed + offset)),
+    refineStepsDeg,
   };
 }
 

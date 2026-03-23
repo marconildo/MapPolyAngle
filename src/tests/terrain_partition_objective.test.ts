@@ -6,6 +6,7 @@ import {
   evaluateSensorNodeCostForCells,
   evaluateRegionOrientation,
   findBestRegionOrientation,
+  optimizeRegionOrientationNearSeed,
   type TerrainGuidanceCell,
 } from "../utils/terrainPartitionObjective.ts";
 
@@ -139,6 +140,31 @@ function runLidarQualityCase() {
   );
 }
 
+function runSeededOrientationOptimizationCase() {
+  const tile = makeDemTile(256, 256, (lng, lat) => {
+    const [, my] = lngLatToMercatorMeters(lng, lat);
+    return 1550 + my * 0.00075;
+  });
+
+  const optimized = optimizeRegionOrientationNearSeed(
+    tradeoffRing,
+    [tile] as any,
+    lidarParams,
+    104,
+    { tradeoff: 0.8 },
+    { windowDeg: 30, coarseCandidatesDeg: [-30, -20, -10, 0, 10, 20, 30], refineStepsDeg: [8, 4, 2, 1] },
+  );
+  assert.ok(optimized?.best, "seeded orientation optimizer should return a best candidate");
+  assert.ok(
+    Math.abs(optimized!.best!.bearingDeg - 90) <= 4,
+    "bounded optimizer should refine a near-contour seed toward the lower-cost contour family",
+  );
+  assert.ok(
+    optimized!.evaluated.length >= 7,
+    "seeded optimizer should evaluate the coarse search neighborhood around the seed",
+  );
+}
+
 function runLineLiftPeakPenaltyCase() {
   const flatTile = makeDemTile(256, 256, (lng, lat) => {
     const [, my] = lngLatToMercatorMeters(lng, lat);
@@ -258,6 +284,7 @@ function runLidarNodeCostHoleSeverityCase() {
 
 runCameraQualityAndTimeCase();
 runLidarQualityCase();
+runSeededOrientationOptimizationCase();
 runLineLiftPeakPenaltyCase();
 runPartitionCombinationCase();
 runNonConvexBridgePenaltyCase();
