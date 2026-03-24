@@ -1816,6 +1816,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         suppressFlightLineEventsRef.current = false;
         onFlightLinesUpdated?.('__all__');
 
+        const firstImportedId = newIds[0];
+        const draw = drawRef.current as any;
+        if (firstImportedId && draw?.get?.(firstImportedId)) {
+          try {
+            draw.changeMode('simple_select', { featureIds: [firstImportedId] });
+          } catch {}
+          scheduleGuardedTimeout(() => onPolygonSelected?.(firstImportedId), 0);
+        }
+
         console.log(`✅ Successfully imported ${newIds.length} areas with file bearings preserved. Use "Optimize" to get terrain-optimal directions.`);
         return { added: newIds.length, total: imported.items.length, areas: areasOut };
       } catch (e) {
