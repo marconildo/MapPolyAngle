@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import io
 import base64
-import math
+import io
 import logging
+import math
 import os
 import shutil
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 import numpy as np
@@ -33,20 +33,20 @@ from .grid import build_grid
 from .mapbox_tiles import TerrainTileCache, fetch_dem_for_ring, mapbox_token
 from .schemas import (
     DebugArtifacts,
-    DsmSourceDescriptorModel,
     DsmFinalizeUploadRequest,
     DsmPrepareUploadRequest,
     DsmPrepareUploadResponse,
+    DsmSourceDescriptorModel,
     DsmStatusResponse,
     ExactOptimizeBearingRequest,
     ExactOptimizeBearingResponse,
+    PartitionSolutionPreviewModel,
     PartitionSolveRequest,
     PartitionSolveResponse,
-    PartitionSolutionPreviewModel,
-    TerrainSourceModel,
     TerrainBatchRequestModel,
     TerrainBatchResponseModel,
     TerrainBatchTileResponseModel,
+    TerrainSourceModel,
 )
 from .solver_graphcut import solve_partition_hierarchy
 

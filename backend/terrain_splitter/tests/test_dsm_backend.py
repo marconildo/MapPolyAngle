@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import io
-import hashlib
 import json
 import math
 import threading
@@ -15,14 +15,17 @@ import numpy as np
 import tifffile
 from fastapi.testclient import TestClient
 from PIL import Image
-import main as main_module
 
+import main as main_module
 from terrain_splitter import app as app_module
 from terrain_splitter import dsm_store as dsm_store_module
-from terrain_splitter.dsm_store import DsmDatasetStore, S3BackedDsmDatasetStore, create_dsm_dataset_store
-from terrain_splitter.mapbox_tiles import fetch_dem_for_ring
+from terrain_splitter.dsm_store import (
+    DsmDatasetStore,
+    S3BackedDsmDatasetStore,
+    create_dsm_dataset_store,
+)
 from terrain_splitter.exact_bridge import LocalExactRuntimeSidecarBridge
-from terrain_splitter.mapbox_tiles import TerrainTile
+from terrain_splitter.mapbox_tiles import TerrainTile, fetch_dem_for_ring
 from terrain_splitter.schemas import (
     DsmSourceDescriptorModel,
     PartitionSolutionPreviewModel,
@@ -891,7 +894,7 @@ def test_fetch_dem_for_ring_matches_legacy_pyramid_for_sharded_dataset(tmp_path:
 def test_internal_terrain_batch_matches_legacy_pyramid_for_sharded_dataset(tmp_path: Path, monkeypatch) -> None:
     raster = np.arange(64, dtype=np.float32).reshape(8, 8)
     payload_path = tmp_path / "parity-batch.tiff"
-    payload = _write_geotiff(payload_path, raster)
+    _write_geotiff(payload_path, raster)
     source_descriptor = dsm_store_module.derive_descriptor_from_path(payload_path, "parity-batch.tiff")
 
     sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
@@ -1762,7 +1765,6 @@ def test_exact_optimize_endpoint_matches_local_exact_runtime(monkeypatch) -> Non
 
 def test_exact_optimize_endpoint_matches_between_sharded_and_legacy_dsm(monkeypatch, tmp_path: Path) -> None:
     fixture_path = _real_dsm_fixture_path()
-    payload = fixture_path.read_bytes()
     source_descriptor = dsm_store_module.derive_descriptor_from_path(fixture_path, fixture_path.name)
     sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
     sharded_descriptor, _ = sharded_store.ingest_dataset_file(fixture_path, fixture_path.name, source_descriptor=source_descriptor)

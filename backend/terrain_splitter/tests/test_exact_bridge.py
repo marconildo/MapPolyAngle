@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 import types
-
 from pathlib import Path
 
 from terrain_splitter.exact_bridge import LambdaExactRuntimeBridge, LocalExactRuntimeSidecarBridge

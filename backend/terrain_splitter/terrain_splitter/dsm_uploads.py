@@ -353,7 +353,11 @@ def finalize_dsm_upload(
         s3_store = dataset_store
         assert isinstance(s3_store, S3BackedDsmDatasetStore)
         session = _read_s3_session(s3_store, upload_id)
-        cleanup_session = lambda: (_delete_s3_session(s3_store, session), _delete_local_session(staging_dir, upload_id))
+        
+        def cleanup_session() -> None:
+            _delete_s3_session(s3_store, session)
+            _delete_local_session(staging_dir, upload_id)
+
         if session.is_expired():
             cleanup_session()
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="DSM upload session has expired.")
@@ -365,7 +369,10 @@ def finalize_dsm_upload(
     else:
         _cleanup_expired_local_sessions(staging_dir, preserve_upload_id=upload_id)
         session = _read_local_session(staging_dir, upload_id)
-        cleanup_session = lambda: _delete_local_session(staging_dir, upload_id)
+        
+        def cleanup_session() -> None:
+            _delete_local_session(staging_dir, upload_id)
+
         if session.is_expired():
             cleanup_session()
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="DSM upload session has expired.")

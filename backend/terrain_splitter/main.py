@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from mangum import Mangum
 
-from terrain_splitter.app import app
-from terrain_splitter.app import _build_terrain_batch_response
+from terrain_splitter.app import _build_terrain_batch_response, app
 from terrain_splitter.schemas import TerrainBatchRequestModel
 from terrain_splitter.solver_frontier import solve_root_split_branch_event, solve_subtree_task_event
 
