@@ -12,6 +12,7 @@ TerrainSourceMode = Literal["mapbox", "blended"]
 DsmProcessingStatus = Literal["ready"]
 PartitionRankingSource = Literal["surrogate", "backend-exact", "frontend-exact"]
 ExactMetricKind = Literal["gsd", "density"]
+DsmPrepareUploadStatus = Literal["existing", "upload-required"]
 
 
 class FlightParamsModel(BaseModel):
@@ -158,8 +159,62 @@ class DsmStatusResponse(BaseModel):
     terrainTileUrlTemplate: str | None = None
 
 
-class DsmDatasetListResponse(BaseModel):
-    datasets: list[DsmStatusResponse] = Field(default_factory=list)
+class DsmPrepareUploadRequest(BaseModel):
+    sha256: str = Field(..., min_length=64, max_length=64)
+    fileSizeBytes: int = Field(..., ge=0)
+    originalName: str = Field(..., min_length=1)
+    contentType: str | None = None
+
+    @model_validator(mode="after")
+    def validate_sha256(self) -> "DsmPrepareUploadRequest":
+        normalized = self.sha256.strip().lower()
+        if len(normalized) != 64 or any(ch not in "0123456789abcdef" for ch in normalized):
+            raise ValueError("sha256 must be a 64-character lowercase hexadecimal string.")
+        self.sha256 = normalized
+        self.originalName = self.originalName.strip()
+        if not self.originalName:
+            raise ValueError("originalName is required.")
+        if self.contentType is not None:
+            self.contentType = self.contentType.strip() or None
+        return self
+
+
+class DsmUploadTargetModel(BaseModel):
+    url: str
+    method: Literal["PUT"] = "PUT"
+    headers: dict[str, str] = Field(default_factory=dict)
+    expiresAtIso: str
+
+
+class DsmPrepareUploadResponse(BaseModel):
+    status: DsmPrepareUploadStatus
+    dataset: DsmStatusResponse | None = None
+    uploadId: str | None = None
+    uploadTarget: DsmUploadTargetModel | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "DsmPrepareUploadResponse":
+        if self.status == "existing":
+            if self.dataset is None:
+                raise ValueError("dataset is required when status is 'existing'.")
+            self.uploadId = None
+            self.uploadTarget = None
+            return self
+        if self.uploadId is None or self.uploadTarget is None:
+            raise ValueError("uploadId and uploadTarget are required when status is 'upload-required'.")
+        self.dataset = None
+        return self
+
+
+class DsmFinalizeUploadRequest(BaseModel):
+    uploadId: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_upload_id(self) -> "DsmFinalizeUploadRequest":
+        self.uploadId = self.uploadId.strip()
+        if not self.uploadId:
+            raise ValueError("uploadId is required.")
+        return self
 
 
 class TerrainBatchTileRequestModel(BaseModel):

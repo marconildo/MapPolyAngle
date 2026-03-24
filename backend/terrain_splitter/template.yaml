@@ -55,6 +55,7 @@ Globals:
         TERRAIN_SPLITTER_CACHE_DIR: /tmp/terrain-splitter/cache
         TERRAIN_SPLITTER_DEBUG_DIR: /tmp/terrain-splitter/debug
         TERRAIN_SPLITTER_DSM_DIR: /tmp/terrain-splitter/dsm
+        TERRAIN_SPLITTER_DSM_UPLOAD_STAGING_DIR: /tmp/terrain-splitter/upload-staging
         TERRAIN_SPLITTER_DSM_STORE_MODE: "s3"
         TERRAIN_SPLITTER_DSM_S3_BUCKET: !Ref TerrainSplitterDsmBucket
         TERRAIN_SPLITTER_DSM_S3_PREFIX: !Ref StageName
@@ -74,6 +75,33 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref AllowedOrigin
+            AllowedMethods:
+              - PUT
+              - HEAD
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireStagedUploads
+            Status: Enabled
+            Prefix: !Sub "${StageName}/uploads/"
+            ExpirationInDays: 1
 
   TerrainSplitterFunction:
     Type: AWS::Serverless::Function
@@ -100,6 +128,7 @@ Resources:
               Action:
                 - s3:GetObject
                 - s3:PutObject
+                - s3:DeleteObject
               Resource: !Sub "${TerrainSplitterDsmBucket.Arn}/*"
       EphemeralStorage:
         Size: 2048

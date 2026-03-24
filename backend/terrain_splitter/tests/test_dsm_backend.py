@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib
 import io
+import hashlib
 import json
 import threading
 from base64 import b64encode
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -96,6 +98,43 @@ def _write_geotiff(path: Path, raster: np.ndarray) -> bytes:
     return path.read_bytes()
 
 
+def _write_rgba_geotiff(path: Path, raster: np.ndarray) -> bytes:
+    pixel_scale = (1.0, 1.0, 0.0)
+    tiepoint = (0.0, 0.0, 0.0, 0.0, float(raster.shape[0]), 0.0)
+    geo_key_directory = (
+        1,
+        1,
+        0,
+        3,
+        1024,
+        0,
+        1,
+        1,
+        1025,
+        0,
+        1,
+        1,
+        3072,
+        0,
+        1,
+        3857,
+    )
+    tifffile.imwrite(
+        path,
+        raster.astype(np.uint8),
+        compression="lzw",
+        metadata=None,
+        photometric="rgb",
+        extrasamples=["unassalpha"],
+        extratags=[
+            (33550, "d", 3, pixel_scale, False),
+            (33922, "d", 6, tiepoint, False),
+            (34735, "H", len(geo_key_directory), geo_key_directory, False),
+        ],
+    )
+    return path.read_bytes()
+
+
 def _write_geographic_geotiff(path: Path, raster: np.ndarray) -> bytes:
     pixel_scale = (0.01, 0.01, 0.0)
     tiepoint = (0.0, 0.0, 0.0, 7.0, 47.0, 0.0)
@@ -167,6 +206,29 @@ def _write_transform_geotiff(path: Path, raster: np.ndarray) -> bytes:
     return path.read_bytes()
 
 
+def _sha256_hex(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _seed_legacy_dataset_entry(store: DsmDatasetStore, dataset_id: str, *, name: str, file_path: Path) -> None:
+    descriptor = _descriptor().model_copy(
+        update={
+            "id": dataset_id,
+            "name": name,
+            "fileSizeBytes": int(file_path.stat().st_size),
+            "loadedAtIso": "2026-03-24T00:00:00Z",
+        }
+    )
+    index = store._load_index()
+    index["datasets"][dataset_id] = {
+        "descriptor": descriptor.model_dump(mode="json"),
+        "filePath": str(file_path),
+        "pyramidPath": str(file_path.with_suffix(".npz")),
+        "sourceCrs": descriptor.sourceCrsCode,
+    }
+    store._save_index(index)
+
+
 class _FakePaginator:
     def __init__(self, client: "_FakeS3Client"):
         self.client = client
@@ -179,6 +241,8 @@ class _FakePaginator:
 class _FakeS3Client:
     def __init__(self):
         self.objects: dict[tuple[str, str], bytes] = {}
+        self.deleted: list[tuple[str, str]] = []
+        self.presigned_requests: list[dict] = []
 
     def put_object(self, *, Bucket: str, Key: str, Body, **kwargs):  # noqa: N803
         if isinstance(Body, bytes):
@@ -196,9 +260,41 @@ class _FakeS3Client:
             raise FileNotFoundError(Key)
         return {"Body": io.BytesIO(payload)}
 
+    def delete_object(self, *, Bucket: str, Key: str):  # noqa: N803
+        self.objects.pop((Bucket, Key), None)
+        self.deleted.append((Bucket, Key))
+        return {}
+
+    def generate_presigned_url(self, ClientMethod: str, Params: dict, ExpiresIn: int, HttpMethod: str):  # noqa: N803
+        self.presigned_requests.append(
+            {
+                "ClientMethod": ClientMethod,
+                "Params": Params,
+                "ExpiresIn": ExpiresIn,
+                "HttpMethod": HttpMethod,
+            }
+        )
+        return f"https://presigned-upload.test/{Params['Bucket']}/{Params['Key']}?expires={ExpiresIn}"
+
     def get_paginator(self, name: str):
         assert name == "list_objects_v2"
         return _FakePaginator(self)
+
+
+@contextmanager
+def _override_app_dsm_state(*, dsm_dir: Path, store, staging_dir: Path):
+    original_dir = app_module.DSM_DIR
+    original_store = app_module.DSM_DATASET_STORE
+    original_staging_dir = app_module.DSM_UPLOAD_STAGING_DIR
+    app_module.DSM_DIR = dsm_dir
+    app_module.DSM_DATASET_STORE = store
+    app_module.DSM_UPLOAD_STAGING_DIR = staging_dir
+    try:
+        yield
+    finally:
+        app_module.DSM_DIR = original_dir
+        app_module.DSM_DATASET_STORE = original_store
+        app_module.DSM_UPLOAD_STAGING_DIR = original_staging_dir
 
 
 class _FakeExactBridge:
@@ -447,6 +543,20 @@ def test_dataset_store_reuses_existing_dataset_for_duplicate_upload(tmp_path: Pa
     assert first_descriptor.id == second_descriptor.id
 
 
+def test_dataset_store_creates_new_dataset_for_same_filename_with_different_bytes(tmp_path: Path) -> None:
+    store = DsmDatasetStore(tmp_path)
+    descriptor = _descriptor()
+    first_payload = _write_test_tiff(tmp_path / "same-name-a.tiff", np.full((4, 4), 42.0, dtype=np.float32))
+    second_payload = _write_test_tiff(tmp_path / "same-name-b.tiff", np.full((4, 4), 84.0, dtype=np.float32))
+
+    first_descriptor, first_reused = store.ingest_dataset(first_payload, "same-name.tiff", descriptor)
+    second_descriptor, second_reused = store.ingest_dataset(second_payload, "same-name.tiff", descriptor)
+
+    assert first_reused is False
+    assert second_reused is False
+    assert first_descriptor.id != second_descriptor.id
+
+
 def test_local_dataset_store_persists_dataset_across_restart(tmp_path: Path) -> None:
     descriptor = _descriptor()
     payload = _write_test_tiff(tmp_path / "persist-local.tiff", np.full((4, 4), 55.0, dtype=np.float32))
@@ -530,7 +640,311 @@ def test_create_dsm_dataset_store_selects_s3_mode(tmp_path: Path, monkeypatch) -
     assert isinstance(store, S3BackedDsmDatasetStore)
 
 
-def test_dsm_upload_and_dataset_endpoints(tmp_path: Path) -> None:
+def test_prepare_upload_returns_existing_dataset_immediately(tmp_path: Path) -> None:
+    payload = _write_geotiff(tmp_path / "existing-upload.tiff", np.full((4, 4), 42.0, dtype=np.float32))
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+    descriptor = _descriptor()
+    stored_descriptor, reused_existing = store.ingest_dataset(payload, "existing-upload.tiff", descriptor)
+    assert reused_existing is False
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "existing-upload.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "existing"
+    assert body["dataset"]["datasetId"] == stored_descriptor.id
+    assert body["dataset"]["reusedExisting"] is True
+
+
+def test_local_prepare_upload_put_finalize_flow(tmp_path: Path) -> None:
+    payload = _write_geotiff(tmp_path / "local-flow.tiff", np.full((4, 4), 37.0, dtype=np.float32))
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            prepare = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "local-flow.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+            assert prepare.status_code == 200
+            prepared = prepare.json()
+            assert prepared["status"] == "upload-required"
+            upload_id = prepared["uploadId"]
+            upload_path = f"/v1/dsm/upload-sessions/{upload_id}"
+
+            upload = client.put(upload_path, content=payload, headers={"Content-Type": "image/tiff"})
+            assert upload.status_code == 204
+
+            duplicate_upload = client.put(upload_path, content=payload, headers={"Content-Type": "image/tiff"})
+            assert duplicate_upload.status_code == 409
+
+            finalize = client.post("/v1/dsm/finalize-upload", json={"uploadId": upload_id})
+
+    assert finalize.status_code == 200
+    body = finalize.json()
+    assert body["processingStatus"] == "ready"
+    assert body["reusedExisting"] is False
+    assert body["descriptor"]["id"] == _sha256_hex(payload)
+    assert not (staging_dir / upload_id).exists()
+
+
+def test_local_finalize_rejects_hash_mismatch_and_cleans_up(tmp_path: Path) -> None:
+    payload = _write_geotiff(tmp_path / "bad-hash.tiff", np.full((4, 4), 19.0, dtype=np.float32))
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            prepare = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": "0" * 64,
+                    "fileSizeBytes": len(payload),
+                    "originalName": "bad-hash.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+            upload_id = prepare.json()["uploadId"]
+            upload = client.put(f"/v1/dsm/upload-sessions/{upload_id}", content=payload, headers={"Content-Type": "image/tiff"})
+            assert upload.status_code == 204
+            finalize = client.post("/v1/dsm/finalize-upload", json={"uploadId": upload_id})
+
+    assert finalize.status_code == 400
+    assert "hash" in finalize.text.lower()
+    assert not (staging_dir / upload_id).exists()
+
+
+def test_local_finalize_rejects_multiband_rgba_geotiff(tmp_path: Path) -> None:
+    rgba = np.zeros((4, 4, 4), dtype=np.uint8)
+    rgba[..., 0] = 120
+    rgba[..., 1] = 80
+    rgba[..., 2] = 40
+    rgba[..., 3] = 255
+    payload = _write_rgba_geotiff(tmp_path / "ortho-rgba.tiff", rgba)
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            prepare = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "ortho-rgba.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+            upload_id = prepare.json()["uploadId"]
+            upload = client.put(f"/v1/dsm/upload-sessions/{upload_id}", content=payload, headers={"Content-Type": "image/tiff"})
+            assert upload.status_code == 204
+            finalize = client.post("/v1/dsm/finalize-upload", json={"uploadId": upload_id})
+
+    assert finalize.status_code == 400
+    assert "single-band elevation geotiff" in finalize.text.lower()
+    assert "rgb/rgba" in finalize.text.lower()
+    assert not (staging_dir / upload_id).exists()
+    assert store.get_dataset_descriptor(_sha256_hex(payload)) is None
+
+
+def test_invalid_legacy_rgba_dataset_is_not_returned_by_detail_endpoint(tmp_path: Path) -> None:
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+    dataset_id = "legacy-invalid-rgba"
+    payload_path = tmp_path / "legacy-invalid-rgba.tiff"
+    rgba = np.zeros((4, 4, 4), dtype=np.uint8)
+    rgba[..., 0] = 120
+    rgba[..., 1] = 80
+    rgba[..., 2] = 40
+    rgba[..., 3] = 255
+    _write_rgba_geotiff(payload_path, rgba)
+    _seed_legacy_dataset_entry(store, dataset_id, name="legacy-invalid-rgba.tiff", file_path=payload_path)
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            detail = client.get(f"/v1/dsm/datasets/{dataset_id}")
+
+    assert detail.status_code == 404
+    assert store.get_dataset_descriptor(dataset_id) is None
+
+
+def test_invalid_legacy_rgba_dataset_does_not_modify_terrain_tiles(tmp_path: Path, monkeypatch) -> None:
+    png_payload = _encode_png_bytes(4, 64)
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr(app_module, "TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr(app_module, "mapbox_token", lambda: "test-token")
+
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+    dataset_id = "legacy-invalid-rgba"
+    payload_path = tmp_path / "legacy-invalid-rgba.tiff"
+    rgba = np.zeros((4, 4, 4), dtype=np.uint8)
+    rgba[..., 0] = 120
+    rgba[..., 1] = 80
+    rgba[..., 2] = 40
+    rgba[..., 3] = 255
+    _write_rgba_geotiff(payload_path, rgba)
+    _seed_legacy_dataset_entry(store, dataset_id, name="legacy-invalid-rgba.tiff", file_path=payload_path)
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            response = client.get(f"/v1/terrain-rgb/0/0/0.png?mode=blended&datasetId={dataset_id}")
+
+    assert response.status_code == 200
+    assert response.content == png_payload
+    assert store.get_dataset_descriptor(dataset_id) is None
+
+
+def test_local_finalize_rejects_missing_staged_payload_and_cleans_up(tmp_path: Path) -> None:
+    payload = _write_geotiff(tmp_path / "missing-payload.tiff", np.full((4, 4), 17.0, dtype=np.float32))
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            prepare = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "missing-payload.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+            upload_id = prepare.json()["uploadId"]
+            finalize = client.post("/v1/dsm/finalize-upload", json={"uploadId": upload_id})
+
+    assert finalize.status_code == 400
+    assert "not found" in finalize.text.lower()
+    assert not (staging_dir / upload_id).exists()
+
+
+def test_local_finalize_rejects_expired_upload_session(tmp_path: Path) -> None:
+    payload = _write_geotiff(tmp_path / "expired.tiff", np.full((4, 4), 23.0, dtype=np.float32))
+    store = DsmDatasetStore(tmp_path / "datasets")
+    staging_dir = tmp_path / "staging"
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            prepare = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "expired.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+            upload_id = prepare.json()["uploadId"]
+            upload = client.put(f"/v1/dsm/upload-sessions/{upload_id}", content=payload, headers={"Content-Type": "image/tiff"})
+            assert upload.status_code == 204
+
+            manifest_path = staging_dir / upload_id / "session.json"
+            session_payload = json.loads(manifest_path.read_text())
+            session_payload["expiresAtIso"] = "2000-01-01T00:00:00Z"
+            manifest_path.write_text(json.dumps(session_payload))
+
+            finalize = client.post("/v1/dsm/finalize-upload", json={"uploadId": upload_id})
+
+    assert finalize.status_code == 410
+    assert not (staging_dir / upload_id).exists()
+
+
+def test_s3_prepare_upload_returns_presigned_target(tmp_path: Path, monkeypatch) -> None:
+    payload = _write_geotiff(tmp_path / "s3-prepare.tiff", np.full((4, 4), 42.0, dtype=np.float32))
+    fake_s3 = _FakeS3Client()
+    store = S3BackedDsmDatasetStore(tmp_path / "s3-cache", bucket="bucket", prefix="stage", client=fake_s3)
+    staging_dir = tmp_path / "staging"
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "terrain-splitter")
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "s3-prepare.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "upload-required"
+    assert body["uploadId"]
+    assert body["uploadTarget"]["method"] == "PUT"
+    assert body["uploadTarget"]["url"].startswith("https://presigned-upload.test/")
+    assert fake_s3.presigned_requests
+    request = fake_s3.presigned_requests[0]
+    assert request["ClientMethod"] == "put_object"
+    assert request["Params"]["Bucket"] == "bucket"
+    assert f"stage/uploads/{body['uploadId']}/" in request["Params"]["Key"]
+    assert ("bucket", f"stage/uploads/{body['uploadId']}/session.json") in fake_s3.objects
+
+
+def test_s3_finalize_upload_ingests_staged_object_and_cleans_up(tmp_path: Path, monkeypatch) -> None:
+    payload = _write_geotiff(tmp_path / "s3-finalize.tiff", np.full((4, 4), 52.0, dtype=np.float32))
+    fake_s3 = _FakeS3Client()
+    store = S3BackedDsmDatasetStore(tmp_path / "s3-cache", bucket="bucket", prefix="stage", client=fake_s3)
+    staging_dir = tmp_path / "staging"
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "terrain-splitter")
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets", store=store, staging_dir=staging_dir):
+        with TestClient(app_module.app) as client:
+            prepare = client.post(
+                "/v1/dsm/prepare-upload",
+                json={
+                    "sha256": _sha256_hex(payload),
+                    "fileSizeBytes": len(payload),
+                    "originalName": "s3-finalize.tiff",
+                    "contentType": "image/tiff",
+                },
+            )
+            prepared = prepare.json()
+            upload_id = prepared["uploadId"]
+            staged_key = fake_s3.presigned_requests[-1]["Params"]["Key"]
+            fake_s3.objects[("bucket", staged_key)] = payload
+
+            finalize = client.post("/v1/dsm/finalize-upload", json={"uploadId": upload_id})
+
+    assert finalize.status_code == 200
+    body = finalize.json()
+    dataset_id = body["datasetId"]
+    assert dataset_id == _sha256_hex(payload)
+    assert body["reusedExisting"] is False
+    assert ("bucket", staged_key) not in fake_s3.objects
+    assert ("bucket", f"stage/uploads/{upload_id}/session.json") not in fake_s3.objects
+    remote_keys = {key for (bucket, key) in fake_s3.objects if bucket == "bucket"}
+    assert f"stage/datasets/{dataset_id}/descriptor.json" in remote_keys
+    assert f"stage/datasets/{dataset_id}/pyramid.npz" in remote_keys
+
+
+def test_dsm_upload_and_dataset_detail_endpoint(tmp_path: Path) -> None:
     payload = _write_geotiff(tmp_path / "upload.tiff", np.full((4, 4), 42.0, dtype=np.float32))
     original_dir = app_module.DSM_DIR
     original_store = app_module.DSM_DATASET_STORE
@@ -552,12 +966,6 @@ def test_dsm_upload_and_dataset_endpoints(tmp_path: Path) -> None:
                 f"/v1/terrain-rgb/{{z}}/{{x}}/{{y}}.png?mode=blended&datasetId={upload_payload['datasetId']}"
             )
 
-            listing = client.get("/v1/dsm/datasets")
-            assert listing.status_code == 200
-            datasets = listing.json()["datasets"]
-            assert len(datasets) == 1
-            assert datasets[0]["datasetId"] == upload_payload["datasetId"]
-
             detail = client.get(f"/v1/dsm/datasets/{upload_payload['datasetId']}")
             assert detail.status_code == 200
             assert detail.json()["datasetId"] == upload_payload["datasetId"]
@@ -566,7 +974,7 @@ def test_dsm_upload_and_dataset_endpoints(tmp_path: Path) -> None:
         app_module.DSM_DATASET_STORE = original_store
 
 
-def test_dsm_upload_and_dataset_endpoints_with_s3_store(tmp_path: Path) -> None:
+def test_dsm_upload_and_dataset_detail_endpoint_with_s3_store(tmp_path: Path) -> None:
     payload = _write_geotiff(tmp_path / "upload-s3.tiff", np.full((4, 4), 42.0, dtype=np.float32))
     fake_s3 = _FakeS3Client()
     original_dir = app_module.DSM_DIR
@@ -585,12 +993,6 @@ def test_dsm_upload_and_dataset_endpoints_with_s3_store(tmp_path: Path) -> None:
             dataset_id = upload_payload["datasetId"]
             assert dataset_id
             assert upload_payload["descriptor"]["id"] == dataset_id
-
-            listing = client.get("/v1/dsm/datasets")
-            assert listing.status_code == 200
-            datasets = listing.json()["datasets"]
-            assert len(datasets) == 1
-            assert datasets[0]["datasetId"] == dataset_id
 
             detail = client.get(f"/v1/dsm/datasets/{dataset_id}")
             assert detail.status_code == 200

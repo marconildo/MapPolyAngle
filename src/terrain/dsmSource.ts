@@ -1,4 +1,4 @@
-import { fromArrayBuffer } from "geotiff";
+import { fromArrayBuffer, fromBlob } from "geotiff";
 import { convertCoordinates, toProj4 } from "geotiff-geokeys-to-proj4";
 import proj4 from "proj4";
 import { tileMetersBounds } from "@/overlap/mercator";
@@ -29,6 +29,11 @@ let dsmState: DsmSourceState = {
   error: null,
 };
 let loadGeneration = 0;
+
+const EXTRA_SAMPLE_ASSOC_ALPHA = 1;
+const EXTRA_SAMPLE_UNASS_ALPHA = 2;
+const INVALID_DSM_LAYOUT_MESSAGE =
+  "This file is not a DSM. Upload a single-band elevation GeoTIFF; RGB/RGBA ortho imagery is not supported.";
 
 function emit() {
   for (const listener of listeners) listener();
@@ -94,6 +99,103 @@ function inferSourceCrsCode(geoKeys: Record<string, any>): string | null {
   return null;
 }
 
+function generateLocalDsmId(): string {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `local-dsm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function readExtraSamples(image: any): number[] {
+  const value = image.fileDirectory.getValue("ExtraSamples");
+  if (Array.isArray(value)) {
+    return value.map((sample) => Number(sample)).filter((sample) => Number.isFinite(sample));
+  }
+  if (Number.isFinite(value)) {
+    return [Number(value)];
+  }
+  return [];
+}
+
+function validateDsmSampleLayout(image: any): void {
+  const samplesPerPixel = Number(image.getSamplesPerPixel?.() ?? 1);
+  if (!Number.isFinite(samplesPerPixel) || samplesPerPixel <= 0) {
+    throw new Error("GeoTIFF sample layout is invalid.");
+  }
+  const extraSamples = readExtraSamples(image);
+  const alphaOrMaskExtraCount = extraSamples.filter(
+    (sample) => sample === EXTRA_SAMPLE_ASSOC_ALPHA || sample === EXTRA_SAMPLE_UNASS_ALPHA,
+  ).length;
+  const unsupportedExtraCount = extraSamples.length - alphaOrMaskExtraCount;
+  const baseSampleCount = samplesPerPixel - alphaOrMaskExtraCount;
+  if (baseSampleCount !== 1 || unsupportedExtraCount > 0) {
+    throw new Error(INVALID_DSM_LAYOUT_MESSAGE);
+  }
+}
+
+async function inspectDsmGeoTiffFile(file: File): Promise<Omit<LoadedDsmSource, "file">> {
+  const tiff = typeof FileReader === "function"
+    ? await fromBlob(file)
+    : await fromArrayBuffer(await file.arrayBuffer());
+  const image = await tiff.getImage();
+  validateDsmSampleLayout(image);
+
+  const geoKeys = image.getGeoKeys() as Record<string, any>;
+  const projObj = toProj4(geoKeys as any);
+  const sourceProj4 = String(projObj.proj4 || "").trim();
+  if (!sourceProj4) {
+    throw new Error("Could not determine a usable source projection from the GeoTIFF geokeys.");
+  }
+
+  const width = image.getWidth();
+  const height = image.getHeight();
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error("GeoTIFF dimensions are invalid.");
+  }
+
+  const [minX, minY, maxX, maxY] = image.getBoundingBox();
+  const sourceBounds = { minX, minY, maxX, maxY };
+  const footprint3857 = toProjectedBounds3857(sourceProj4, sourceBounds);
+  const footprintLngLat = toFootprintLngLat(sourceProj4, sourceBounds);
+  const noDataRaw = image.getGDALNoData();
+  const noDataValue = noDataRaw == null ? null : Number.parseFloat(String(noDataRaw));
+  const descriptor: DsmSourceDescriptor = {
+    id: generateLocalDsmId(),
+    name: file.name,
+    fileSizeBytes: file.size,
+    width,
+    height,
+    sourceBounds,
+    footprint3857,
+    footprintLngLat: footprintLngLat.bounds,
+    footprintRingLngLat: footprintLngLat.ring,
+    sourceCrsCode: inferSourceCrsCode(geoKeys),
+    sourceCrsLabel: String(geoKeys.GTCitationGeoKey || inferSourceCrsCode(geoKeys) || "GeoTIFF CRS"),
+    sourceProj4,
+    horizontalUnits: typeof projObj.coordinatesUnits === "string" ? projObj.coordinatesUnits : null,
+    verticalScaleToMeters:
+      projObj.coordinatesConversionParameters &&
+      Number.isFinite(projObj.coordinatesConversionParameters.z)
+        ? projObj.coordinatesConversionParameters.z
+        : 1,
+    noDataValue: Number.isFinite(noDataValue) ? noDataValue : null,
+    loadedAtIso: new Date().toISOString(),
+  };
+
+  return {
+    descriptor,
+    image,
+    sourceBounds,
+    sourceProj4,
+    noDataValue: descriptor.noDataValue,
+    verticalScaleToMeters: descriptor.verticalScaleToMeters,
+  };
+}
+
+export async function validateDsmGeoTiffFile(file: File): Promise<void> {
+  await inspectDsmGeoTiffFile(file);
+}
+
 function sourcePointToPixel(dsm: LoadedDsmSource, sourceX: number, sourceY: number) {
   const { minX, minY, maxX, maxY } = dsm.sourceBounds;
   const pixelSizeX = (maxX - minX) / dsm.descriptor.width;
@@ -144,54 +246,14 @@ export async function loadDsmFromFile(file: File): Promise<DsmSourceDescriptor> 
   emit();
 
   try {
-    const tiff = await fromArrayBuffer(await file.arrayBuffer());
-    const image = await tiff.getImage();
-    const geoKeys = image.getGeoKeys() as Record<string, any>;
-    const projObj = toProj4(geoKeys as any);
-    const sourceProj4 = String(projObj.proj4 || "").trim();
-    if (!sourceProj4) {
-      throw new Error("Could not determine a usable source projection from the GeoTIFF geokeys.");
-    }
-
-    const [minX, minY, maxX, maxY] = image.getBoundingBox();
-    const sourceBounds = { minX, minY, maxX, maxY };
-    const footprint3857 = toProjectedBounds3857(sourceProj4, sourceBounds);
-    const footprintLngLat = toFootprintLngLat(sourceProj4, sourceBounds);
-    const noDataRaw = image.getGDALNoData();
-    const noDataValue = noDataRaw == null ? null : Number.parseFloat(String(noDataRaw));
-    const descriptor: DsmSourceDescriptor = {
-      id: crypto.randomUUID(),
-      name: file.name,
-      fileSizeBytes: file.size,
-      width: image.getWidth(),
-      height: image.getHeight(),
-      sourceBounds,
-      footprint3857,
-      footprintLngLat: footprintLngLat.bounds,
-      footprintRingLngLat: footprintLngLat.ring,
-      sourceCrsCode: inferSourceCrsCode(geoKeys),
-      sourceCrsLabel: String(geoKeys.GTCitationGeoKey || inferSourceCrsCode(geoKeys) || "GeoTIFF CRS"),
-      sourceProj4,
-      horizontalUnits: typeof projObj.coordinatesUnits === "string" ? projObj.coordinatesUnits : null,
-      verticalScaleToMeters:
-        projObj.coordinatesConversionParameters &&
-        Number.isFinite(projObj.coordinatesConversionParameters.z)
-          ? projObj.coordinatesConversionParameters.z
-          : 1,
-      noDataValue: Number.isFinite(noDataValue) ? noDataValue : null,
-      loadedAtIso: new Date().toISOString(),
-    };
+    const loaded = await inspectDsmGeoTiffFile(file);
+    const descriptor = loaded.descriptor;
 
     if (generation !== loadGeneration) return descriptor;
 
     activeDsm = {
       file,
-      descriptor,
-      image,
-      sourceBounds,
-      sourceProj4,
-      noDataValue: descriptor.noDataValue,
-      verticalScaleToMeters: descriptor.verticalScaleToMeters,
+      ...loaded,
     };
     dsmState = {
       descriptor,

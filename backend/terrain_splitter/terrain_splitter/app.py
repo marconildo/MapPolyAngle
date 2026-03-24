@@ -18,13 +18,22 @@ from PIL import Image
 
 from .debug import write_debug_artifacts
 from .dsm_store import create_dsm_dataset_store, derive_descriptor_from_payload
+from .dsm_uploads import (
+    finalize_dsm_upload,
+    prepare_dsm_upload,
+    store_local_upload_payload,
+    uses_presigned_dsm_upload_flow,
+)
 from .exact_bridge import create_exact_runtime_bridge
 from .features import compute_feature_field
 from .grid import build_grid
 from .mapbox_tiles import TerrainTileCache, fetch_dem_for_ring, mapbox_token
 from .schemas import (
     DebugArtifacts,
-    DsmDatasetListResponse,
+    DsmSourceDescriptorModel,
+    DsmFinalizeUploadRequest,
+    DsmPrepareUploadRequest,
+    DsmPrepareUploadResponse,
     DsmStatusResponse,
     ExactOptimizeBearingRequest,
     ExactOptimizeBearingResponse,
@@ -63,6 +72,7 @@ def _should_enable_internal_http() -> bool:
 CACHE_DIR = _runtime_dir("TERRAIN_SPLITTER_CACHE_DIR", ".cache")
 DEBUG_DIR = _runtime_dir("TERRAIN_SPLITTER_DEBUG_DIR", ".debug")
 DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
+DSM_UPLOAD_STAGING_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_UPLOAD_STAGING_DIR", ".dsm-upload-staging")
 DSM_DATASET_STORE = create_dsm_dataset_store(DSM_DIR)
 EXACT_RUNTIME_BRIDGE = create_exact_runtime_bridge()
 EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_K", "3")))
@@ -181,22 +191,22 @@ def _terrain_tile_url_template(request: Request, terrain_source: TerrainSourceMo
     return str(request.base_url).rstrip("/") + f"/v1/terrain-rgb/{{z}}/{{x}}/{{y}}.png?{query}"
 
 
-@app.get("/v1/dsm/datasets", response_model=DsmDatasetListResponse)
-def list_dsm_datasets(request: Request) -> DsmDatasetListResponse:
-    datasets = [
-        DsmStatusResponse(
-            datasetId=descriptor.id,
-            descriptor=descriptor,
-            processingStatus="ready",
-            reusedExisting=True,
-            terrainTileUrlTemplate=_terrain_tile_url_template(
-                request,
-                TerrainSourceModel(mode="blended", datasetId=descriptor.id),
-            ),
-        )
-        for descriptor in DSM_DATASET_STORE.list_datasets()
-    ]
-    return DsmDatasetListResponse(datasets=datasets)
+def _dsm_status_response(
+    request: Request,
+    descriptor: DsmSourceDescriptorModel,
+    *,
+    reused_existing: bool,
+) -> DsmStatusResponse:
+    return DsmStatusResponse(
+        datasetId=descriptor.id,
+        descriptor=descriptor,
+        processingStatus="ready",
+        reusedExisting=reused_existing,
+        terrainTileUrlTemplate=_terrain_tile_url_template(
+            request,
+            TerrainSourceModel(mode="blended", datasetId=descriptor.id),
+        ),
+    )
 
 
 @app.get("/v1/dsm/datasets/{dataset_id}", response_model=DsmStatusResponse)
@@ -204,16 +214,7 @@ def get_dsm_dataset(request: Request, dataset_id: str) -> DsmStatusResponse:
     descriptor = DSM_DATASET_STORE.get_dataset_descriptor(dataset_id)
     if descriptor is None:
         raise HTTPException(status_code=404, detail=f"DSM dataset {dataset_id} was not found.")
-    return DsmStatusResponse(
-        datasetId=descriptor.id,
-        descriptor=descriptor,
-        processingStatus="ready",
-        reusedExisting=True,
-        terrainTileUrlTemplate=_terrain_tile_url_template(
-            request,
-            TerrainSourceModel(mode="blended", datasetId=descriptor.id),
-        ),
-    )
+    return _dsm_status_response(request, descriptor, reused_existing=True)
 
 
 @app.post("/v1/dsm/upload", response_model=DsmStatusResponse)
@@ -235,16 +236,59 @@ async def upload_dsm(request: Request, file: UploadFile = File(...)) -> DsmStatu
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Failed to ingest DSM: {exc}") from exc
 
-    return DsmStatusResponse(
-        datasetId=stored_descriptor.id,
-        descriptor=stored_descriptor,
-        processingStatus="ready",
-        reusedExisting=reused_existing,
-        terrainTileUrlTemplate=_terrain_tile_url_template(
-            request,
-            TerrainSourceModel(mode="blended", datasetId=stored_descriptor.id),
-        ),
+    return _dsm_status_response(request, stored_descriptor, reused_existing=reused_existing)
+
+
+@app.post("/v1/dsm/prepare-upload", response_model=DsmPrepareUploadResponse)
+def prepare_dsm_upload_route(request: Request, payload: DsmPrepareUploadRequest) -> DsmPrepareUploadResponse:
+    prepared = prepare_dsm_upload(
+        dataset_store=DSM_DATASET_STORE,
+        staging_dir=DSM_UPLOAD_STAGING_DIR,
+        base_url=str(request.base_url).rstrip("/"),
+        sha256=payload.sha256,
+        file_size_bytes=payload.fileSizeBytes,
+        original_name=payload.originalName,
+        content_type=payload.contentType,
     )
+    if prepared.status == "existing" and prepared.descriptor is not None:
+        return DsmPrepareUploadResponse(
+            status="existing",
+            dataset=_dsm_status_response(request, prepared.descriptor, reused_existing=prepared.reused_existing),
+        )
+    return DsmPrepareUploadResponse(
+        status="upload-required",
+        uploadId=prepared.upload_id,
+        uploadTarget={
+            "url": prepared.upload_target_url,
+            "method": "PUT",
+            "headers": prepared.upload_target_headers or {},
+            "expiresAtIso": prepared.expires_at_iso,
+        },
+    )
+
+
+@app.post("/v1/dsm/finalize-upload", response_model=DsmStatusResponse)
+def finalize_dsm_upload_route(request: Request, payload: DsmFinalizeUploadRequest) -> DsmStatusResponse:
+    try:
+        descriptor, reused_existing = finalize_dsm_upload(
+            dataset_store=DSM_DATASET_STORE,
+            staging_dir=DSM_UPLOAD_STAGING_DIR,
+            upload_id=payload.uploadId,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to ingest DSM: {exc}") from exc
+    return _dsm_status_response(request, descriptor, reused_existing=reused_existing)
+
+
+if not uses_presigned_dsm_upload_flow(DSM_DATASET_STORE):
+    @app.put("/v1/dsm/upload-sessions/{upload_id}", status_code=204)
+    async def upload_dsm_session_payload(upload_id: str, request: Request) -> Response:
+        await store_local_upload_payload(
+            staging_dir=DSM_UPLOAD_STAGING_DIR,
+            upload_id=upload_id,
+            request=request,
+        )
+        return Response(status_code=204)
 
 
 @app.get("/v1/terrain-rgb/{z}/{x}/{y}.png")

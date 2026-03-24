@@ -10,7 +10,7 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
-import { setTerrainDemSourceOnMap, useMapInitialization } from './hooks/useMapInitialization';
+import { setTerrainDemSourceOnMap, useMapInitialization, waitForTerrainDemSourceOnMap } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import {
   addFlightLinesForPolygon,
@@ -393,6 +393,7 @@ interface Props {
   sampleStep?: number;
   terrainDemUrlTemplate?: string | null;
   terrainSource?: TerrainSourceSelection;
+  onTerrainSourceReady?: (terrainSource: TerrainSourceSelection) => void;
 
   onRequestParams?: (polygonId: string, ring: [number, number][]) => void;
   onAnalysisComplete?: (results: PolygonAnalysisResult[]) => void;
@@ -413,6 +414,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       sampleStep = 2,
       terrainDemUrlTemplate = null,
       terrainSource = { mode: 'mapbox', datasetId: null },
+      onTerrainSourceReady,
       onRequestParams,
       onAnalysisComplete,
       onAnalysisStart,
@@ -428,6 +430,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const drawRef = useRef<MapboxDraw>();
     const deckOverlayRef = useRef<MapboxOverlay>();
     const terrainDemSourceTemplateRef = useRef<string | null>(terrainDemUrlTemplate);
+    const terrainSourceRef = useRef<TerrainSourceSelection>(terrainSource);
+    const onTerrainSourceReadyRef = useRef(onTerrainSourceReady);
+    const terrainSourceApplySeqRef = useRef(0);
 
     // File inputs
     const kmlInputRef = useRef<HTMLInputElement>(null);
@@ -499,6 +504,18 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     React.useEffect(() => { polygonFlightLinesRef.current = polygonFlightLines; }, [polygonFlightLines]);
     React.useEffect(() => { polygonResultsRef.current = polygonResults; }, [polygonResults]);
     React.useEffect(() => { importedOriginalsRef.current = importedOriginals; }, [importedOriginals]);
+    React.useEffect(() => { terrainSourceRef.current = terrainSource; }, [terrainSource]);
+    React.useEffect(() => { onTerrainSourceReadyRef.current = onTerrainSourceReady; }, [onTerrainSourceReady]);
+
+    const applyTerrainSourceToMap = useCallback((map: MapboxMap, tileUrlTemplate: string | null, nextTerrainSource: TerrainSourceSelection) => {
+      const applySeq = terrainSourceApplySeqRef.current + 1;
+      terrainSourceApplySeqRef.current = applySeq;
+      setTerrainDemSourceOnMap(map, tileUrlTemplate);
+      void waitForTerrainDemSourceOnMap(map, tileUrlTemplate).then(() => {
+        if (terrainSourceApplySeqRef.current !== applySeq) return;
+        onTerrainSourceReadyRef.current?.(nextTerrainSource);
+      });
+    }, []);
 
     const syncProcessingPerimeterOverlay = useCallback(() => {
       const map = mapRef.current;
@@ -1375,7 +1392,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         mapRef.current = map;
         drawRef.current = draw;
         deckOverlayRef.current = overlay;
-        setTerrainDemSourceOnMap(map, terrainDemSourceTemplateRef.current);
+        applyTerrainSourceToMap(map, terrainDemSourceTemplateRef.current, terrainSourceRef.current);
         map.on('draw.create', handleDrawCreate);
         map.on('draw.update', handleDrawUpdate);
         map.on('draw.delete', handleDrawDelete);
@@ -1418,15 +1435,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } catch {}
         });
       },
-      [clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected, scheduleGuardedTimeout]
+      [applyTerrainSourceToMap, clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected, scheduleGuardedTimeout]
     );
 
     useEffect(() => {
       terrainDemSourceTemplateRef.current = terrainDemUrlTemplate;
       if (mapRef.current && mapRef.current.isStyleLoaded()) {
-        setTerrainDemSourceOnMap(mapRef.current, terrainDemUrlTemplate);
+        applyTerrainSourceToMap(mapRef.current, terrainDemUrlTemplate, terrainSource);
       }
-    }, [terrainDemUrlTemplate]);
+    }, [applyTerrainSourceToMap, terrainDemUrlTemplate, terrainSource]);
 
     useMapInitialization({
       mapboxToken,

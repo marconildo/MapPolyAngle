@@ -54,6 +54,76 @@ export function setTerrainDemSourceOnMap(map: MapboxMap, tileUrlTemplate: string
   map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
 }
 
+export function waitForTerrainDemSourceOnMap(
+  map: MapboxMap,
+  tileUrlTemplate: string | null,
+  timeoutMs = 10000,
+): Promise<void> {
+  const sourceId = tileUrlTemplate ? BACKEND_DEM_SOURCE_ID : MAPBOX_DEM_SOURCE_ID;
+
+  try {
+    if (!map.getStyle() || !map.getSource(sourceId)) {
+      return Promise.resolve();
+    }
+  } catch {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId: number | null = null;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      map.off('sourcedata', handleSourceData);
+      map.off('idle', handleIdle);
+      resolve();
+    };
+
+    const isReady = () => {
+      try {
+        return !!map.getSource(sourceId) && map.isSourceLoaded(sourceId);
+      } catch {
+        return true;
+      }
+    };
+
+    const handleIdle = () => {
+      if (isReady()) finish();
+    };
+
+    const handleSourceData = (event: { sourceId?: string; isSourceLoaded?: boolean }) => {
+      if (event.sourceId !== sourceId) return;
+      if (event.isSourceLoaded || isReady()) {
+        if (!map.isMoving()) {
+          finish();
+          return;
+        }
+        map.once('idle', handleIdle);
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      finish();
+    }, timeoutMs);
+
+    map.on('sourcedata', handleSourceData);
+    map.on('idle', handleIdle);
+
+    if (isReady()) {
+      if (!map.isMoving()) {
+        finish();
+        return;
+      }
+      map.once('idle', handleIdle);
+    }
+  });
+}
+
 interface UseMapInitializationProps {
   mapboxToken: string;
   center: LngLatLike;

@@ -1,11 +1,11 @@
-import { clearActiveDsm, loadDsmFromFile } from './dsmSource';
+import { clearActiveDsm, loadDsmFromFile, validateDsmGeoTiffFile } from './dsmSource';
 import type { DsmSourceDescriptor, TerrainSourceMode, TerrainSourceSelection, TerrainSourceState } from './types';
 import {
+  findDsmDatasetFromTerrainBackend,
   getDsmDatasetFromTerrainBackend,
   getTerrainTileUrlForSource,
   getTerrainTileUrlTemplateForSource,
   isDsmTerrainBackendEnabled,
-  listDsmDatasetsFromTerrainBackend,
   uploadDsmToTerrainBackend,
 } from '@/services/dsmTerrainBackend';
 
@@ -50,14 +50,6 @@ function persistTerrainSelection() {
   }
 }
 
-function sortDescriptors(descriptors: DsmSourceDescriptor[]): DsmSourceDescriptor[] {
-  return [...descriptors].sort((left, right) => right.loadedAtIso.localeCompare(left.loadedAtIso));
-}
-
-function upsertDescriptor(descriptors: DsmSourceDescriptor[], descriptor: DsmSourceDescriptor): DsmSourceDescriptor[] {
-  return sortDescriptors([...descriptors.filter((candidate) => candidate.id !== descriptor.id), descriptor]);
-}
-
 function emit(options?: { persist?: boolean }) {
   terrainSourceState = {
     ...terrainSourceState,
@@ -73,9 +65,7 @@ function initialTerrainSourceState(): TerrainSourceState {
   return {
     source: { mode: 'mapbox', datasetId: null },
     descriptor: null,
-    datasets: [],
     isLoading: false,
-    isDatasetListLoading: false,
     error: null,
     backendEnabled: isDsmTerrainBackendEnabled(),
   };
@@ -146,59 +136,50 @@ export function __resetTerrainSourceForTests(options?: { clearStorage?: boolean 
 
 export async function initializeTerrainSourceState(): Promise<void> {
   if (!isDsmTerrainBackendEnabled()) return;
-  await refreshTerrainSourceDatasets();
-}
-
-export async function refreshTerrainSourceDatasets(): Promise<DsmSourceDescriptor[]> {
-  if (!isDsmTerrainBackendEnabled()) {
+  const persisted = readPersistedTerrainSelection();
+  if (persisted?.mode !== 'blended' || !persisted.selectedDatasetId) {
     terrainSourceState = {
       ...terrainSourceState,
-      datasets: [],
-      isDatasetListLoading: false,
+      source: { mode: 'mapbox', datasetId: null },
+      descriptor: null,
+      isLoading: false,
+      error: null,
     };
-    emit();
-    return [];
+    emit({ persist: false });
+    return;
   }
 
   terrainSourceState = {
     ...terrainSourceState,
-    isDatasetListLoading: true,
+    isLoading: true,
+    error: null,
   };
   emit({ persist: false });
 
   try {
-    const datasets = sortDescriptors(
-      (await listDsmDatasetsFromTerrainBackend())
-        .map((dataset) => dataset.descriptor)
-        .filter((descriptor): descriptor is DsmSourceDescriptor => descriptor != null)
-    );
-    const persisted = readPersistedTerrainSelection();
-    const preferredId = terrainSourceState.descriptor?.id ?? persisted?.selectedDatasetId ?? null;
-    const selectedDescriptor = preferredId ? datasets.find((dataset) => dataset.id === preferredId) ?? null : null;
-    const nextMode =
-      selectedDescriptor && (terrainSourceState.source.mode === 'blended' || persisted?.mode === 'blended')
-        ? 'blended'
-        : 'mapbox';
+    const fetched = await findDsmDatasetFromTerrainBackend(persisted.selectedDatasetId);
+    if (!fetched?.descriptor) {
+      clearTerrainSourceSelection();
+      return;
+    }
     terrainSourceState = {
       ...terrainSourceState,
-      datasets,
-      descriptor: selectedDescriptor,
+      descriptor: fetched.descriptor,
       source: {
-        mode: nextMode,
-        datasetId: nextMode === 'blended' ? selectedDescriptor?.id ?? null : null,
+        mode: 'blended',
+        datasetId: fetched.descriptor.id,
       },
-      isDatasetListLoading: false,
+      isLoading: false,
       error: null,
     };
     emit();
-    return datasets;
   } catch (error) {
     terrainSourceState = {
       ...terrainSourceState,
-      isDatasetListLoading: false,
+      isLoading: false,
       error: error instanceof Error ? error.message : String(error),
     };
-    emit();
+    emit({ persist: false });
     throw error;
   }
 }
@@ -220,14 +201,12 @@ export async function selectTerrainSourceDataset(datasetId: string, mode: Terrai
   emit();
 
   try {
-    const existing = terrainSourceState.datasets.find((dataset) => dataset.id === normalizedDatasetId) ?? null;
-    const fetched = existing ?? (await getDsmDatasetFromTerrainBackend(normalizedDatasetId)).descriptor;
+    const fetched = (await getDsmDatasetFromTerrainBackend(normalizedDatasetId)).descriptor;
     if (!fetched) {
       throw new Error(`DSM dataset ${normalizedDatasetId} is not available.`);
     }
     terrainSourceState = {
       ...terrainSourceState,
-      datasets: upsertDescriptor(terrainSourceState.datasets, fetched),
       descriptor: fetched,
       source: {
         mode: mode === 'blended' ? 'blended' : 'mapbox',
@@ -249,7 +228,10 @@ export async function selectTerrainSourceDataset(datasetId: string, mode: Terrai
   }
 }
 
-export async function loadTerrainSourceFromFile(file: File): Promise<DsmSourceDescriptor> {
+export async function loadTerrainSourceFromFile(
+  file: File,
+  options?: { onProgressPhase?: (phase: 'validating' | 'uploading') => void },
+): Promise<DsmSourceDescriptor> {
   terrainSourceState = {
     ...terrainSourceState,
     isLoading: true,
@@ -260,6 +242,9 @@ export async function loadTerrainSourceFromFile(file: File): Promise<DsmSourceDe
   try {
     if (isDsmTerrainBackendEnabled()) {
       try {
+        options?.onProgressPhase?.('validating');
+        await validateDsmGeoTiffFile(file);
+        options?.onProgressPhase?.('uploading');
         const uploaded = await uploadDsmToTerrainBackend(file);
         clearActiveDsm();
         if (!uploaded.descriptor || !uploaded.datasetId) {
@@ -267,7 +252,6 @@ export async function loadTerrainSourceFromFile(file: File): Promise<DsmSourceDe
         }
         terrainSourceState = {
           ...terrainSourceState,
-          datasets: upsertDescriptor(terrainSourceState.datasets, uploaded.descriptor),
           source: { mode: 'blended', datasetId: uploaded.datasetId },
           descriptor: uploaded.descriptor,
           isLoading: false,
@@ -286,7 +270,6 @@ export async function loadTerrainSourceFromFile(file: File): Promise<DsmSourceDe
       ...terrainSourceState,
       source: { mode: 'blended', datasetId: localDescriptor.id },
       descriptor: localDescriptor,
-      datasets: upsertDescriptor(terrainSourceState.datasets, localDescriptor),
       isLoading: false,
       error: null,
     };

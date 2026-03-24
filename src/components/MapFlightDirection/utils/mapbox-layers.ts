@@ -40,6 +40,8 @@ const PROCESSING_PERIMETER_PULSE_LAYER_ID = 'terrain-processing-perimeter-pulse'
 const DSM_FOOTPRINT_SOURCE_ID = 'uploaded-dsm-footprint-source';
 const DSM_FOOTPRINT_FILL_LAYER_ID = 'uploaded-dsm-footprint-fill';
 const DSM_FOOTPRINT_LINE_LAYER_ID = 'uploaded-dsm-footprint-line';
+const IMAGERY_OVERLAY_SOURCE_ID = 'imagery-overlay-source';
+const IMAGERY_OVERLAY_LAYER_ID = 'imagery-overlay-layer';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -285,6 +287,43 @@ export function clearDsmFootprintPolygon(map: MapboxMap) {
   try { if (map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_LINE_LAYER_ID); } catch {}
   try { if (map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_FILL_LAYER_ID); } catch {}
   try { if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) map.removeSource(DSM_FOOTPRINT_SOURCE_ID); } catch {}
+}
+
+export function setImageryOverlayOnMap(
+  map: MapboxMap,
+  overlay: {
+    url: string;
+    coordinates: [[number, number], [number, number], [number, number], [number, number]];
+  } | null,
+) {
+  try {
+    if (!map.getStyle()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  try { if (map.getLayer(IMAGERY_OVERLAY_LAYER_ID)) map.removeLayer(IMAGERY_OVERLAY_LAYER_ID); } catch {}
+  try { if (map.getSource(IMAGERY_OVERLAY_SOURCE_ID)) map.removeSource(IMAGERY_OVERLAY_SOURCE_ID); } catch {}
+
+  if (!overlay) return;
+
+  map.addSource(IMAGERY_OVERLAY_SOURCE_ID, {
+    type: 'image',
+    url: overlay.url,
+    coordinates: overlay.coordinates,
+  } as any);
+
+  map.addLayer({
+    id: IMAGERY_OVERLAY_LAYER_ID,
+    type: 'raster',
+    source: IMAGERY_OVERLAY_SOURCE_ID,
+    paint: {
+      'raster-opacity': 0.92,
+      'raster-resampling': 'linear',
+    },
+  }, getDrawLayerAnchor(map));
 }
 
 export function addFlightLinesForPolygon(

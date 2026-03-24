@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeArrayBuffer } from "geotiff";
 
 import type { DsmSourceDescriptor } from "../terrain/types.ts";
 
@@ -50,6 +51,7 @@ function makeDescriptor(id: string, name: string): DsmSourceDescriptor {
 }
 
 const datasets = [makeDescriptor("dsm-1", "First DSM"), makeDescriptor("dsm-2", "Second DSM")];
+const uploadedDescriptor = makeDescriptor("uploaded-dsm", "Uploaded DSM");
 
 type MockResponseInit = {
   ok?: boolean;
@@ -71,26 +73,59 @@ function mockResponse(init: MockResponseInit) {
   };
 }
 
-const fetchCalls: string[] = [];
+async function makeSingleBandGeoTiffFile(name: string): Promise<File> {
+  const arrayBuffer = await writeArrayBuffer(
+    new Float32Array([1, 4, 9, 16]),
+    {
+      width: 2,
+      height: 2,
+      SampleFormat: [3],
+      BitsPerSample: [32],
+      GeographicTypeGeoKey: 4326,
+      ModelPixelScale: [0.01, 0.01, 0],
+      ModelTiepoint: [0, 0, 0, 7, 47, 0],
+    },
+  );
+  const blob = new Blob([arrayBuffer], { type: "image/tiff" }) as Blob & { name: string; lastModified: number };
+  Object.defineProperty(blob, "name", { value: name, configurable: true });
+  Object.defineProperty(blob, "lastModified", { value: 0, configurable: true });
+  return blob as unknown as File;
+}
+
+async function makeRgbaGeoTiffFile(name: string): Promise<File> {
+  const arrayBuffer = await writeArrayBuffer(
+    [
+      [[120, 120], [120, 120]],
+      [[80, 80], [80, 80]],
+      [[40, 40], [40, 40]],
+      [[255, 255], [255, 255]],
+    ],
+    {
+      width: 2,
+      height: 2,
+      SamplesPerPixel: 4,
+      BitsPerSample: [8, 8, 8, 8],
+      PhotometricInterpretation: 2,
+      ExtraSamples: [2],
+      GeographicTypeGeoKey: 4326,
+      ModelPixelScale: [0.01, 0.01, 0],
+      ModelTiepoint: [0, 0, 0, 7, 47, 0],
+    },
+  );
+  const blob = new Blob([arrayBuffer], { type: "image/tiff" }) as Blob & { name: string; lastModified: number };
+  Object.defineProperty(blob, "name", { value: name, configurable: true });
+  Object.defineProperty(blob, "lastModified", { value: 0, configurable: true });
+  return blob as unknown as File;
+}
+
+const fetchCalls: Array<{ url: string; method: string }> = [];
 
 globalThis.window = { localStorage: storage } as typeof window;
 globalThis.__TERRAIN_BACKEND_URL_FOR_TESTS__ = backendBaseUrl;
-globalThis.fetch = (async (input: string | URL) => {
+globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
   const url = String(input);
-  fetchCalls.push(url);
-  if (url === `${backendBaseUrl}/v1/dsm/datasets`) {
-    return mockResponse({
-      jsonBody: {
-        datasets: datasets.map((descriptor) => ({
-          datasetId: descriptor.id,
-          descriptor,
-          processingStatus: "ready",
-          reusedExisting: true,
-          terrainTileUrlTemplate: `${backendBaseUrl}/v1/terrain-rgb/{z}/{x}/{y}.png?mode=blended&datasetId=${descriptor.id}`,
-        })),
-      },
-    });
-  }
+  const method = init?.method ?? "GET";
+  fetchCalls.push({ url, method });
   if (url.startsWith(`${backendBaseUrl}/v1/dsm/datasets/`)) {
     const datasetId = decodeURIComponent(url.slice(`${backendBaseUrl}/v1/dsm/datasets/`.length));
     const descriptor = datasets.find((candidate) => candidate.id === datasetId);
@@ -107,7 +142,35 @@ globalThis.fetch = (async (input: string | URL) => {
       },
     });
   }
-  throw new Error(`Unexpected fetch: ${url}`);
+  if (url === `${backendBaseUrl}/v1/dsm/prepare-upload` && method === "POST") {
+    return mockResponse({
+      jsonBody: {
+        status: "upload-required",
+        uploadId: "terrain-source-upload",
+        uploadTarget: {
+          url: "https://upload-target.test/terrain-source",
+          method: "PUT",
+          headers: { "Content-Type": "image/tiff" },
+          expiresAtIso: "2026-03-24T13:00:00Z",
+        },
+      },
+    });
+  }
+  if (url === "https://upload-target.test/terrain-source" && method === "PUT") {
+    return mockResponse({ status: 200, textBody: "" });
+  }
+  if (url === `${backendBaseUrl}/v1/dsm/finalize-upload` && method === "POST") {
+    return mockResponse({
+      jsonBody: {
+        datasetId: uploadedDescriptor.id,
+        descriptor: uploadedDescriptor,
+        processingStatus: "ready",
+        reusedExisting: false,
+        terrainTileUrlTemplate: `${backendBaseUrl}/v1/terrain-rgb/{z}/{x}/{y}.png?mode=blended&datasetId=${uploadedDescriptor.id}`,
+      },
+    });
+  }
+  throw new Error(`Unexpected fetch: ${method} ${url}`);
 }) as typeof fetch;
 
 const terrainSource = await import("../terrain/terrainSource.ts");
@@ -123,42 +186,55 @@ async function testSessionRestore() {
   const state = terrainSource.getTerrainSourceState();
   assert.equal(state.source.mode, "blended");
   assert.equal(state.descriptor?.id, "dsm-1");
-  assert.equal(state.datasets.length, 2);
   assert.match(terrainSource.getTerrainDemUrlTemplateForCurrentSource() ?? "", /datasetId=dsm-1/);
-  assert.ok(fetchCalls.includes(`${backendBaseUrl}/v1/dsm/datasets`));
+  assert.ok(fetchCalls.some((call) => call.url === `${backendBaseUrl}/v1/dsm/datasets/dsm-1`));
 }
 
-async function testSavedDsmSelectionAndPersistence() {
+async function testUploadingDsmUpdatesTerrainSourceState() {
   storage.clear();
   fetchCalls.length = 0;
   terrainSource.__resetTerrainSourceForTests();
 
   await terrainSource.initializeTerrainSourceState();
-  let state = terrainSource.getTerrainSourceState();
-  assert.equal(state.source.mode, "mapbox");
-  assert.equal(state.descriptor, null);
+  const descriptor = await terrainSource.loadTerrainSourceFromFile(await makeSingleBandGeoTiffFile("uploaded.tiff"));
 
-  const selected = await terrainSource.selectTerrainSourceDataset("dsm-2");
-  assert.equal(selected.id, "dsm-2");
-  state = terrainSource.getTerrainSourceState();
+  assert.equal(descriptor.id, uploadedDescriptor.id);
+  const state = terrainSource.getTerrainSourceState();
   assert.equal(state.source.mode, "blended");
-  assert.equal(state.descriptor?.id, "dsm-2");
+  assert.equal(state.source.datasetId, uploadedDescriptor.id);
+  assert.equal(state.descriptor?.id, uploadedDescriptor.id);
   assert.equal(
     storage.getItem("terrain-source-selection-v1"),
-    JSON.stringify({ mode: "blended", selectedDatasetId: "dsm-2" }),
+    JSON.stringify({ mode: "blended", selectedDatasetId: uploadedDescriptor.id }),
   );
-
-  terrainSource.clearTerrainSourceSelection();
-  state = terrainSource.getTerrainSourceState();
-  assert.equal(state.source.mode, "mapbox");
-  assert.equal(state.descriptor, null);
-  assert.equal(
-    storage.getItem("terrain-source-selection-v1"),
-    JSON.stringify({ mode: "mapbox", selectedDatasetId: null }),
+  assert.deepEqual(
+    fetchCalls
+      .filter((call) => call.method !== "GET")
+      .map((call) => [call.method, call.url]),
+    [
+      ["POST", `${backendBaseUrl}/v1/dsm/prepare-upload`],
+      ["PUT", "https://upload-target.test/terrain-source"],
+      ["POST", `${backendBaseUrl}/v1/dsm/finalize-upload`],
+    ],
   );
 }
 
+async function testInvalidRgbaGeoTiffIsRejectedBeforeBackendUpload() {
+  storage.clear();
+  fetchCalls.length = 0;
+  terrainSource.__resetTerrainSourceForTests();
+
+  await assert.rejects(
+    terrainSource.loadTerrainSourceFromFile(await makeRgbaGeoTiffFile("ortho-rgba.tiff")),
+    /single-band elevation geotiff|rgb\/rgba ortho imagery/i,
+  );
+  assert.equal(fetchCalls.length, 0);
+  assert.equal(terrainSource.getTerrainSourceState().source.mode, "mapbox");
+  assert.equal(terrainSource.getTerrainSourceState().descriptor, null);
+}
+
 await testSessionRestore();
-await testSavedDsmSelectionAndPersistence();
+await testUploadingDsmUpdatesTerrainSourceState();
+await testInvalidRgbaGeoTiffIsRejectedBeforeBackendUpload();
 
 console.log("terrain_source.test.ts passed");

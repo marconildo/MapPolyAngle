@@ -15,6 +15,7 @@ __pycache__/
 backend/terrain_splitter/.cache/
 backend/terrain_splitter/.debug/
 backend/terrain_splitter/.dsm/
+backend/terrain_splitter/.dsm-upload-staging/
 backend/terrain_splitter/.aws-sam/
 backend/terrain_splitter/exact-runtime/
 .aws-sam/
