@@ -7,14 +7,17 @@ import type { Map as MapboxMap } from 'mapbox-gl';
 import type {
   FlightParams
 } from '@/domain/types';
+import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { PolygonAnalysisResult } from './types';
+
+export type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 
 export interface PolygonWithId {
   id?: string;
   ring: [number, number][];
 }
 
-export type BearingOverrideSource = 'wingtra' | 'user' | 'partition';
+export type BearingOverrideSource = 'wingtra' | 'user' | 'partition' | 'optimized';
 
 export interface BearingOverride {
   bearingDeg: number;
@@ -32,29 +35,6 @@ export interface ImportedFlightplanArea {
   };
 }
 
-export interface TerrainPartitionSolutionPreview {
-  signature: string;
-  tradeoff: number;
-  regionCount: number;
-  totalMissionTimeSec: number;
-  normalizedQualityCost: number;
-  weightedMeanMismatchDeg: number;
-  hierarchyLevel: number;
-  largestRegionFraction: number;
-  meanConvexity: number;
-  boundaryBreakAlignment: number;
-  isFirstPracticalSplit: boolean;
-  regions: Array<{
-    areaM2: number;
-    bearingDeg: number;
-    atomCount: number;
-    ring: [number, number][];
-    convexity: number;
-    compactness: number;
-    baseAltitudeAGL?: number;
-  }>;
-}
-
 export interface MapFlightDirectionAPI {
   // Core map operations
   clearAllDrawings(): void;
@@ -66,7 +46,15 @@ export interface MapFlightDirectionAPI {
     options?: { skipBackend?: boolean }
   ): Promise<{ createdIds: string[]; replaced: boolean }>;
   getTerrainPartitionSolutions(polygonId: string): Promise<TerrainPartitionSolutionPreview[]>;
+  refineTerrainPartitionPreview(
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+  ): Promise<TerrainPartitionSolutionPreview>;
   applyTerrainPartitionSolution(polygonId: string, signature: string): Promise<{ createdIds: string[]; replaced: boolean }>;
+  applyTerrainPartitionPreview(
+    polygonId: string,
+    solution: TerrainPartitionSolutionPreview,
+  ): Promise<{ createdIds: string[]; replaced: boolean }>;
   startPolygonDrawing(): void;
   getMap(): MapboxMap | undefined;
 
@@ -75,6 +63,9 @@ export interface MapFlightDirectionAPI {
   getPolygonsWithIds(): PolygonWithId[];
   getPolygonResults(): PolygonAnalysisResult[];
   getPolygonTiles(): Map<string, any[]>; // Keep as any[] for now to match current implementation
+  refreshTerrainForAllPolygons(): void;
+  setTerrainDemSource(tileUrlTemplate: string | null): void;
+  setFlightLinesVisible(visible: boolean): void;
 
   // Flight planning
   applyPolygonParams(polygonId: string, params: FlightParams): void;
@@ -82,6 +73,7 @@ export interface MapFlightDirectionAPI {
   applyParamsToAllPending(params: FlightParams): void; // bulk apply same params to queued polygons
   getFlightLines(): Map<string, {
     flightLines: number[][][];
+    sweepIndices?: number[];
     lineSpacing: number;
     altitudeAGL: number
   }>;

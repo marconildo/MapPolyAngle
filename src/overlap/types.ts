@@ -75,6 +75,17 @@ export type TileResult = {
   densityStats?: DensityStats;
 };
 
+export type OverlayTileResult = {
+  z: number;
+  x: number;
+  y: number;
+  size: number;
+  maxOverlap?: number;
+  overlap?: Uint16Array;
+  gsdMin?: Float32Array;
+  density?: Float32Array;
+};
+
 export type LidarStripMeters = {
   id?: string;
   polygonId?: string;

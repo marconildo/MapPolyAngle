@@ -41,6 +41,14 @@ Parameters:
     Type: Number
     Default: 8
     Description: Maximum number of nested Lambda subtree self-invocations allowed in flight per worker.
+  ExactPostprocessTopK:
+    Type: Number
+    Default: 5
+    Description: Maximum number of surrogate-ranked candidate solutions promoted into exact reranking.
+  ExactCandidateMaxInflight:
+    Type: Number
+    Default: 5
+    Description: Maximum number of exact candidate rerank Lambda invocations allowed in flight per autosplit request.
 
 Globals:
   Function:
@@ -54,6 +62,11 @@ Globals:
         MAPBOX_TOKEN: !Ref MapboxToken
         TERRAIN_SPLITTER_CACHE_DIR: /tmp/terrain-splitter/cache
         TERRAIN_SPLITTER_DEBUG_DIR: /tmp/terrain-splitter/debug
+        TERRAIN_SPLITTER_DSM_DIR: /tmp/terrain-splitter/dsm
+        TERRAIN_SPLITTER_DSM_UPLOAD_STAGING_DIR: /tmp/terrain-splitter/upload-staging
+        TERRAIN_SPLITTER_DSM_STORE_MODE: "s3"
+        TERRAIN_SPLITTER_DSM_S3_BUCKET: !Ref TerrainSplitterDsmBucket
+        TERRAIN_SPLITTER_DSM_S3_PREFIX: !Ref StageName
         TERRAIN_SPLITTER_ENABLE_APP_CORS: "false"
         TERRAIN_SPLITTER_ROOT_PARALLEL_MODE: "lambda"
         TERRAIN_SPLITTER_ROOT_PARALLEL_WORKERS: !Ref RootParallelWorkers
@@ -62,9 +75,44 @@ Globals:
         TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC: !Ref LambdaInvokeReadTimeoutSec
         TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS: !Ref NestedLambdaMinCells
         TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT: !Ref NestedLambdaMaxInflight
+        TERRAIN_SPLITTER_EXACT_TOP_K: !Ref ExactPostprocessTopK
+        TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT: !Ref ExactCandidateMaxInflight
+        TERRAIN_SPLITTER_EXACT_LAMBDA_FUNCTION_NAME: !Sub "${AWS::StackName}-terrain-splitter-exact"
         PYTHONPATH: /var/task
 
 Resources:
+  TerrainSplitterDsmBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref AllowedOrigin
+            AllowedMethods:
+              - PUT
+              - HEAD
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireStagedUploads
+            Status: Enabled
+            Prefix: !Sub "${StageName}/uploads/"
+            ExpirationInDays: 1
+
   TerrainSplitterFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -78,8 +126,48 @@ Resources:
               Action:
                 - lambda:InvokeFunction
               Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter"
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter-exact"
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt TerrainSplitterDsmBucket.Arn
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub "${TerrainSplitterDsmBucket.Arn}/*"
       EphemeralStorage:
         Size: 2048
+      Environment:
+        Variables:
+          TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP: "false"
+
+  TerrainSplitterExactFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-terrain-splitter-exact"
+      Runtime: nodejs20.x
+      Timeout: 900
+      MemorySize: 4096
+      Handler: index.handler
+      CodeUri: ../..
+      Environment:
+        Variables:
+          EXACT_RUNTIME_PROVIDER_MODE: lambda
+          EXACT_RUNTIME_TERRAIN_BATCH_FUNCTION_NAME: !Ref TerrainSplitterFunction
+          TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP: "false"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-terrain-splitter"
 
   TerrainSplitterFunctionUrl:
     Type: AWS::Lambda::Url
@@ -110,3 +198,6 @@ Outputs:
   TerrainSplitterFunctionUrl:
     Description: Lambda Function URL for the terrain splitter backend
     Value: !GetAtt TerrainSplitterFunctionUrl.FunctionUrl
+  TerrainSplitterDsmBucketName:
+    Description: S3 bucket backing DSM datasets for the terrain splitter backend
+    Value: !Ref TerrainSplitterDsmBucket

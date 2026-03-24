@@ -8,6 +8,11 @@ PayloadKind = Literal["camera", "lidar"]
 AltitudeMode = Literal["legacy", "min-clearance"]
 LidarReturnMode = Literal["single", "dual", "triple"]
 LidarComparisonMode = Literal["first-return", "all-returns"]
+TerrainSourceMode = Literal["mapbox", "blended"]
+DsmProcessingStatus = Literal["ready"]
+PartitionRankingSource = Literal["surrogate", "backend-exact", "frontend-exact"]
+ExactMetricKind = Literal["gsd", "density"]
+DsmPrepareUploadStatus = Literal["existing", "upload-required"]
 
 
 class FlightParamsModel(BaseModel):
@@ -34,11 +39,59 @@ class FlightParamsModel(BaseModel):
     customBearingDeg: float | None = None
 
 
+class BoundsModel(BaseModel):
+    minX: float
+    minY: float
+    maxX: float
+    maxY: float
+
+
+class LngLatBoundsModel(BaseModel):
+    minLng: float
+    minLat: float
+    maxLng: float
+    maxLat: float
+
+
+class DsmSourceDescriptorModel(BaseModel):
+    id: str
+    name: str
+    fileSizeBytes: int = Field(..., ge=0)
+    width: int = Field(..., gt=0)
+    height: int = Field(..., gt=0)
+    sourceBounds: BoundsModel
+    footprint3857: BoundsModel
+    footprintLngLat: LngLatBoundsModel
+    footprintRingLngLat: list[tuple[float, float]]
+    sourceCrsCode: str | None = None
+    sourceCrsLabel: str
+    sourceProj4: str
+    horizontalUnits: str | None = None
+    verticalScaleToMeters: float = Field(1.0, gt=0)
+    noDataValue: float | None = None
+    nativeResolutionXM: float | None = Field(default=None, gt=0)
+    nativeResolutionYM: float | None = Field(default=None, gt=0)
+    validCoverageRatio: float | None = Field(default=None, ge=0, le=1)
+    loadedAtIso: str
+
+
+class TerrainSourceModel(BaseModel):
+    mode: TerrainSourceMode = "mapbox"
+    datasetId: str | None = None
+
+    @model_validator(mode="after")
+    def validate_dataset_requirement(self) -> "TerrainSourceModel":
+        if self.mode == "blended" and (self.datasetId is None or not self.datasetId.strip()):
+            raise ValueError("datasetId is required when terrainSource.mode is 'blended'.")
+        return self
+
+
 class PartitionSolveRequest(BaseModel):
     polygonId: str | None = None
     ring: list[tuple[float, float]]
     payloadKind: PayloadKind
     params: FlightParamsModel
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
     altitudeMode: AltitudeMode = "legacy"
     minClearanceM: float = Field(60, ge=0)
     turnExtendM: float = Field(96, ge=0)
@@ -62,6 +115,8 @@ class RegionPreview(BaseModel):
     convexity: float
     compactness: float
     baseAltitudeAGL: float | None = None
+    exactScore: float | None = None
+    exactSeedBearingDeg: float | None = None
 
 
 class DebugArtifacts(BaseModel):
@@ -81,6 +136,11 @@ class PartitionSolutionPreviewModel(BaseModel):
     meanConvexity: float
     boundaryBreakAlignment: float
     isFirstPracticalSplit: bool
+    rankingSource: PartitionRankingSource | None = None
+    exactScore: float | None = None
+    exactQualityCost: float | None = None
+    exactMissionTimeSec: float | None = None
+    exactMetricKind: ExactMetricKind | None = None
     regions: list[RegionPreview]
     debug: DebugArtifacts | None = None
 
@@ -89,3 +149,132 @@ class PartitionSolveResponse(BaseModel):
     requestId: str
     solutions: list[PartitionSolutionPreviewModel]
     debug: DebugArtifacts | None = None
+
+
+class DsmStatusResponse(BaseModel):
+    datasetId: str | None = None
+    descriptor: DsmSourceDescriptorModel | None = None
+    processingStatus: DsmProcessingStatus | None = None
+    reusedExisting: bool = False
+    terrainTileUrlTemplate: str | None = None
+
+
+class DsmPrepareUploadRequest(BaseModel):
+    sha256: str = Field(..., min_length=64, max_length=64)
+    fileSizeBytes: int = Field(..., ge=0)
+    originalName: str = Field(..., min_length=1)
+    contentType: str | None = None
+
+    @model_validator(mode="after")
+    def validate_sha256(self) -> "DsmPrepareUploadRequest":
+        normalized = self.sha256.strip().lower()
+        if len(normalized) != 64 or any(ch not in "0123456789abcdef" for ch in normalized):
+            raise ValueError("sha256 must be a 64-character lowercase hexadecimal string.")
+        self.sha256 = normalized
+        self.originalName = self.originalName.strip()
+        if not self.originalName:
+            raise ValueError("originalName is required.")
+        if self.contentType is not None:
+            self.contentType = self.contentType.strip() or None
+        return self
+
+
+class DsmUploadTargetModel(BaseModel):
+    url: str
+    method: Literal["PUT"] = "PUT"
+    headers: dict[str, str] = Field(default_factory=dict)
+    expiresAtIso: str
+
+
+class DsmPrepareUploadResponse(BaseModel):
+    status: DsmPrepareUploadStatus
+    dataset: DsmStatusResponse | None = None
+    uploadId: str | None = None
+    uploadTarget: DsmUploadTargetModel | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "DsmPrepareUploadResponse":
+        if self.status == "existing":
+            if self.dataset is None:
+                raise ValueError("dataset is required when status is 'existing'.")
+            self.uploadId = None
+            self.uploadTarget = None
+            return self
+        if self.uploadId is None or self.uploadTarget is None:
+            raise ValueError("uploadId and uploadTarget are required when status is 'upload-required'.")
+        self.dataset = None
+        return self
+
+
+class DsmFinalizeUploadRequest(BaseModel):
+    uploadId: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_upload_id(self) -> "DsmFinalizeUploadRequest":
+        self.uploadId = self.uploadId.strip()
+        if not self.uploadId:
+            raise ValueError("uploadId is required.")
+        return self
+
+
+class TerrainBatchTileRequestModel(BaseModel):
+    z: int = Field(..., ge=0)
+    x: int
+    y: int
+    padTiles: int = Field(0, ge=0, le=2)
+
+
+class TerrainBatchRequestModel(BaseModel):
+    operation: Literal["terrain-batch"] = "terrain-batch"
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
+    tiles: list[TerrainBatchTileRequestModel] = Field(default_factory=list)
+
+
+class TerrainBatchTileResponseModel(BaseModel):
+    z: int
+    x: int
+    y: int
+    size: int = Field(..., gt=0)
+    pngBase64: str
+    demPngBase64: str | None = None
+    demSize: int | None = Field(default=None, gt=0)
+    demPadTiles: int | None = Field(default=None, ge=0)
+
+
+class TerrainBatchResponseModel(BaseModel):
+    operation: Literal["terrain-batch"] = "terrain-batch"
+    tiles: list[TerrainBatchTileResponseModel] = Field(default_factory=list)
+
+
+class ExactOptimizeBearingRequest(BaseModel):
+    polygonId: str | None = None
+    ring: list[tuple[float, float]]
+    payloadKind: PayloadKind
+    params: FlightParamsModel
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
+    altitudeMode: AltitudeMode = "legacy"
+    minClearanceM: float = Field(60, ge=0)
+    turnExtendM: float = Field(96, ge=0)
+    seedBearingDeg: float = 0
+    mode: Literal["local", "global"] = "global"
+    halfWindowDeg: float | None = Field(default=None, gt=0, le=180)
+
+    @model_validator(mode="after")
+    def validate_ring_and_payload(self) -> "ExactOptimizeBearingRequest":
+        if len(self.ring) < 3:
+            raise ValueError("Polygon ring must have at least 3 coordinates.")
+        if self.params.payloadKind != self.payloadKind:
+            self.params.payloadKind = self.payloadKind
+        return self
+
+
+class ExactOptimizeBearingResponse(BaseModel):
+    bearingDeg: float | None = None
+    exactScore: float | None = None
+    qualityCost: float | None = None
+    missionTimeSec: float | None = None
+    normalizedTimeCost: float | None = None
+    metricKind: ExactMetricKind | None = None
+    seedBearingDeg: float
+    lineSpacingM: float | None = None
+    diagnostics: dict[str, float] = Field(default_factory=dict)
