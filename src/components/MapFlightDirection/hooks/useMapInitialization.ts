@@ -54,26 +54,89 @@ export function setTerrainDemSourceOnMap(map: MapboxMap, tileUrlTemplate: string
   map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
 }
 
+export function forceReloadTerrainDemSourceOnMap(map: MapboxMap, tileUrlTemplate: string | null) {
+  try {
+    if (!map.getStyle()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  ensureMapboxDemSource(map);
+  map.setTerrain(null);
+
+  if (map.getSource(BACKEND_DEM_SOURCE_ID)) {
+    map.removeSource(BACKEND_DEM_SOURCE_ID);
+  }
+
+  if (tileUrlTemplate) {
+    map.addSource(BACKEND_DEM_SOURCE_ID, {
+      type: 'raster-dem',
+      tiles: [tileUrlTemplate],
+      tileSize: 512,
+      maxzoom: 14,
+      encoding: 'mapbox',
+    });
+    map.setTerrain({ source: BACKEND_DEM_SOURCE_ID, exaggeration: 1 });
+  } else {
+    map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
+  }
+
+  map.triggerRepaint();
+}
+
+export function reassertTerrainDemSourceOnMap(map: MapboxMap, tileUrlTemplate: string | null) {
+  try {
+    if (!map.getStyle()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  ensureMapboxDemSource(map);
+
+  if (tileUrlTemplate) {
+    if (!map.getSource(BACKEND_DEM_SOURCE_ID)) {
+      return;
+    }
+    map.setTerrain({ source: BACKEND_DEM_SOURCE_ID, exaggeration: 1 });
+    map.triggerRepaint();
+    return;
+  }
+
+  map.setTerrain({ source: MAPBOX_DEM_SOURCE_ID, exaggeration: 1 });
+  map.triggerRepaint();
+}
+
+interface TerrainDemSourceWaitResult {
+  timedOut: boolean;
+  sawRenderableContent: boolean;
+}
+
 export function waitForTerrainDemSourceOnMap(
   map: MapboxMap,
   tileUrlTemplate: string | null,
   timeoutMs = 10000,
-): Promise<void> {
+): Promise<TerrainDemSourceWaitResult> {
   const sourceId = tileUrlTemplate ? BACKEND_DEM_SOURCE_ID : MAPBOX_DEM_SOURCE_ID;
+  const requireRenderableContent = Boolean(tileUrlTemplate);
 
   try {
     if (!map.getStyle() || !map.getSource(sourceId)) {
-      return Promise.resolve();
+      return Promise.resolve({ timedOut: false, sawRenderableContent: !requireRenderableContent });
     }
   } catch {
-    return Promise.resolve();
+    return Promise.resolve({ timedOut: false, sawRenderableContent: !requireRenderableContent });
   }
 
   return new Promise((resolve) => {
     let settled = false;
     let timeoutId: number | null = null;
+    let sawRenderableContent = !requireRenderableContent;
 
-    const finish = () => {
+    const finish = (timedOut: boolean) => {
       if (settled) return;
       settled = true;
       if (timeoutId !== null) {
@@ -81,26 +144,41 @@ export function waitForTerrainDemSourceOnMap(
       }
       map.off('sourcedata', handleSourceData);
       map.off('idle', handleIdle);
-      resolve();
+      resolve({ timedOut, sawRenderableContent });
     };
 
     const isReady = () => {
       try {
-        return !!map.getSource(sourceId) && map.isSourceLoaded(sourceId);
+        const sourceLoaded = !!map.getSource(sourceId) && map.isSourceLoaded(sourceId);
+        return sourceLoaded && (!requireRenderableContent || sawRenderableContent);
       } catch {
         return true;
       }
     };
 
     const handleIdle = () => {
-      if (isReady()) finish();
+      if (isReady()) finish(false);
     };
 
-    const handleSourceData = (event: { sourceId?: string; isSourceLoaded?: boolean }) => {
+    const handleSourceData = (event: {
+      sourceId?: string;
+      isSourceLoaded?: boolean;
+      sourceDataType?: string;
+      coord?: unknown;
+      tile?: unknown;
+    }) => {
       if (event.sourceId !== sourceId) return;
+      if (
+        event.sourceDataType === 'content' ||
+        event.sourceDataType === 'visibility' ||
+        event.coord != null ||
+        event.tile != null
+      ) {
+        sawRenderableContent = true;
+      }
       if (event.isSourceLoaded || isReady()) {
         if (!map.isMoving()) {
-          finish();
+          finish(false);
           return;
         }
         map.once('idle', handleIdle);
@@ -108,7 +186,13 @@ export function waitForTerrainDemSourceOnMap(
     };
 
     timeoutId = window.setTimeout(() => {
-      finish();
+      console.warn('[terrain-source] terrain source readiness timed out', {
+        sourceId,
+        timeoutMs,
+        tileUrlTemplate,
+        sawRenderableContent,
+      });
+      finish(true);
     }, timeoutMs);
 
     map.on('sourcedata', handleSourceData);
@@ -116,7 +200,11 @@ export function waitForTerrainDemSourceOnMap(
 
     if (isReady()) {
       if (!map.isMoving()) {
-        finish();
+        console.debug('[terrain-source] terrain source already ready', {
+          sourceId,
+          tileUrlTemplate,
+        });
+        finish(false);
         return;
       }
       map.once('idle', handleIdle);

@@ -178,16 +178,45 @@ const terrainSource = await import("../terrain/terrainSource.ts");
 async function testSessionRestore() {
   storage.clear();
   fetchCalls.length = 0;
-  storage.setItem("terrain-source-selection-v1", JSON.stringify({ mode: "blended", selectedDatasetId: "dsm-1" }));
+  storage.setItem(
+    "terrain-source-selection-v1",
+    JSON.stringify({ mode: "blended", selectedDatasetId: "dsm-1", rememberedDescriptor: datasets[0] }),
+  );
   terrainSource.__resetTerrainSourceForTests({ clearStorage: false });
 
   await terrainSource.initializeTerrainSourceState();
 
   const state = terrainSource.getTerrainSourceState();
+  assert.equal(state.source.mode, "mapbox");
+  assert.equal(state.descriptor, null);
+  assert.equal(state.rememberedDescriptor?.id, "dsm-1");
+  assert.equal(terrainSource.getTerrainDemUrlTemplateForCurrentSource(), null);
+  assert.equal(fetchCalls.length, 0);
+}
+
+async function testApplyingRememberedDsmLoadsBackendOnlyOnDemand() {
+  storage.clear();
+  fetchCalls.length = 0;
+  storage.setItem(
+    "terrain-source-selection-v1",
+    JSON.stringify({ mode: "blended", selectedDatasetId: "dsm-1", rememberedDescriptor: datasets[0] }),
+  );
+  terrainSource.__resetTerrainSourceForTests({ clearStorage: false });
+
+  await terrainSource.initializeTerrainSourceState();
+  const descriptor = await terrainSource.activateRememberedTerrainSource();
+
+  assert.equal(descriptor.id, "dsm-1");
+  const state = terrainSource.getTerrainSourceState();
   assert.equal(state.source.mode, "blended");
+  assert.equal(state.source.datasetId, "dsm-1");
   assert.equal(state.descriptor?.id, "dsm-1");
+  assert.equal(state.rememberedDescriptor?.id, "dsm-1");
   assert.match(terrainSource.getTerrainDemUrlTemplateForCurrentSource() ?? "", /datasetId=dsm-1/);
-  assert.ok(fetchCalls.some((call) => call.url === `${backendBaseUrl}/v1/dsm/datasets/dsm-1`));
+  assert.deepEqual(
+    fetchCalls.map((call) => [call.method, call.url]),
+    [["GET", `${backendBaseUrl}/v1/dsm/datasets/dsm-1`]],
+  );
 }
 
 async function testUploadingDsmUpdatesTerrainSourceState() {
@@ -203,10 +232,11 @@ async function testUploadingDsmUpdatesTerrainSourceState() {
   assert.equal(state.source.mode, "blended");
   assert.equal(state.source.datasetId, uploadedDescriptor.id);
   assert.equal(state.descriptor?.id, uploadedDescriptor.id);
-  assert.equal(
-    storage.getItem("terrain-source-selection-v1"),
-    JSON.stringify({ mode: "blended", selectedDatasetId: uploadedDescriptor.id }),
-  );
+  assert.deepEqual(JSON.parse(storage.getItem("terrain-source-selection-v1") ?? "null"), {
+    mode: "blended",
+    selectedDatasetId: uploadedDescriptor.id,
+    rememberedDescriptor: uploadedDescriptor,
+  });
   assert.deepEqual(
     fetchCalls
       .filter((call) => call.method !== "GET")
@@ -234,6 +264,7 @@ async function testInvalidRgbaGeoTiffIsRejectedBeforeBackendUpload() {
 }
 
 await testSessionRestore();
+await testApplyingRememberedDsmLoadsBackendOnlyOnDemand();
 await testUploadingDsmUpdatesTerrainSourceState();
 await testInvalidRgbaGeoTiffIsRejectedBeforeBackendUpload();
 

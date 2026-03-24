@@ -4,6 +4,7 @@ import importlib
 import io
 import hashlib
 import json
+import math
 import threading
 from base64 import b64encode
 from contextlib import contextmanager
@@ -17,10 +18,18 @@ from PIL import Image
 import main as main_module
 
 from terrain_splitter import app as app_module
+from terrain_splitter import dsm_store as dsm_store_module
 from terrain_splitter.dsm_store import DsmDatasetStore, S3BackedDsmDatasetStore, create_dsm_dataset_store
+from terrain_splitter.mapbox_tiles import fetch_dem_for_ring
 from terrain_splitter.exact_bridge import LocalExactRuntimeSidecarBridge
 from terrain_splitter.mapbox_tiles import TerrainTile
-from terrain_splitter.schemas import DsmSourceDescriptorModel, PartitionSolutionPreviewModel, TerrainBatchResponseModel, TerrainSourceModel
+from terrain_splitter.schemas import (
+    DsmSourceDescriptorModel,
+    PartitionSolutionPreviewModel,
+    TerrainBatchRequestModel,
+    TerrainBatchResponseModel,
+    TerrainSourceModel,
+)
 
 
 def _descriptor() -> DsmSourceDescriptorModel:
@@ -210,6 +219,42 @@ def _sha256_hex(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _real_dsm_fixture_path() -> Path:
+    return Path(__file__).resolve().parent / "fixtures" / "example_dsm_23_5_cmpx_crop_512.tiff"
+
+
+def _ring_inside_descriptor(descriptor: DsmSourceDescriptorModel, inset_fraction: float = 0.2) -> list[list[float]]:
+    bounds = descriptor.footprintLngLat
+    span_lng = bounds.maxLng - bounds.minLng
+    span_lat = bounds.maxLat - bounds.minLat
+    inset_lng = span_lng * inset_fraction
+    inset_lat = span_lat * inset_fraction
+    min_lng = bounds.minLng + inset_lng
+    max_lng = bounds.maxLng - inset_lng
+    min_lat = bounds.minLat + inset_lat
+    max_lat = bounds.maxLat - inset_lat
+    return [
+        [min_lng, min_lat],
+        [max_lng, min_lat],
+        [max_lng, max_lat],
+        [min_lng, max_lat],
+        [min_lng, min_lat],
+    ]
+
+
+def _tile_ref_for_descriptor(descriptor: DsmSourceDescriptorModel, zoom: int = 14) -> tuple[int, int, int]:
+    bounds = descriptor.footprintLngLat
+    lng = (bounds.minLng + bounds.maxLng) / 2
+    lat = (bounds.minLat + bounds.maxLat) / 2
+    n = 2 ** zoom
+    tile_x = int((lng + 180.0) / 360.0 * n)
+    lat_rad = math.radians(lat)
+    tile_y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    tile_x = max(0, min(n - 1, tile_x))
+    tile_y = max(0, min(n - 1, tile_y))
+    return zoom, tile_x, tile_y
+
+
 def _seed_legacy_dataset_entry(store: DsmDatasetStore, dataset_id: str, *, name: str, file_path: Path) -> None:
     descriptor = _descriptor().model_copy(
         update={
@@ -229,6 +274,38 @@ def _seed_legacy_dataset_entry(store: DsmDatasetStore, dataset_id: str, *, name:
     store._save_index(index)
 
 
+def _seed_legacy_dataset_from_file(
+    store: DsmDatasetStore,
+    file_path: Path,
+    *,
+    original_name: str,
+    source_descriptor: DsmSourceDescriptorModel | None = None,
+) -> DsmSourceDescriptorModel:
+    dataset_id = _sha256_hex(file_path.read_bytes())
+    source_descriptor = source_descriptor or dsm_store_module.derive_descriptor_from_path(file_path, original_name)
+    destination_path = store._dataset_file_path(dataset_id, Path(original_name).suffix or ".tiff")
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    if file_path.resolve() != destination_path.resolve():
+        destination_path.write_bytes(file_path.read_bytes())
+    normalized, valid_mask = dsm_store_module._read_raster_and_valid_mask_from_path(destination_path, source_descriptor)
+    bounds = source_descriptor.sourceBounds
+    pixel_size_x = (bounds.maxX - bounds.minX) / source_descriptor.width
+    pixel_size_y = (bounds.maxY - bounds.minY) / source_descriptor.height
+    levels = dsm_store_module._build_pyramid(normalized, valid_mask, pixel_size_x, pixel_size_y)
+    pyramid_path = store._dataset_pyramid_path(dataset_id)
+    dsm_store_module._serialize_pyramid(levels, pyramid_path)
+    descriptor = store._build_descriptor(dataset_id, original_name, int(destination_path.stat().st_size), source_descriptor, valid_mask)
+    index = store._load_index()
+    index["datasets"][dataset_id] = {
+        "descriptor": descriptor.model_dump(mode="json"),
+        "filePath": str(destination_path),
+        "pyramidPath": str(pyramid_path),
+        "sourceCrs": dsm_store_module._resolve_source_crs(descriptor),
+    }
+    store._save_index(index)
+    return descriptor
+
+
 class _FakePaginator:
     def __init__(self, client: "_FakeS3Client"):
         self.client = client
@@ -243,6 +320,7 @@ class _FakeS3Client:
         self.objects: dict[tuple[str, str], bytes] = {}
         self.deleted: list[tuple[str, str]] = []
         self.presigned_requests: list[dict] = []
+        self.get_object_requests: list[tuple[str, str]] = []
 
     def put_object(self, *, Bucket: str, Key: str, Body, **kwargs):  # noqa: N803
         if isinstance(Body, bytes):
@@ -255,6 +333,7 @@ class _FakeS3Client:
         return {}
 
     def get_object(self, *, Bucket: str, Key: str):  # noqa: N803
+        self.get_object_requests.append((Bucket, Key))
         payload = self.objects.get((Bucket, Key))
         if payload is None:
             raise FileNotFoundError(Key)
@@ -393,6 +472,76 @@ class _TerrainBatchStubServer:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+
+class _LocalTerrainBatchServer:
+    def __init__(self, store, png_payload: bytes):
+        self.store = store
+        self.png_payload = png_payload
+        self.requests: list[dict] = []
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self.base_url: str | None = None
+        self._original_store = None
+        self._original_cache = None
+        self._original_token = None
+
+    def __enter__(self):
+        outer = self
+        self._original_store = app_module.DSM_DATASET_STORE
+        self._original_cache = app_module.TerrainTileCache
+        self._original_token = app_module.mapbox_token
+        app_module.DSM_DATASET_STORE = self.store
+
+        class _FakeTerrainTileCache:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def get_or_fetch(self, *_args, **_kwargs):
+                return outer.png_payload
+
+        app_module.TerrainTileCache = _FakeTerrainTileCache
+        app_module.mapbox_token = lambda: "test-token"
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                if self.path != "/v1/internal/terrain-batch":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                outer.requests.append(payload)
+                response_model = app_module._build_terrain_batch_response(TerrainBatchRequestModel.model_validate(payload))
+                body = response_model.model_dump_json().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):  # noqa: A003
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        host, port = self._server.server_address
+        self.base_url = f"http://{host}:{port}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        if self._original_store is not None:
+            app_module.DSM_DATASET_STORE = self._original_store
+        if self._original_cache is not None:
+            app_module.TerrainTileCache = self._original_cache
+        if self._original_token is not None:
+            app_module.mapbox_token = self._original_token
 
 
 def _exact_request_payload() -> dict:
@@ -586,6 +735,166 @@ def test_local_dataset_store_persists_dataset_across_restart(tmp_path: Path) -> 
     )
     assert changed is True
     assert np.allclose(tile.elevation, 55.0, atol=1e-3)
+
+
+def test_sharded_local_dataset_matches_legacy_pyramid_for_tile_and_rgba_overlay(tmp_path: Path) -> None:
+    raster = np.asarray(
+        [
+            [10.0, 11.0, 12.0, 13.0],
+            [20.0, 21.0, 22.0, 23.0],
+            [30.0, 31.0, 32.0, 33.0],
+            [40.0, 41.0, 42.0, 43.0],
+        ],
+        dtype=np.float32,
+    )
+    payload_path = tmp_path / "parity-local.tiff"
+    payload = _write_geotiff(payload_path, raster)
+
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, reused = sharded_store.ingest_dataset(payload, "parity-local.tiff", _descriptor())
+    assert reused is False
+
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        payload_path,
+        original_name="parity-local.tiff",
+        source_descriptor=dsm_store_module.derive_descriptor_from_path(payload_path, "parity-local.tiff"),
+    )
+
+    sharded_tile = TerrainTile(z=0, x=0, y=0, elevation=np.zeros((4, 4), dtype=np.float32), min_x=0, min_y=0, max_x=4, max_y=4)
+    legacy_tile = TerrainTile(z=0, x=0, y=0, elevation=np.zeros((4, 4), dtype=np.float32), min_x=0, min_y=0, max_x=4, max_y=4)
+
+    assert sharded_store.apply_terrain_source_to_tile(
+        TerrainSourceModel(mode="blended", datasetId=sharded_descriptor.id),
+        sharded_tile,
+    )
+    assert legacy_store.apply_terrain_source_to_tile(
+        TerrainSourceModel(mode="blended", datasetId=legacy_descriptor.id),
+        legacy_tile,
+    )
+    assert np.allclose(sharded_tile.elevation, legacy_tile.elevation, atol=1e-6)
+
+    sharded_rgba = np.zeros((64, 64, 4), dtype=np.uint8)
+    legacy_rgba = np.zeros((64, 64, 4), dtype=np.uint8)
+    zoom = 22
+    tile_x = 2 ** (zoom - 1)
+    tile_y = tile_x - 1
+    assert sharded_store.apply_terrain_source_to_rgba_tile(
+        TerrainSourceModel(mode="blended", datasetId=sharded_descriptor.id),
+        zoom,
+        tile_x,
+        tile_y,
+        sharded_rgba,
+    )
+    assert legacy_store.apply_terrain_source_to_rgba_tile(
+        TerrainSourceModel(mode="blended", datasetId=legacy_descriptor.id),
+        zoom,
+        tile_x,
+        tile_y,
+        legacy_rgba,
+    )
+    assert np.array_equal(sharded_rgba, legacy_rgba)
+
+
+def test_fetch_dem_for_ring_matches_legacy_pyramid_for_sharded_dataset(tmp_path: Path, monkeypatch) -> None:
+    raster = np.arange(64, dtype=np.float32).reshape(8, 8)
+    payload_path = tmp_path / "parity-geographic.tiff"
+    _write_geographic_geotiff(payload_path, raster)
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(payload_path, "parity-geographic.tiff")
+
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, _ = sharded_store.ingest_dataset_file(payload_path, "parity-geographic.tiff", source_descriptor=source_descriptor)
+
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        payload_path,
+        original_name="parity-geographic.tiff",
+        source_descriptor=source_descriptor,
+    )
+
+    png_payload = _encode_terrain_png_bytes(64)
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr(dsm_store_module, "mapbox_token", lambda: "test-token", raising=False)
+    monkeypatch.setattr("terrain_splitter.mapbox_tiles.TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr("terrain_splitter.mapbox_tiles.mapbox_token", lambda: "test-token")
+
+    ring = [(7.01, 46.99), (7.03, 46.99), (7.03, 46.97), (7.01, 46.97), (7.01, 46.99)]
+    sharded_dem, sharded_zoom = fetch_dem_for_ring(
+        ring,
+        tmp_path / "cache-sharded",
+        grid_step_m=40,
+        terrain_source=TerrainSourceModel(mode="blended", datasetId=sharded_descriptor.id),
+        dsm_store=sharded_store,
+    )
+    legacy_dem, legacy_zoom = fetch_dem_for_ring(
+        ring,
+        tmp_path / "cache-legacy",
+        grid_step_m=40,
+        terrain_source=TerrainSourceModel(mode="blended", datasetId=legacy_descriptor.id),
+        dsm_store=legacy_store,
+    )
+
+    assert sharded_zoom == legacy_zoom
+    assert sharded_dem.tiles.keys() == legacy_dem.tiles.keys()
+    for key in sharded_dem.tiles:
+        assert np.allclose(sharded_dem.tiles[key].elevation, legacy_dem.tiles[key].elevation, atol=1e-6)
+
+
+def test_internal_terrain_batch_matches_legacy_pyramid_for_sharded_dataset(tmp_path: Path, monkeypatch) -> None:
+    raster = np.arange(64, dtype=np.float32).reshape(8, 8)
+    payload_path = tmp_path / "parity-batch.tiff"
+    payload = _write_geotiff(payload_path, raster)
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(payload_path, "parity-batch.tiff")
+
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, _ = sharded_store.ingest_dataset_file(payload_path, "parity-batch.tiff", source_descriptor=source_descriptor)
+
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        payload_path,
+        original_name="parity-batch.tiff",
+        source_descriptor=source_descriptor,
+    )
+
+    png_payload = _encode_terrain_png_bytes(64)
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr(app_module, "TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr(app_module, "mapbox_token", lambda: "test-token")
+
+    request = TerrainBatchRequestModel.model_validate(
+        {
+            "terrainSource": {"mode": "blended", "datasetId": sharded_descriptor.id},
+            "tiles": [{"z": 0, "x": 0, "y": 0, "padTiles": 1}],
+        }
+    )
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets-a", store=sharded_store, staging_dir=tmp_path / "staging-a"):
+        sharded_response = app_module._build_terrain_batch_response(request).model_dump(mode="json")
+    request = TerrainBatchRequestModel.model_validate(
+        {
+            "terrainSource": {"mode": "blended", "datasetId": legacy_descriptor.id},
+            "tiles": [{"z": 0, "x": 0, "y": 0, "padTiles": 1}],
+        }
+    )
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets-b", store=legacy_store, staging_dir=tmp_path / "staging-b"):
+        legacy_response = app_module._build_terrain_batch_response(request).model_dump(mode="json")
+    assert sharded_response == legacy_response
 
 
 def test_s3_backed_store_reuses_existing_dataset_across_cold_start(tmp_path: Path) -> None:
@@ -941,7 +1250,9 @@ def test_s3_finalize_upload_ingests_staged_object_and_cleans_up(tmp_path: Path, 
     assert ("bucket", f"stage/uploads/{upload_id}/session.json") not in fake_s3.objects
     remote_keys = {key for (bucket, key) in fake_s3.objects if bucket == "bucket"}
     assert f"stage/datasets/{dataset_id}/descriptor.json" in remote_keys
-    assert f"stage/datasets/{dataset_id}/pyramid.npz" in remote_keys
+    assert f"stage/datasets/{dataset_id}/analysis/manifest.json" in remote_keys
+    assert any(key == f"stage/datasets/{dataset_id}/analysis/level-0.npz" for key in remote_keys)
+    assert f"stage/datasets/{dataset_id}/pyramid.npz" not in remote_keys
 
 
 def test_dsm_upload_and_dataset_detail_endpoint(tmp_path: Path) -> None:
@@ -1000,10 +1311,149 @@ def test_dsm_upload_and_dataset_detail_endpoint_with_s3_store(tmp_path: Path) ->
 
             remote_keys = {key for (bucket, key) in fake_s3.objects if bucket == "bucket"}
             assert any(key.endswith("/descriptor.json") for key in remote_keys)
-            assert any(key.endswith("/pyramid.npz") for key in remote_keys)
+            assert any(key.endswith("/analysis/manifest.json") for key in remote_keys)
+            assert any("/analysis/level-" in key and key.endswith(".npz") for key in remote_keys)
+            assert not any(key.endswith("/pyramid.npz") for key in remote_keys)
     finally:
         app_module.DSM_DIR = original_dir
         app_module.DSM_DATASET_STORE = original_store
+
+
+def test_s3_descriptor_lookup_does_not_download_source_or_analysis_artifacts(tmp_path: Path) -> None:
+    payload = _write_geotiff(tmp_path / "s3-descriptor-only.tiff", np.full((4, 4), 22.0, dtype=np.float32))
+    fake_s3 = _FakeS3Client()
+    upload_store = S3BackedDsmDatasetStore(tmp_path / "cache-upload", bucket="bucket", prefix="stage", client=fake_s3)
+    stored_descriptor, _ = upload_store.ingest_dataset(payload, "s3-descriptor-only.tiff", _descriptor())
+
+    cold_store = S3BackedDsmDatasetStore(tmp_path / "cache-cold", bucket="bucket", prefix="stage", client=fake_s3)
+    fake_s3.get_object_requests.clear()
+    descriptor = cold_store.get_dataset_descriptor(stored_descriptor.id)
+
+    assert descriptor is not None
+    requested_keys = [key for (bucket, key) in fake_s3.get_object_requests if bucket == "bucket"]
+    assert requested_keys == [f"stage/datasets/{stored_descriptor.id}/descriptor.json"]
+
+
+def test_s3_cold_tile_sampling_downloads_only_selected_analysis_level(tmp_path: Path) -> None:
+    raster = np.arange(600 * 600, dtype=np.float32).reshape(600, 600)
+    payload = _write_geotiff(tmp_path / "s3-level-select.tiff", raster)
+    descriptor = dsm_store_module.derive_descriptor_from_payload(payload, "s3-level-select.tiff")
+    fake_s3 = _FakeS3Client()
+    upload_store = S3BackedDsmDatasetStore(tmp_path / "cache-upload", bucket="bucket", prefix="stage", client=fake_s3)
+    stored_descriptor, _ = upload_store.ingest_dataset(payload, "s3-level-select.tiff", descriptor)
+
+    cold_store = S3BackedDsmDatasetStore(tmp_path / "cache-cold", bucket="bucket", prefix="stage", client=fake_s3)
+    fake_s3.get_object_requests.clear()
+    tile = TerrainTile(
+        z=0,
+        x=0,
+        y=0,
+        elevation=np.zeros((64, 64), dtype=np.float32),
+        min_x=0,
+        min_y=0,
+        max_x=600,
+        max_y=600,
+    )
+    changed = cold_store.apply_terrain_source_to_tile(
+        TerrainSourceModel(mode="blended", datasetId=stored_descriptor.id),
+        tile,
+    )
+    assert changed is True
+    requested_keys = [key for (bucket, key) in fake_s3.get_object_requests if bucket == "bucket"]
+    assert f"stage/datasets/{stored_descriptor.id}/{stored_descriptor.id}.tiff" not in requested_keys
+    assert f"stage/datasets/{stored_descriptor.id}/analysis/manifest.json" in requested_keys
+    level_keys = [key for key in requested_keys if f"stage/datasets/{stored_descriptor.id}/analysis/level-" in key]
+    assert len(level_keys) == 1
+
+
+def test_s3_legacy_remote_dataset_still_serves_descriptor_tile_and_terrain_batch(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = _real_dsm_fixture_path()
+    local_legacy_store = DsmDatasetStore(tmp_path / "legacy-local")
+    descriptor = _seed_legacy_dataset_from_file(
+        local_legacy_store,
+        fixture_path,
+        original_name=fixture_path.name,
+    )
+    dataset_id = descriptor.id
+    local_entry = local_legacy_store._load_index()["datasets"][dataset_id]
+    fake_s3 = _FakeS3Client()
+    fake_s3.objects[("bucket", f"stage/datasets/{dataset_id}/descriptor.json")] = json.dumps(
+        local_entry["descriptor"]
+    ).encode("utf-8")
+    fake_s3.objects[("bucket", f"stage/datasets/{dataset_id}/pyramid.npz")] = Path(local_entry["pyramidPath"]).read_bytes()
+    fake_s3.objects[("bucket", f"stage/datasets/{dataset_id}/{dataset_id}{fixture_path.suffix}") ] = Path(local_entry["filePath"]).read_bytes()
+
+    cold_store = S3BackedDsmDatasetStore(tmp_path / "legacy-cold", bucket="bucket", prefix="stage", client=fake_s3)
+    descriptor_out = cold_store.get_dataset_descriptor(dataset_id)
+    assert descriptor_out is not None
+    assert descriptor_out.id == dataset_id
+
+    tile = TerrainTile(
+        z=14,
+        x=4288,
+        y=2870,
+        elevation=np.zeros((64, 64), dtype=np.float32),
+        min_x=descriptor.footprint3857.minX,
+        min_y=descriptor.footprint3857.minY,
+        max_x=descriptor.footprint3857.maxX,
+        max_y=descriptor.footprint3857.maxY,
+    )
+    changed = cold_store.apply_terrain_source_to_tile(
+        TerrainSourceModel(mode="blended", datasetId=dataset_id),
+        tile,
+    )
+    assert changed is True
+    assert np.isfinite(tile.elevation).all()
+
+    png_payload = _encode_terrain_png_bytes(64)
+    with _LocalTerrainBatchServer(cold_store, png_payload):
+        request = TerrainBatchRequestModel.model_validate(
+            {
+                "terrainSource": {"mode": "blended", "datasetId": dataset_id},
+                "tiles": [{"z": 14, "x": 4288, "y": 2870, "padTiles": 1}],
+            }
+        )
+        response = app_module._build_terrain_batch_response(request)
+    assert response.tiles
+    assert response.tiles[0].pngBase64
+    assert response.tiles[0].demPngBase64
+
+
+def test_public_terrain_rgb_route_matches_between_sharded_and_legacy_dsm(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = _real_dsm_fixture_path()
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(fixture_path, fixture_path.name)
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, _ = sharded_store.ingest_dataset_file(fixture_path, fixture_path.name, source_descriptor=source_descriptor)
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        fixture_path,
+        original_name=fixture_path.name,
+        source_descriptor=source_descriptor,
+    )
+    z, x, y = _tile_ref_for_descriptor(source_descriptor, zoom=14)
+    png_payload = _encode_terrain_png_bytes(64)
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr(app_module, "TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr(app_module, "mapbox_token", lambda: "test-token")
+
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets-a", store=sharded_store, staging_dir=tmp_path / "staging-a"):
+        with TestClient(app_module.app) as client:
+            sharded_response = client.get(f"/v1/terrain-rgb/{z}/{x}/{y}.png?mode=blended&datasetId={sharded_descriptor.id}")
+    with _override_app_dsm_state(dsm_dir=tmp_path / "datasets-b", store=legacy_store, staging_dir=tmp_path / "staging-b"):
+        with TestClient(app_module.app) as client:
+            legacy_response = client.get(f"/v1/terrain-rgb/{z}/{x}/{y}.png?mode=blended&datasetId={legacy_descriptor.id}")
+
+    assert sharded_response.status_code == 200
+    assert legacy_response.status_code == 200
+    assert sharded_response.content == legacy_response.content
 
 
 def test_dsm_upload_rejects_ungeoreferenced_tiff(tmp_path: Path) -> None:
@@ -1140,6 +1590,25 @@ def test_internal_terrain_batch_http_route_only_mounts_in_local_mode(monkeypatch
         importlib.reload(app_module)
 
 
+def test_runtime_dir_defaults_to_repo_root_and_migrates_legacy_local_state(tmp_path: Path, monkeypatch) -> None:
+    legacy_base_dir = tmp_path / "backend" / "terrain_splitter"
+    legacy_base_dir.mkdir(parents=True)
+    legacy_dir = legacy_base_dir / ".dsm"
+    legacy_dir.mkdir()
+    legacy_file = legacy_dir / "index.json"
+    legacy_file.write_text('{"datasets":{}}', encoding="utf-8")
+
+    monkeypatch.delenv("TERRAIN_SPLITTER_DSM_DIR", raising=False)
+    monkeypatch.setattr(app_module, "BASE_DIR", legacy_base_dir)
+    monkeypatch.setattr(app_module, "LOCAL_RUNTIME_ROOT", tmp_path / ".terrain-splitter-runtime")
+
+    migrated_dir = app_module._runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
+
+    assert migrated_dir == tmp_path / ".terrain-splitter-runtime" / "dsm"
+    assert (migrated_dir / "index.json").read_text(encoding="utf-8") == '{"datasets":{}}'
+    assert not legacy_dir.exists()
+
+
 def test_lambda_internal_terrain_batch_event_still_works(monkeypatch) -> None:
     captured = {}
 
@@ -1250,6 +1719,67 @@ def test_exact_optimize_endpoint_matches_local_exact_runtime(monkeypatch) -> Non
         finally:
             bridge.close()
             app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_exact_optimize_endpoint_matches_between_sharded_and_legacy_dsm(monkeypatch, tmp_path: Path) -> None:
+    fixture_path = _real_dsm_fixture_path()
+    payload = fixture_path.read_bytes()
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(fixture_path, fixture_path.name)
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, _ = sharded_store.ingest_dataset_file(fixture_path, fixture_path.name, source_descriptor=source_descriptor)
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        fixture_path,
+        original_name=fixture_path.name,
+        source_descriptor=source_descriptor,
+    )
+    ring = _ring_inside_descriptor(source_descriptor, inset_fraction=0.25)
+    request_template = {
+        "polygonId": "fixture-poly",
+        "ring": ring,
+        "payloadKind": "camera",
+        "params": {
+            "payloadKind": "camera",
+            "altitudeAGL": 110,
+            "frontOverlap": 75,
+            "sideOverlap": 70,
+        },
+        "altitudeMode": "legacy",
+        "minClearanceM": 0,
+        "turnExtendM": 0,
+        "seedBearingDeg": 17,
+    }
+    png_payload = _encode_terrain_png_bytes(64)
+    repo_root = Path(__file__).resolve().parents[3]
+
+    def _run(store, descriptor):
+        with _LocalTerrainBatchServer(store, png_payload) as terrain_server:
+            monkeypatch.setenv("TERRAIN_SPLITTER_INTERNAL_BASE_URL", terrain_server.base_url)
+            bridge = LocalExactRuntimeSidecarBridge(repo_root)
+            original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+            app_module.EXACT_RUNTIME_BRIDGE = bridge
+            try:
+                with TestClient(app_module.app) as client:
+                    response = client.post(
+                        "/v1/exact/optimize-bearing",
+                        json={**request_template, "terrainSource": {"mode": "blended", "datasetId": descriptor.id}},
+                    )
+                assert response.status_code == 200
+                assert terrain_server.requests
+                return response.json()
+            finally:
+                bridge.close()
+                app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+    sharded_response = _run(sharded_store, sharded_descriptor)
+    legacy_response = _run(legacy_store, legacy_descriptor)
+    assert sharded_response["bearingDeg"] == legacy_response["bearingDeg"]
+    assert sharded_response["exactScore"] == legacy_response["exactScore"]
+    assert sharded_response["qualityCost"] == legacy_response["qualityCost"]
+    assert sharded_response["missionTimeSec"] == legacy_response["missionTimeSec"]
+    assert sharded_response["metricKind"] == legacy_response["metricKind"]
+    assert sharded_response["seedBearingDeg"] == legacy_response["seedBearingDeg"]
 
 
 def test_partition_solve_returns_backend_exact_reranked_solutions(monkeypatch) -> None:
@@ -1524,3 +2054,290 @@ def test_partition_solve_exact_rerank_matches_local_exact_runtime(monkeypatch) -
             bridge.close()
             app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
             app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_endpoint_matches_between_sharded_and_legacy_dsm(monkeypatch, tmp_path: Path) -> None:
+    fixture_path = _real_dsm_fixture_path()
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(fixture_path, fixture_path.name)
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, _ = sharded_store.ingest_dataset_file(fixture_path, fixture_path.name, source_descriptor=source_descriptor)
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        fixture_path,
+        original_name=fixture_path.name,
+        source_descriptor=source_descriptor,
+    )
+
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.5,
+                "regionCount": 1,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.4,
+                "weightedMeanMismatchDeg": 4.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 90.0, "atomCount": 2, "ring": _ring_inside_descriptor(source_descriptor, 0.2), "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 0.0, "atomCount": 2, "ring": _ring_inside_descriptor(source_descriptor, 0.3), "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+
+    request_json = {
+        "polygonId": "fixture-poly",
+        "ring": _ring_inside_descriptor(source_descriptor, inset_fraction=0.15),
+        "payloadKind": "camera",
+        "params": {
+            "payloadKind": "camera",
+            "altitudeAGL": 110,
+            "frontOverlap": 75,
+            "sideOverlap": 70,
+        },
+        "altitudeMode": "legacy",
+        "minClearanceM": 0,
+        "turnExtendM": 0,
+    }
+    png_payload = _encode_terrain_png_bytes(64)
+    repo_root = Path(__file__).resolve().parents[3]
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr("terrain_splitter.mapbox_tiles.TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr("terrain_splitter.mapbox_tiles.mapbox_token", lambda: "test-token")
+
+    def _run(store, descriptor):
+        with _LocalTerrainBatchServer(store, png_payload) as terrain_server:
+            monkeypatch.setenv("TERRAIN_SPLITTER_INTERNAL_BASE_URL", terrain_server.base_url)
+            bridge = LocalExactRuntimeSidecarBridge(repo_root)
+            original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+            original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+            original_store = app_module.DSM_DATASET_STORE
+            app_module.EXACT_RUNTIME_BRIDGE = bridge
+            app_module.EXACT_POSTPROCESS_TOP_K = 2
+            app_module.DSM_DATASET_STORE = store
+            try:
+                with TestClient(app_module.app) as client:
+                    response = client.post(
+                        "/v1/partition/solve",
+                        json={**request_json, "terrainSource": {"mode": "blended", "datasetId": descriptor.id}},
+                    )
+                assert response.status_code == 200
+                assert terrain_server.requests
+                return response.json()
+            finally:
+                bridge.close()
+                app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+                app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+                app_module.DSM_DATASET_STORE = original_store
+
+    sharded_response = _run(sharded_store, sharded_descriptor)
+    legacy_response = _run(legacy_store, legacy_descriptor)
+    assert [solution["signature"] for solution in sharded_response["solutions"]] == [solution["signature"] for solution in legacy_response["solutions"]]
+    assert sharded_response["solutions"][0]["rankingSource"] == legacy_response["solutions"][0]["rankingSource"]
+    assert sharded_response["solutions"][0]["exactScore"] == legacy_response["solutions"][0]["exactScore"]
+    assert sharded_response["solutions"][1]["exactScore"] == legacy_response["solutions"][1]["exactScore"]
+    assert sharded_response["solutions"][0]["regions"][0]["bearingDeg"] == legacy_response["solutions"][0]["regions"][0]["bearingDeg"]
+    assert sharded_response["solutions"][1]["regions"][0]["bearingDeg"] == legacy_response["solutions"][1]["regions"][0]["bearingDeg"]
+
+
+def test_partition_solve_lidar_endpoint_matches_between_sharded_and_legacy_dsm(monkeypatch, tmp_path: Path) -> None:
+    fixture_path = _real_dsm_fixture_path()
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(fixture_path, fixture_path.name)
+    sharded_store = DsmDatasetStore(tmp_path / "sharded-store")
+    sharded_descriptor, _ = sharded_store.ingest_dataset_file(fixture_path, fixture_path.name, source_descriptor=source_descriptor)
+    legacy_store = DsmDatasetStore(tmp_path / "legacy-store")
+    legacy_descriptor = _seed_legacy_dataset_from_file(
+        legacy_store,
+        fixture_path,
+        original_name=fixture_path.name,
+        source_descriptor=source_descriptor,
+    )
+
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.5,
+                "regionCount": 1,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.4,
+                "weightedMeanMismatchDeg": 4.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 90.0, "atomCount": 2, "ring": _ring_inside_descriptor(source_descriptor, 0.2), "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 0.0, "atomCount": 2, "ring": _ring_inside_descriptor(source_descriptor, 0.3), "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+
+    request_json = {
+        "polygonId": "fixture-poly-lidar",
+        "ring": _ring_inside_descriptor(source_descriptor, inset_fraction=0.15),
+        "payloadKind": "lidar",
+        "params": {
+            "payloadKind": "lidar",
+            "altitudeAGL": 120,
+            "frontOverlap": 0,
+            "sideOverlap": 40,
+            "lidarKey": "WINGTRA_LIDAR_XT32M2X",
+            "speedMps": 16,
+            "mappingFovDeg": 90,
+            "lidarReturnMode": "single",
+            "pointDensityPtsM2": 50,
+            "maxLidarRangeM": 200,
+        },
+        "altitudeMode": "legacy",
+        "minClearanceM": 0,
+        "turnExtendM": 0,
+    }
+    png_payload = _encode_terrain_png_bytes(64)
+    repo_root = Path(__file__).resolve().parents[3]
+
+    class _FakeTerrainTileCache:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_or_fetch(self, *_args, **_kwargs):
+            return png_payload
+
+    monkeypatch.setattr("terrain_splitter.mapbox_tiles.TerrainTileCache", _FakeTerrainTileCache)
+    monkeypatch.setattr("terrain_splitter.mapbox_tiles.mapbox_token", lambda: "test-token")
+
+    def _run(store, descriptor):
+        with _LocalTerrainBatchServer(store, png_payload) as terrain_server:
+            monkeypatch.setenv("TERRAIN_SPLITTER_INTERNAL_BASE_URL", terrain_server.base_url)
+            bridge = LocalExactRuntimeSidecarBridge(repo_root)
+            original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+            original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+            original_store = app_module.DSM_DATASET_STORE
+            app_module.EXACT_RUNTIME_BRIDGE = bridge
+            app_module.EXACT_POSTPROCESS_TOP_K = 2
+            app_module.DSM_DATASET_STORE = store
+            try:
+                with TestClient(app_module.app) as client:
+                    response = client.post(
+                        "/v1/partition/solve",
+                        json={**request_json, "terrainSource": {"mode": "blended", "datasetId": descriptor.id}},
+                    )
+                assert response.status_code == 200
+                assert terrain_server.requests
+                return response.json()
+            finally:
+                bridge.close()
+                app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+                app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+                app_module.DSM_DATASET_STORE = original_store
+
+    sharded_response = _run(sharded_store, sharded_descriptor)
+    legacy_response = _run(legacy_store, legacy_descriptor)
+    assert [solution["signature"] for solution in sharded_response["solutions"]] == [solution["signature"] for solution in legacy_response["solutions"]]
+    assert sharded_response["solutions"][0]["rankingSource"] == legacy_response["solutions"][0]["rankingSource"]
+    assert sharded_response["solutions"][0]["exactScore"] == legacy_response["solutions"][0]["exactScore"]
+    assert sharded_response["solutions"][1]["exactScore"] == legacy_response["solutions"][1]["exactScore"]
+    assert sharded_response["solutions"][0]["regions"][0]["bearingDeg"] == legacy_response["solutions"][0]["regions"][0]["bearingDeg"]
+    assert sharded_response["solutions"][1]["regions"][0]["bearingDeg"] == legacy_response["solutions"][1]["regions"][0]["bearingDeg"]
+
+
+def test_s3_cold_exact_optimize_uses_selected_level_without_source_download(monkeypatch, tmp_path: Path) -> None:
+    fixture_path = _real_dsm_fixture_path()
+    source_descriptor = dsm_store_module.derive_descriptor_from_path(fixture_path, fixture_path.name)
+    fake_s3 = _FakeS3Client()
+    upload_store = S3BackedDsmDatasetStore(tmp_path / "cache-upload", bucket="bucket", prefix="stage", client=fake_s3)
+    stored_descriptor, _ = upload_store.ingest_dataset_file(fixture_path, fixture_path.name, source_descriptor=source_descriptor)
+    cold_store = S3BackedDsmDatasetStore(tmp_path / "cache-cold", bucket="bucket", prefix="stage", client=fake_s3)
+    ring = _ring_inside_descriptor(source_descriptor, inset_fraction=0.25)
+    png_payload = _encode_terrain_png_bytes(64)
+    repo_root = Path(__file__).resolve().parents[3]
+
+    with _LocalTerrainBatchServer(cold_store, png_payload) as terrain_server:
+        monkeypatch.setenv("TERRAIN_SPLITTER_INTERNAL_BASE_URL", terrain_server.base_url)
+        bridge = LocalExactRuntimeSidecarBridge(repo_root)
+        try:
+            fake_s3.get_object_requests.clear()
+            response = bridge.optimize_bearing(
+                {
+                    "polygonId": "fixture-poly",
+                    "ring": ring,
+                    "payloadKind": "camera",
+                    "params": {
+                        "payloadKind": "camera",
+                        "altitudeAGL": 110,
+                        "frontOverlap": 75,
+                        "sideOverlap": 70,
+                    },
+                    "terrainSource": {"mode": "blended", "datasetId": stored_descriptor.id},
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                    "seedBearingDeg": 17,
+                    "mode": "global",
+                    "halfWindowDeg": 90,
+                }
+            )
+            assert response["best"]["bearingDeg"] is not None
+            requested_keys = [key for (bucket, key) in fake_s3.get_object_requests if bucket == "bucket"]
+            assert f"stage/datasets/{stored_descriptor.id}/{stored_descriptor.id}{fixture_path.suffix}" not in requested_keys
+            assert f"stage/datasets/{stored_descriptor.id}/analysis/manifest.json" in requested_keys
+            level_keys = [key for key in requested_keys if f"stage/datasets/{stored_descriptor.id}/analysis/level-" in key]
+            assert len(level_keys) >= 1
+            assert len(set(level_keys)) <= 2
+        finally:
+            bridge.close()

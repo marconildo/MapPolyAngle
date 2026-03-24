@@ -1508,19 +1508,49 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       let preparedSolutions = solutions;
       if (solutions.length > 1) {
         const backendExactPrepared = preparedSolutions.every((solution) => solution.rankingSource === 'backend-exact');
+        console.log(`[terrain-split][${polygonId}] preparing partition options`, {
+          incomingSolutionCount: preparedSolutions.length,
+          incomingRankingSources: preparedSolutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+          backendExactPrepared,
+        });
         if (backendExactPrepared) {
           selectedIndex = 0;
+          console.log(`[terrain-split][${polygonId}] using backend-exact partition ranking`, {
+            selectedIndex,
+            solutionCount: preparedSolutions.length,
+          });
         } else {
           if (isLidarPayload(polygonId, getMergedParamsMap())) {
+            console.log(`[terrain-split][${polygonId}] running frontend exact rerank for lidar partition options`, {
+              solutionCount: preparedSolutions.length,
+            });
             const exact = await chooseBestExactLidarPartitionIndex(polygonId, preparedSolutions);
             selectedIndex = exact.bestIndex;
             preparedSolutions = exact.solutions;
+            console.log(`[terrain-split][${polygonId}] frontend exact rerank finished for lidar partition options`, {
+              selectedIndex,
+              solutionCount: preparedSolutions.length,
+              rankingSources: preparedSolutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+            });
           } else {
+            console.log(`[terrain-split][${polygonId}] running frontend exact rerank for camera partition options`, {
+              solutionCount: preparedSolutions.length,
+            });
             const exact = await chooseBestExactCameraPartitionIndex(polygonId, preparedSolutions);
             selectedIndex = exact.bestIndex;
             preparedSolutions = exact.solutions;
+            console.log(`[terrain-split][${polygonId}] frontend exact rerank finished for camera partition options`, {
+              selectedIndex,
+              solutionCount: preparedSolutions.length,
+              rankingSources: preparedSolutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+            });
           }
         }
+      } else {
+        console.log(`[terrain-split][${polygonId}] partition options do not require exact rerank`, {
+          solutionCount: preparedSolutions.length,
+          rankingSources: preparedSolutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+        });
       }
       splitPerfLog(polygonId, 'terrain partition options prepared for UI', {
         totalMs: Math.round(splitPerfNow() - startedAt),

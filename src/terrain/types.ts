@@ -38,6 +38,7 @@ export interface TerrainSourceSelection {
 export interface TerrainSourceState {
   source: TerrainSourceSelection;
   descriptor: DsmSourceDescriptor | null;
+  rememberedDescriptor: DsmSourceDescriptor | null;
   isLoading: boolean;
   error: string | null;
   backendEnabled: boolean;

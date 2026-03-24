@@ -10,7 +10,7 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
-import { setTerrainDemSourceOnMap, useMapInitialization, waitForTerrainDemSourceOnMap } from './hooks/useMapInitialization';
+import { forceReloadTerrainDemSourceOnMap, reassertTerrainDemSourceOnMap, setTerrainDemSourceOnMap, useMapInitialization, waitForTerrainDemSourceOnMap } from './hooks/useMapInitialization';
 import { usePolygonAnalysis } from './hooks/usePolygonAnalysis';
 import {
   addFlightLinesForPolygon,
@@ -510,11 +510,53 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const applyTerrainSourceToMap = useCallback((map: MapboxMap, tileUrlTemplate: string | null, nextTerrainSource: TerrainSourceSelection) => {
       const applySeq = terrainSourceApplySeqRef.current + 1;
       terrainSourceApplySeqRef.current = applySeq;
-      setTerrainDemSourceOnMap(map, tileUrlTemplate);
-      void waitForTerrainDemSourceOnMap(map, tileUrlTemplate).then(() => {
-        if (terrainSourceApplySeqRef.current !== applySeq) return;
-        onTerrainSourceReadyRef.current?.(nextTerrainSource);
+      console.log('[terrain-source] applying terrain source to map', {
+        applySeq,
+        terrainMode: nextTerrainSource.mode,
+        datasetId: nextTerrainSource.datasetId ?? null,
+        tileUrlTemplate,
       });
+      setTerrainDemSourceOnMap(map, tileUrlTemplate);
+      if (typeof window !== 'undefined') {
+        window.requestAnimationFrame(() => {
+          if (terrainSourceApplySeqRef.current !== applySeq) return;
+          console.debug('[terrain-source] reasserting terrain source after animation frame', {
+            applySeq,
+            terrainMode: nextTerrainSource.mode,
+            datasetId: nextTerrainSource.datasetId ?? null,
+          });
+          reassertTerrainDemSourceOnMap(map, tileUrlTemplate);
+        });
+      }
+      void (async () => {
+        let waitResult = await waitForTerrainDemSourceOnMap(map, tileUrlTemplate, tileUrlTemplate ? 4000 : 10000);
+        if (terrainSourceApplySeqRef.current !== applySeq) return;
+
+        if (tileUrlTemplate && (waitResult.timedOut || !waitResult.sawRenderableContent)) {
+          console.warn('[terrain-source] backend terrain source did not render on first apply; retrying full source bind', {
+            applySeq,
+            terrainMode: nextTerrainSource.mode,
+            datasetId: nextTerrainSource.datasetId ?? null,
+            tileUrlTemplate,
+            timedOut: waitResult.timedOut,
+            sawRenderableContent: waitResult.sawRenderableContent,
+          });
+          forceReloadTerrainDemSourceOnMap(map, tileUrlTemplate);
+          waitResult = await waitForTerrainDemSourceOnMap(map, tileUrlTemplate, 6000);
+          if (terrainSourceApplySeqRef.current !== applySeq) return;
+        }
+
+        reassertTerrainDemSourceOnMap(map, tileUrlTemplate);
+        console.log('[terrain-source] terrain source apply completed', {
+          applySeq,
+          terrainMode: nextTerrainSource.mode,
+          datasetId: nextTerrainSource.datasetId ?? null,
+          tileUrlTemplate,
+          timedOut: waitResult.timedOut,
+          sawRenderableContent: waitResult.sawRenderableContent,
+        });
+        onTerrainSourceReadyRef.current?.(nextTerrainSource);
+      })();
     }, []);
 
     const syncProcessingPerimeterOverlay = useCallback(() => {
@@ -2094,8 +2136,20 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             solutionCount: solutions.length,
             regionCounts: solutions.map((solution) => solution.regionCount),
           });
+          console.log(`[terrain-split][${polygonId}] backend partition solutions received`, {
+            totalMs: Math.round(splitPerfNow() - backendStartedAt),
+            solutionCount: solutions.length,
+            regionCounts: solutions.map((solution) => solution.regionCount),
+            rankingSources: solutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+          });
           backendPartitionSolutionsRef.current.set(polygonId, solutions);
-          return solutions.filter((solution) => solution.regions.length > 1);
+          const practicalSolutions = solutions.filter((solution) => solution.regions.length > 1);
+          console.log(`[terrain-split][${polygonId}] backend partition practical solutions prepared`, {
+            solutionCount: practicalSolutions.length,
+            regionCounts: practicalSolutions.map((solution) => solution.regionCount),
+            rankingSources: practicalSolutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+          });
+          return practicalSolutions;
         } catch (error) {
           splitPerfLog(polygonId, 'backend partition solve failed; falling back to local solver', {
             totalMs: Math.round(splitPerfNow() - startedAt),
@@ -2109,6 +2163,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       splitPerfLog(polygonId, 'local partition solutions computed', {
         totalMs: Math.round(splitPerfNow() - localStartedAt),
         solutionCount: local.length,
+      });
+      console.log(`[terrain-split][${polygonId}] local partition solutions computed`, {
+        totalMs: Math.round(splitPerfNow() - localStartedAt),
+        solutionCount: local.length,
+        regionCounts: local.map((solution) => solution.regionCount),
+        rankingSources: local.map((solution) => solution.rankingSource ?? 'surrogate'),
       });
       backendPartitionSolutionsRef.current.set(polygonId, local);
       return local;
@@ -2553,9 +2613,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       getMap: () => mapRef.current,
       refreshTerrainForAllPolygons,
       setTerrainDemSource: (tileUrlTemplate: string | null) => {
+        const sameTemplate = terrainDemSourceTemplateRef.current === tileUrlTemplate;
         terrainDemSourceTemplateRef.current = tileUrlTemplate;
         if (mapRef.current && mapRef.current.isStyleLoaded()) {
-          setTerrainDemSourceOnMap(mapRef.current, tileUrlTemplate);
+          if (sameTemplate) {
+            console.debug('[terrain-source] lightweight terrain reassert requested', {
+              terrainMode: terrainSourceRef.current.mode,
+              datasetId: terrainSourceRef.current.datasetId ?? null,
+              tileUrlTemplate,
+            });
+            reassertTerrainDemSourceOnMap(mapRef.current, tileUrlTemplate);
+            return;
+          }
+          applyTerrainSourceToMap(mapRef.current, tileUrlTemplate, terrainSourceRef.current);
         }
       },
       getPolygons: (): [number,number][][] => {

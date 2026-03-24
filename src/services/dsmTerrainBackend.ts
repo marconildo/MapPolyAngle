@@ -86,8 +86,8 @@ export function isDsmTerrainBackendEnabled(): boolean {
 
 export function getTerrainTileUrlTemplateForSource(source: TerrainSourceSelection): string | null {
   if (!isDsmTerrainBackendEnabled()) return null;
-  const params = new URLSearchParams({ mode: source.mode });
-  if (source.mode === 'blended' && source.datasetId) params.set('datasetId', source.datasetId);
+  if (source.mode !== 'blended' || !source.datasetId) return null;
+  const params = new URLSearchParams({ mode: source.mode, datasetId: source.datasetId });
   return `${backendBase()}/v1/terrain-rgb/{z}/{x}/{y}.png?${params.toString()}`;
 }
 

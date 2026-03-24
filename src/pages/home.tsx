@@ -10,6 +10,7 @@ import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
 import {
+  activateRememberedTerrainSource,
   getTerrainDemUrlTemplateForCurrentSource,
   getTerrainSourceState,
   initializeTerrainSourceState,
@@ -103,6 +104,35 @@ export default function Home() {
   const openDJIImporterRef = useRef<((mode?: 'dji' | 'wingtra') => void) | null>(null);
   const importOperationIdRef = useRef(0);
   const lastReadyTerrainKeyRef = useRef<string | null>(null);
+
+  const scheduleTerrainSourceReapplyAfterViewportSettle = useCallback((targetKey: string) => {
+    const map = mapRef.current?.getMap?.();
+    if (!map) return;
+
+    const reapply = () => {
+      const currentState = getTerrainSourceState();
+      const currentKey = `${currentState.source.mode}:${currentState.source.datasetId ?? ''}`;
+      if (currentKey !== targetKey) {
+        console.debug('[terrain-source] skipping post-fit terrain reapply because terrain source changed', {
+          targetKey,
+          currentKey,
+        });
+        return;
+      }
+      console.log('[terrain-source] reapplying terrain source after viewport settle', {
+        targetKey,
+      });
+      mapRef.current?.setTerrainDemSource(getTerrainDemUrlTemplateForCurrentSource());
+    };
+
+    window.setTimeout(() => {
+      if (map.isMoving()) {
+        map.once('idle', reapply);
+        return;
+      }
+      reapply();
+    }, 0);
+  }, []);
 
   const cancelPendingCoverageAutoRun = useCallback(() => {
     if (pendingCoverageAutoRunRef.current !== null) {
@@ -215,6 +245,28 @@ export default function Home() {
     clearGSDRef.current?.();
     mapRef.current?.refreshTerrainForAllPolygons?.();
   }, [terrainSourceState.isLoading, terrainSourceState.source.datasetId, terrainSourceState.source.mode]);
+
+  React.useEffect(() => {
+    if (!importUiState || importUiState.kind !== 'terrain' || importUiState.phase !== 'applying') {
+      return;
+    }
+    const { operationId, targetKey } = importUiState;
+    const timeoutId = window.setTimeout(() => {
+      setImportUiState((current) => {
+        if (!current || current.operationId !== operationId || current.phase !== 'applying') {
+          return current;
+        }
+        console.warn('[terrain-source] clearing stuck terrain apply overlay after timeout', {
+          operationId,
+          targetKey,
+          currentTerrainKey: `${terrainSourceState.source.mode}:${terrainSourceState.source.datasetId ?? ''}`,
+          lastReadyTerrainKey: lastReadyTerrainKeyRef.current,
+        });
+        return null;
+      });
+    }, 12000);
+    return () => window.clearTimeout(timeoutId);
+  }, [importUiState, terrainSourceState.source.datasetId, terrainSourceState.source.mode]);
 
   // Memoize handlers to prevent unnecessary re-renders
   const handleAnalysisStart = useCallback((polygonId: string) => {
@@ -363,6 +415,11 @@ export default function Home() {
     fitMapToGeoTiffDescriptor(terrainSourceState.descriptor);
   }, [terrainSourceState.descriptor, fitMapToGeoTiffDescriptor]);
 
+  const zoomToRememberedDsm = useCallback(() => {
+    if (!terrainSourceState.rememberedDescriptor) return;
+    fitMapToGeoTiffDescriptor(terrainSourceState.rememberedDescriptor);
+  }, [fitMapToGeoTiffDescriptor, terrainSourceState.rememberedDescriptor]);
+
   const zoomToImageryOverlay = useCallback(() => {
     if (!imageryOverlayState.descriptor) return;
     fitMapToGeoTiffDescriptor(imageryOverlayState.descriptor);
@@ -394,13 +451,24 @@ export default function Home() {
           ));
         },
       });
-      fitMapToGeoTiffDescriptor(descriptor);
-      setShowTerrainSource(true);
       const targetKey = `blended:${descriptor.id}`;
+      const shouldWaitForApply = priorTerrainKey !== targetKey && lastReadyTerrainKeyRef.current !== targetKey;
       setImportUiState((current) => {
         if (!current || current.operationId !== operationId) return current;
-        if (priorTerrainKey === targetKey || lastReadyTerrainKeyRef.current === targetKey) return null;
-        return { operationId, kind: 'terrain', phase: 'applying', targetKey };
+        return shouldWaitForApply ? { operationId, kind: 'terrain', phase: 'applying', targetKey } : null;
+      });
+      if (shouldWaitForApply) {
+        mapRef.current?.setTerrainDemSource(getTerrainDemUrlTemplateForCurrentSource());
+      }
+      fitMapToGeoTiffDescriptor(descriptor);
+      setShowTerrainSource(true);
+      scheduleTerrainSourceReapplyAfterViewportSettle(targetKey);
+      console.log('[terrain-source] DSM upload/import completed; waiting for map terrain apply', {
+        operationId,
+        descriptorId: descriptor.id,
+        priorTerrainKey,
+        targetKey,
+        lastReadyTerrainKey: lastReadyTerrainKeyRef.current,
       });
     } catch (error) {
       setImportUiState((current) => (current?.operationId === operationId ? null : current));
@@ -413,6 +481,50 @@ export default function Home() {
       if (dsmInputRef.current) dsmInputRef.current.value = '';
     }
   }, [fitMapToGeoTiffDescriptor, terrainSourceState.source.datasetId, terrainSourceState.source.mode]);
+
+  const handleApplyRememberedTerrainSource = useCallback(async () => {
+    const rememberedDescriptor = terrainSourceState.rememberedDescriptor;
+    if (!rememberedDescriptor) return;
+    const operationId = importOperationIdRef.current + 1;
+    importOperationIdRef.current = operationId;
+    const priorTerrainKey = `${terrainSourceState.source.mode}:${terrainSourceState.source.datasetId ?? ''}`;
+    try {
+      const descriptor = await activateRememberedTerrainSource();
+      const targetKey = `blended:${descriptor.id}`;
+      const shouldWaitForApply = priorTerrainKey !== targetKey && lastReadyTerrainKeyRef.current !== targetKey;
+      setImportUiState(
+        shouldWaitForApply
+          ? { operationId, kind: 'terrain', phase: 'applying', targetKey }
+          : null,
+      );
+      if (shouldWaitForApply) {
+        mapRef.current?.setTerrainDemSource(getTerrainDemUrlTemplateForCurrentSource());
+      }
+      fitMapToGeoTiffDescriptor(descriptor);
+      setShowTerrainSource(true);
+      scheduleTerrainSourceReapplyAfterViewportSettle(targetKey);
+      console.log('[terrain-source] remembered DSM activated; waiting for map terrain apply', {
+        operationId,
+        descriptorId: descriptor.id,
+        priorTerrainKey,
+        targetKey,
+        lastReadyTerrainKey: lastReadyTerrainKeyRef.current,
+      });
+    } catch (error) {
+      setImportUiState(null);
+      toast({
+        variant: 'destructive',
+        title: 'Terrain source load failed',
+        description: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }, [
+    fitMapToGeoTiffDescriptor,
+    scheduleTerrainSourceReapplyAfterViewportSettle,
+    terrainSourceState.rememberedDescriptor,
+    terrainSourceState.source.datasetId,
+    terrainSourceState.source.mode,
+  ]);
 
   const handleImageryFileChange = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -490,6 +602,7 @@ export default function Home() {
   const hasPolygonsToAnalyze = hasResults || hasImportedPolygons;
   const panelEnabled = hasPolygonsToAnalyze || importedPoseCount>0; // enable if poses-only
   const terrainDescriptor = terrainSourceState.descriptor;
+  const rememberedTerrainDescriptor = terrainSourceState.rememberedDescriptor;
   const imageryDescriptor = imageryOverlayState.descriptor;
   const terrainAnalysisDisabled = terrainSourceState.isLoading || importUiState !== null;
   const importUiMessage = importUiState?.kind === 'imagery'
@@ -504,6 +617,8 @@ export default function Home() {
       : 'Please wait while the map refreshes with the new elevation.';
   const collapsedTerrainSourceTitle = terrainDescriptor
     ? `Terrain source: ${terrainDescriptor.name.length > 9 ? `${terrainDescriptor.name.slice(0, 9)}...` : terrainDescriptor.name}`
+    : rememberedTerrainDescriptor
+      ? `Terrain source: ${rememberedTerrainDescriptor.name.length > 9 ? `${rememberedTerrainDescriptor.name.slice(0, 9)}...` : rememberedTerrainDescriptor.name}`
     : imageryDescriptor
       ? `Imagery overlay: ${imageryDescriptor.name.length > 9 ? `${imageryDescriptor.name.slice(0, 9)}...` : imageryDescriptor.name}`
       : 'Terrain source';
@@ -713,6 +828,37 @@ export default function Home() {
                           </Button>
                         </div>
                       )}
+                      {!terrainDescriptor && rememberedTerrainDescriptor && (
+                        <div className="space-y-2 text-[11px] text-slate-600">
+                          <div className="font-medium text-slate-800">{rememberedTerrainDescriptor.name}</div>
+                          <div>
+                            {rememberedTerrainDescriptor.width.toLocaleString()} x {rememberedTerrainDescriptor.height.toLocaleString()} px · {formatBytes(rememberedTerrainDescriptor.fileSizeBytes)}
+                          </div>
+                          <div>{rememberedTerrainDescriptor.sourceCrsLabel}</div>
+                          {(rememberedTerrainDescriptor.nativeResolutionXM || rememberedTerrainDescriptor.nativeResolutionYM) && (
+                            <div>
+                              Native resolution: {(rememberedTerrainDescriptor.nativeResolutionXM ?? 0).toFixed(2)} m × {(rememberedTerrainDescriptor.nativeResolutionYM ?? 0).toFixed(2)} m
+                            </div>
+                          )}
+                          <div className="text-[11px] text-slate-500">
+                            Saved locally. Click Load to apply this DSM terrain.
+                          </div>
+                          <div className="flex gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 px-2 text-[11px]"
+                              onClick={handleApplyRememberedTerrainSource}
+                              disabled={terrainAnalysisDisabled || !terrainSourceState.backendEnabled}
+                            >
+                              Load
+                            </Button>
+                            <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToRememberedDsm}>
+                              Zoom
+                            </Button>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     <div className="border-t border-slate-200 pt-3 space-y-2">
@@ -811,6 +957,10 @@ export default function Home() {
             onTerrainSourceReady={(readyTerrainSource) => {
               const readyKey = `${readyTerrainSource.mode}:${readyTerrainSource.datasetId ?? ''}`;
               lastReadyTerrainKeyRef.current = readyKey;
+              console.log('[terrain-source] map reported terrain source ready', {
+                readyKey,
+                currentImportUiState: importUiState,
+              });
               setImportUiState((current) => {
                 if (!current || current.phase !== 'applying') return current;
                 return current.targetKey === readyKey ? null : current;

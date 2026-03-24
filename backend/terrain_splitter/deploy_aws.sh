@@ -41,7 +41,9 @@ else
 fi
 
 echo "Building terrain splitter Lambda with SAM (config env: $CONFIG_ENV)..."
-sam build --config-env "$CONFIG_ENV" --use-container
+# Force a fresh containerized build for the Python Lambda so SAM never reuses
+# stale host-built deps (which can omit or mismatch compiled Linux wheels).
+sam build --config-env "$CONFIG_ENV" --use-container --no-cached
 
 echo "Deploying terrain splitter Lambda (config env: $CONFIG_ENV)..."
 sam deploy --config-env "$CONFIG_ENV" --parameter-overrides "$PARAMETER_OVERRIDES"

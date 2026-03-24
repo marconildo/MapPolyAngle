@@ -6,11 +6,11 @@ import json
 import math
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import tifffile
@@ -31,6 +31,18 @@ class DsmDatasetLevel:
 
 
 @dataclass(slots=True)
+class DsmDatasetLevelRef:
+    level_index: int
+    width: int
+    height: int
+    pixel_size_x: float
+    pixel_size_y: float
+    relative_path: str | None = None
+    file_size_bytes: int | None = None
+    sha256: str | None = None
+
+
+@dataclass(slots=True)
 class DsmDataset:
     descriptor: DsmSourceDescriptorModel
     file_path: Path
@@ -40,7 +52,22 @@ class DsmDataset:
     min_y: float
     max_x: float
     max_y: float
-    levels: list[DsmDatasetLevel]
+    level_refs: list[DsmDatasetLevelRef]
+    level_loader: Callable[[int], DsmDatasetLevel]
+    loaded_levels: dict[int, DsmDatasetLevel] = field(default_factory=dict)
+    _level_lock: RLock = field(default_factory=RLock, repr=False)
+
+    def get_level(self, level_index: int) -> DsmDatasetLevel:
+        cached = self.loaded_levels.get(level_index)
+        if cached is not None:
+            return cached
+        with self._level_lock:
+            cached = self.loaded_levels.get(level_index)
+            if cached is not None:
+                return cached
+            level = self.level_loader(level_index)
+            self.loaded_levels[level_index] = level
+            return level
 
 
 def _utc_now_iso() -> str:
@@ -219,6 +246,94 @@ def _build_pyramid(
             break
 
     return levels
+
+
+def _serialize_level(level: DsmDatasetLevel, path: Path) -> None:
+    payload: dict[str, Any] = {
+        "raster": level.raster.astype(np.float32),
+        "valid": level.valid_mask.astype(np.uint8),
+        "shape": np.asarray([level.height, level.width], dtype=np.int32),
+        "pixel": np.asarray([level.pixel_size_x, level.pixel_size_y], dtype=np.float64),
+    }
+    np.savez_compressed(path, **payload)
+
+
+def _deserialize_level(path: Path) -> DsmDatasetLevel:
+    with np.load(path) as payload:
+        shape = payload["shape"]
+        pixel = payload["pixel"]
+        raster = np.asarray(payload["raster"], dtype=np.float32).reshape(int(shape[0]), int(shape[1]))
+        valid_mask = np.asarray(payload["valid"], dtype=np.uint8).reshape(int(shape[0]), int(shape[1])) > 0
+        return DsmDatasetLevel(
+            raster=raster,
+            valid_mask=valid_mask,
+            width=int(shape[1]),
+            height=int(shape[0]),
+            pixel_size_x=float(pixel[0]),
+            pixel_size_y=float(pixel[1]),
+        )
+
+
+def _analysis_manifest_payload(level_refs: list[DsmDatasetLevelRef]) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "levels": [
+            {
+                "levelIndex": level_ref.level_index,
+                "width": level_ref.width,
+                "height": level_ref.height,
+                "pixelSizeX": level_ref.pixel_size_x,
+                "pixelSizeY": level_ref.pixel_size_y,
+                "path": level_ref.relative_path,
+                "fileSizeBytes": level_ref.file_size_bytes,
+                "sha256": level_ref.sha256,
+            }
+            for level_ref in level_refs
+        ],
+    }
+
+
+def _write_analysis_manifest(path: Path, level_refs: list[DsmDatasetLevelRef]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_analysis_manifest_payload(level_refs), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _read_analysis_manifest(path: Path) -> list[DsmDatasetLevelRef]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    levels = payload.get("levels", [])
+    if not isinstance(levels, list) or not levels:
+        raise ValueError("DSM analysis manifest is invalid.")
+    parsed: list[DsmDatasetLevelRef] = []
+    for raw_level in levels:
+        if not isinstance(raw_level, dict):
+            raise ValueError("DSM analysis manifest contains an invalid level entry.")
+        parsed.append(
+            DsmDatasetLevelRef(
+                level_index=int(raw_level["levelIndex"]),
+                width=int(raw_level["width"]),
+                height=int(raw_level["height"]),
+                pixel_size_x=float(raw_level["pixelSizeX"]),
+                pixel_size_y=float(raw_level["pixelSizeY"]),
+                relative_path=str(raw_level["path"]) if raw_level.get("path") else None,
+                file_size_bytes=int(raw_level["fileSizeBytes"]) if raw_level.get("fileSizeBytes") is not None else None,
+                sha256=str(raw_level["sha256"]) if raw_level.get("sha256") else None,
+            )
+        )
+    parsed.sort(key=lambda level_ref: level_ref.level_index)
+    return parsed
+
+
+def _level_refs_from_preloaded_levels(levels: list[DsmDatasetLevel]) -> list[DsmDatasetLevelRef]:
+    return [
+        DsmDatasetLevelRef(
+            level_index=index,
+            width=level.width,
+            height=level.height,
+            pixel_size_x=level.pixel_size_x,
+            pixel_size_y=level.pixel_size_y,
+        )
+        for index, level in enumerate(levels)
+    ]
 
 
 def _serialize_pyramid(levels: list[DsmDatasetLevel], path: Path) -> None:
@@ -498,6 +613,39 @@ class DsmDatasetStore:
     def _dataset_pyramid_path(self, dataset_id: str) -> Path:
         return self._dataset_dir(dataset_id) / "pyramid.npz"
 
+    def _dataset_analysis_dir(self, dataset_id: str) -> Path:
+        path = self._dataset_dir(dataset_id) / "analysis"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _dataset_analysis_manifest_path(self, dataset_id: str) -> Path:
+        return self._dataset_analysis_dir(dataset_id) / "manifest.json"
+
+    def _dataset_analysis_level_path(self, dataset_id: str, level_index: int) -> Path:
+        return self._dataset_analysis_dir(dataset_id) / f"level-{level_index}.npz"
+
+    def _serialize_analysis_levels(self, dataset_id: str, levels: list[DsmDatasetLevel]) -> Path:
+        analysis_dir = self._dataset_analysis_dir(dataset_id)
+        level_refs: list[DsmDatasetLevelRef] = []
+        for index, level in enumerate(levels):
+            level_path = analysis_dir / f"level-{index}.npz"
+            _serialize_level(level, level_path)
+            level_refs.append(
+                DsmDatasetLevelRef(
+                    level_index=index,
+                    width=level.width,
+                    height=level.height,
+                    pixel_size_x=level.pixel_size_x,
+                    pixel_size_y=level.pixel_size_y,
+                    relative_path=str(level_path.relative_to(self._dataset_dir(dataset_id))),
+                    file_size_bytes=int(level_path.stat().st_size),
+                    sha256=_sha256_for_path(level_path),
+                )
+            )
+        manifest_path = self._dataset_analysis_manifest_path(dataset_id)
+        _write_analysis_manifest(manifest_path, level_refs)
+        return manifest_path
+
     def _evict_dataset_entry(self, index: dict[str, Any], dataset_id: str) -> None:
         datasets = index.get("datasets", {})
         if isinstance(datasets, dict) and dataset_id in datasets:
@@ -512,7 +660,10 @@ class DsmDatasetStore:
         file_path: Path,
         *,
         index: dict[str, Any] | None = None,
+        source_file_validated: bool = False,
     ) -> bool:
+        if source_file_validated:
+            return True
         if not file_path.exists():
             return True
         try:
@@ -581,8 +732,11 @@ class DsmDatasetStore:
             entry = index["datasets"].get(dataset_id)
             if isinstance(entry, dict):
                 existing_file_path = Path(entry.get("filePath", ""))
-                pyramid_path = Path(entry.get("pyramidPath", ""))
-                if existing_file_path.exists() and pyramid_path.exists():
+                analysis_manifest_path = Path(entry.get("analysisManifestPath", "")) if entry.get("analysisManifestPath") else None
+                pyramid_path = Path(entry.get("pyramidPath", "")) if entry.get("pyramidPath") else None
+                has_analysis = analysis_manifest_path is not None and analysis_manifest_path.exists()
+                has_legacy_pyramid = pyramid_path is not None and pyramid_path.exists()
+                if existing_file_path.exists() and (has_analysis or has_legacy_pyramid):
                     descriptor = DsmSourceDescriptorModel.model_validate(entry["descriptor"])
                     return descriptor, True
 
@@ -602,14 +756,14 @@ class DsmDatasetStore:
 
             descriptor = self._build_descriptor(dataset_id, original_name, int(destination_file_path.stat().st_size), source_descriptor, valid_mask)
             levels = _build_pyramid(normalized, valid_mask, pixel_size_x, pixel_size_y)
-            pyramid_path = self._dataset_pyramid_path(dataset_id)
-            _serialize_pyramid(levels, pyramid_path)
+            analysis_manifest_path = self._serialize_analysis_levels(dataset_id, levels)
 
             index["datasets"][dataset_id] = {
                 "descriptor": descriptor.model_dump(mode="json"),
                 "filePath": str(destination_file_path),
-                "pyramidPath": str(pyramid_path),
+                "analysisManifestPath": str(analysis_manifest_path),
                 "sourceCrs": _resolve_source_crs(descriptor),
+                "sourceFileValidated": True,
             }
             self._save_index(index)
             self._dataset_cache.pop(dataset_id, None)
@@ -633,9 +787,59 @@ class DsmDatasetStore:
                 return None
             descriptor = DsmSourceDescriptorModel.model_validate(entry["descriptor"])
             file_path = Path(entry.get("filePath", ""))
-            if not self._validate_existing_source_file(dataset_id, descriptor, file_path, index=index):
+            if not self._validate_existing_source_file(
+                dataset_id,
+                descriptor,
+                file_path,
+                index=index,
+                source_file_validated=bool(entry.get("sourceFileValidated")),
+            ):
                 return None
             return descriptor
+
+    def _build_preloaded_dataset(
+        self,
+        descriptor: DsmSourceDescriptorModel,
+        file_path: Path,
+        source_crs: str,
+        levels: list[DsmDatasetLevel],
+    ) -> DsmDataset:
+        level_refs = _level_refs_from_preloaded_levels(levels)
+        loaded_levels = {level_ref.level_index: levels[level_ref.level_index] for level_ref in level_refs}
+        return DsmDataset(
+            descriptor=descriptor,
+            file_path=file_path,
+            source_crs=source_crs,
+            to_source=Transformer.from_crs("EPSG:3857", source_crs, always_xy=True),
+            min_x=descriptor.sourceBounds.minX,
+            min_y=descriptor.sourceBounds.minY,
+            max_x=descriptor.sourceBounds.maxX,
+            max_y=descriptor.sourceBounds.maxY,
+            level_refs=level_refs,
+            level_loader=lambda level_index: loaded_levels[level_index],
+            loaded_levels=loaded_levels,
+        )
+
+    def _build_lazy_dataset(
+        self,
+        descriptor: DsmSourceDescriptorModel,
+        file_path: Path,
+        source_crs: str,
+        level_refs: list[DsmDatasetLevelRef],
+        level_loader: Callable[[int], DsmDatasetLevel],
+    ) -> DsmDataset:
+        return DsmDataset(
+            descriptor=descriptor,
+            file_path=file_path,
+            source_crs=source_crs,
+            to_source=Transformer.from_crs("EPSG:3857", source_crs, always_xy=True),
+            min_x=descriptor.sourceBounds.minX,
+            min_y=descriptor.sourceBounds.minY,
+            max_x=descriptor.sourceBounds.maxX,
+            max_y=descriptor.sourceBounds.maxY,
+            level_refs=level_refs,
+            level_loader=level_loader,
+        )
 
     def _load_dataset(self, dataset_id: str) -> DsmDataset:
         cached = self._dataset_cache.get(dataset_id)
@@ -650,27 +854,53 @@ class DsmDatasetStore:
 
             descriptor = DsmSourceDescriptorModel.model_validate(entry["descriptor"])
             file_path = Path(entry["filePath"])
-            if not self._validate_existing_source_file(dataset_id, descriptor, file_path, index=index):
+            if not self._validate_existing_source_file(
+                dataset_id,
+                descriptor,
+                file_path,
+                index=index,
+                source_file_validated=bool(entry.get("sourceFileValidated")),
+            ):
                 raise KeyError(f"DSM dataset {dataset_id} is invalid.")
-            pyramid_path = Path(entry["pyramidPath"])
-            if not file_path.exists() or not pyramid_path.exists():
+            source_crs = str(entry.get("sourceCrs") or _resolve_source_crs(descriptor))
+            analysis_manifest_path = Path(entry.get("analysisManifestPath", "")) if entry.get("analysisManifestPath") else None
+            if analysis_manifest_path is not None and analysis_manifest_path.exists():
+                level_refs = _read_analysis_manifest(analysis_manifest_path)
+                dataset_dir = self._dataset_dir(dataset_id)
+
+                def _load_level(level_index: int) -> DsmDatasetLevel:
+                    level_ref = level_refs[level_index]
+                    if not level_ref.relative_path:
+                        raise FileNotFoundError(f"DSM analysis level {level_index} does not have a backing file.")
+                    level_path = dataset_dir / level_ref.relative_path
+                    if not level_path.exists():
+                        raise FileNotFoundError(f"DSM analysis level {level_index} is missing.")
+                    return _deserialize_level(level_path)
+
+                dataset = self._build_lazy_dataset(
+                    descriptor=descriptor,
+                    file_path=file_path,
+                    source_crs=source_crs,
+                    level_refs=level_refs,
+                    level_loader=_load_level,
+                )
+                self._dataset_cache[dataset_id] = dataset
+                return dataset
+
+            pyramid_path = Path(entry.get("pyramidPath", "")) if entry.get("pyramidPath") else None
+            if pyramid_path is None or not pyramid_path.exists():
                 raise FileNotFoundError(f"DSM dataset {dataset_id} is missing required files.")
 
-            dataset = DsmDataset(
+            dataset = self._build_preloaded_dataset(
                 descriptor=descriptor,
                 file_path=file_path,
-                source_crs=str(entry.get("sourceCrs") or _resolve_source_crs(descriptor)),
-                to_source=Transformer.from_crs("EPSG:3857", str(entry.get("sourceCrs") or _resolve_source_crs(descriptor)), always_xy=True),
-                min_x=descriptor.sourceBounds.minX,
-                min_y=descriptor.sourceBounds.minY,
-                max_x=descriptor.sourceBounds.maxX,
-                max_y=descriptor.sourceBounds.maxY,
+                source_crs=source_crs,
                 levels=_deserialize_pyramid(pyramid_path),
             )
             self._dataset_cache[dataset_id] = dataset
             return dataset
 
-    def _select_level(self, dataset: DsmDataset, bounds: tuple[float, float, float, float], size: int) -> DsmDatasetLevel:
+    def _select_level_index(self, dataset: DsmDataset, bounds: tuple[float, float, float, float], size: int) -> int:
         min_x, min_y, max_x, max_y = bounds
         corners3857 = [
             (min_x, max_y),
@@ -681,12 +911,11 @@ class DsmDatasetStore:
         source_corners = [dataset.to_source.transform(x, y) for x, y in corners3857]
         source_span_x = abs(max(corner[0] for corner in source_corners) - min(corner[0] for corner in source_corners))
         source_span_y = abs(max(corner[1] for corner in source_corners) - min(corner[1] for corner in source_corners))
-        base = dataset.levels[0]
+        base = dataset.level_refs[0]
         raw_cols = source_span_x / max(base.pixel_size_x, 1e-9)
         raw_rows = source_span_y / max(base.pixel_size_y, 1e-9)
         oversampling = max(raw_cols / max(size, 1), raw_rows / max(size, 1), 1.0)
-        level_index = min(len(dataset.levels) - 1, max(0, int(math.floor(math.log2(oversampling)))))
-        return dataset.levels[level_index]
+        return min(len(dataset.level_refs) - 1, max(0, int(math.floor(math.log2(oversampling)))))
 
     def _sample_dataset_grid(
         self,
@@ -709,7 +938,9 @@ class DsmDatasetStore:
             empty = np.zeros((size, size), dtype=np.float32)
             return empty, np.zeros((size, size), dtype=bool)
 
-        level = self._select_level(dataset, bounds, size)
+        level_index = self._select_level_index(dataset, bounds, size)
+        level_ref = dataset.level_refs[level_index]
+        level = dataset.get_level(level_index)
         xs = min_x + ((np.arange(size, dtype=np.float64) + 0.5) / size) * (max_x - min_x)
         ys = max_y - ((np.arange(size, dtype=np.float64) + 0.5) / size) * (max_y - min_y)
         grid_x, grid_y = np.meshgrid(xs, ys)
@@ -718,16 +949,16 @@ class DsmDatasetStore:
         src_x = np.asarray(src_x, dtype=np.float64)
         src_y = np.asarray(src_y, dtype=np.float64)
 
-        cols = (src_x - (dataset.min_x + 0.5 * level.pixel_size_x)) / level.pixel_size_x
-        rows = ((dataset.max_y - 0.5 * level.pixel_size_y) - src_y) / level.pixel_size_y
+        cols = (src_x - (dataset.min_x + 0.5 * level_ref.pixel_size_x)) / level_ref.pixel_size_x
+        rows = ((dataset.max_y - 0.5 * level_ref.pixel_size_y) - src_y) / level_ref.pixel_size_y
 
         valid = (
             np.isfinite(cols)
             & np.isfinite(rows)
             & (cols >= 0.0)
             & (rows >= 0.0)
-            & (cols <= max(level.width - 1, 0))
-            & (rows <= max(level.height - 1, 0))
+            & (cols <= max(level_ref.width - 1, 0))
+            & (rows <= max(level_ref.height - 1, 0))
         )
         if not np.any(valid):
             empty = np.zeros((size, size), dtype=np.float32)
@@ -735,10 +966,10 @@ class DsmDatasetStore:
 
         col0 = np.floor(cols).astype(np.int32)
         row0 = np.floor(rows).astype(np.int32)
-        col0 = np.clip(col0, 0, max(level.width - 1, 0))
-        row0 = np.clip(row0, 0, max(level.height - 1, 0))
-        col1 = np.clip(col0 + 1, 0, level.width - 1)
-        row1 = np.clip(row0 + 1, 0, level.height - 1)
+        col0 = np.clip(col0, 0, max(level_ref.width - 1, 0))
+        row0 = np.clip(row0, 0, max(level_ref.height - 1, 0))
+        col1 = np.clip(col0 + 1, 0, level_ref.width - 1)
+        row1 = np.clip(row0 + 1, 0, level_ref.height - 1)
 
         fx = np.clip(cols - col0, 0.0, 1.0).astype(np.float32)
         fy = np.clip(rows - row0, 0.0, 1.0).astype(np.float32)
@@ -862,6 +1093,13 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
     def _pyramid_key(self, dataset_id: str) -> str:
         return f"{self._dataset_key_prefix(dataset_id)}/pyramid.npz"
 
+    def _analysis_manifest_key(self, dataset_id: str) -> str:
+        return f"{self._dataset_key_prefix(dataset_id)}/analysis/manifest.json"
+
+    def _analysis_level_key(self, dataset_id: str, relative_path: str) -> str:
+        normalized_relative_path = relative_path.lstrip("/")
+        return f"{self._dataset_key_prefix(dataset_id)}/{normalized_relative_path}"
+
     def _source_key(self, dataset_id: str, suffix: str) -> str:
         suffix = suffix if suffix.startswith(".") else f".{suffix}"
         return f"{self._dataset_key_prefix(dataset_id)}/{dataset_id}{suffix}"
@@ -873,16 +1111,21 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
         suffix: str,
         *,
         source_crs: str | None = None,
+        source_file_validated: bool = False,
     ) -> dict[str, Any]:
         suffix = suffix or ".tiff"
         file_path = self._dataset_file_path(dataset_id, suffix)
         pyramid_path = self._dataset_pyramid_path(dataset_id)
+        analysis_manifest_path = self._dataset_analysis_manifest_path(dataset_id)
         entry = {
             "descriptor": descriptor.model_dump(mode="json"),
             "filePath": str(file_path),
+            "analysisManifestPath": str(analysis_manifest_path),
             "pyramidPath": str(pyramid_path),
             "sourceCrs": source_crs or _resolve_source_crs(descriptor),
+            "sourceFileValidated": source_file_validated,
             "remoteDescriptorKey": self._descriptor_key(dataset_id),
+            "remoteAnalysisManifestKey": self._analysis_manifest_key(dataset_id),
             "remotePyramidKey": self._pyramid_key(dataset_id),
             "remoteSourceKey": self._source_key(dataset_id, suffix),
         }
@@ -903,10 +1146,15 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
         payload = json.loads(body.decode("utf-8"))
         descriptor = DsmSourceDescriptorModel.model_validate(payload)
         suffix = Path(descriptor.name or "surface.tiff").suffix or ".tiff"
-        self._upsert_local_index_entry(dataset_id, descriptor, suffix)
+        self._upsert_local_index_entry(
+            dataset_id,
+            descriptor,
+            suffix,
+            source_file_validated=bool(payload.get("sourceFileValidated")),
+        )
         return descriptor
 
-    def _ensure_local_dataset_files(self, dataset_id: str) -> None:
+    def _ensure_local_analysis_artifacts(self, dataset_id: str) -> None:
         index = self._load_index()
         entry = index.get("datasets", {}).get(dataset_id)
         if not isinstance(entry, dict):
@@ -918,20 +1166,41 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
         if not isinstance(entry, dict):
             raise KeyError(f"DSM dataset {dataset_id} was not found.")
 
-        file_path = Path(entry["filePath"])
+        analysis_manifest_path = Path(entry["analysisManifestPath"])
         pyramid_path = Path(entry["pyramidPath"])
-        if file_path.exists() and pyramid_path.exists():
+        if analysis_manifest_path.exists() or pyramid_path.exists():
             return
 
         client = self._s3_client()
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        analysis_manifest_path.parent.mkdir(parents=True, exist_ok=True)
         pyramid_path.parent.mkdir(parents=True, exist_ok=True)
-        if not file_path.exists():
-            file_payload = client.get_object(Bucket=self.bucket, Key=entry["remoteSourceKey"])["Body"].read()
-            file_path.write_bytes(file_payload)
+        try:
+            manifest_payload = client.get_object(Bucket=self.bucket, Key=entry["remoteAnalysisManifestKey"])["Body"].read()
+        except Exception as exc:  # noqa: BLE001
+            if _is_not_found_error(exc):
+                manifest_payload = None
+            else:
+                raise
+        if manifest_payload is not None:
+            analysis_manifest_path.write_bytes(manifest_payload)
+            return
         if not pyramid_path.exists():
             pyramid_payload = client.get_object(Bucket=self.bucket, Key=entry["remotePyramidKey"])["Body"].read()
             pyramid_path.write_bytes(pyramid_payload)
+
+    def _ensure_local_level_file(self, dataset_id: str, entry: dict[str, Any], level_ref: DsmDatasetLevelRef) -> Path:
+        if not level_ref.relative_path:
+            raise FileNotFoundError(f"DSM analysis level {level_ref.level_index} does not have a backing file.")
+        level_path = self._dataset_dir(dataset_id) / level_ref.relative_path
+        if level_path.exists():
+            return level_path
+        level_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._s3_client().get_object(
+            Bucket=self.bucket,
+            Key=self._analysis_level_key(dataset_id, level_ref.relative_path),
+        )["Body"].read()
+        level_path.write_bytes(payload)
+        return level_path
 
     def ingest_dataset(
         self,
@@ -978,7 +1247,7 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
             index = self._load_index()
             entry = index["datasets"][digest]
             file_path = Path(entry["filePath"])
-            pyramid_path = Path(entry["pyramidPath"])
+            analysis_manifest_path = Path(entry["analysisManifestPath"])
             client = self._s3_client()
             with file_path.open("rb") as source_handle:
                 client.put_object(
@@ -987,20 +1256,31 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
                     Body=source_handle,
                     ContentType="image/tiff",
                 )
-            with pyramid_path.open("rb") as pyramid_handle:
+            with analysis_manifest_path.open("rb") as manifest_handle:
                 client.put_object(
                     Bucket=self.bucket,
-                    Key=self._pyramid_key(digest),
-                    Body=pyramid_handle,
-                    ContentType="application/octet-stream",
+                    Key=self._analysis_manifest_key(digest),
+                    Body=manifest_handle,
+                    ContentType="application/json",
                 )
+            for level_ref in _read_analysis_manifest(analysis_manifest_path):
+                if not level_ref.relative_path:
+                    continue
+                level_path = self._dataset_dir(digest) / level_ref.relative_path
+                with level_path.open("rb") as level_handle:
+                    client.put_object(
+                        Bucket=self.bucket,
+                        Key=self._analysis_level_key(digest, level_ref.relative_path),
+                        Body=level_handle,
+                        ContentType="application/octet-stream",
+                    )
             client.put_object(
                 Bucket=self.bucket,
                 Key=self._descriptor_key(digest),
                 Body=stored_descriptor.model_dump_json().encode("utf-8"),
                 ContentType="application/json",
             )
-            self._upsert_local_index_entry(digest, stored_descriptor, suffix)
+            self._upsert_local_index_entry(digest, stored_descriptor, suffix, source_file_validated=True)
             return stored_descriptor, False
 
     def list_datasets(self) -> list[DsmSourceDescriptorModel]:
@@ -1020,18 +1300,66 @@ class S3BackedDsmDatasetStore(DsmDatasetStore):
         return sorted(descriptors, key=lambda descriptor: descriptor.loadedAtIso, reverse=True)
 
     def get_dataset_descriptor(self, dataset_id: str) -> DsmSourceDescriptorModel | None:
-        try:
-            self._ensure_local_dataset_files(dataset_id)
-        except KeyError:
-            return None
-        return super().get_dataset_descriptor(dataset_id)
+        with self._lock:
+            index = self._load_index()
+            entry = index.get("datasets", {}).get(dataset_id)
+            if not isinstance(entry, dict):
+                descriptor = self._load_remote_descriptor(dataset_id)
+                if descriptor is None:
+                    return None
+                return descriptor
+            descriptor = DsmSourceDescriptorModel.model_validate(entry["descriptor"])
+            file_path = Path(entry.get("filePath", ""))
+            if file_path.exists() and not self._validate_existing_source_file(
+                dataset_id,
+                descriptor,
+                file_path,
+                index=index,
+                source_file_validated=bool(entry.get("sourceFileValidated")),
+            ):
+                return None
+            return descriptor
 
     def _load_dataset(self, dataset_id: str) -> DsmDataset:
         cached = self._dataset_cache.get(dataset_id)
         if cached is not None:
             return cached
         with self._lock:
-            self._ensure_local_dataset_files(dataset_id)
+            self._ensure_local_analysis_artifacts(dataset_id)
+            index = self._load_index()
+            entry = index.get("datasets", {}).get(dataset_id)
+            if not isinstance(entry, dict):
+                raise KeyError(f"DSM dataset {dataset_id} was not found.")
+
+            descriptor = DsmSourceDescriptorModel.model_validate(entry["descriptor"])
+            file_path = Path(entry["filePath"])
+            if file_path.exists() and not self._validate_existing_source_file(
+                dataset_id,
+                descriptor,
+                file_path,
+                index=index,
+                source_file_validated=bool(entry.get("sourceFileValidated")),
+            ):
+                raise KeyError(f"DSM dataset {dataset_id} is invalid.")
+            source_crs = str(entry.get("sourceCrs") or _resolve_source_crs(descriptor))
+            analysis_manifest_path = Path(entry["analysisManifestPath"])
+            if analysis_manifest_path.exists():
+                level_refs = _read_analysis_manifest(analysis_manifest_path)
+
+                def _load_level(level_index: int) -> DsmDatasetLevel:
+                    level_ref = level_refs[level_index]
+                    return _deserialize_level(self._ensure_local_level_file(dataset_id, entry, level_ref))
+
+                dataset = self._build_lazy_dataset(
+                    descriptor=descriptor,
+                    file_path=file_path,
+                    source_crs=source_crs,
+                    level_refs=level_refs,
+                    level_loader=_load_level,
+                )
+                self._dataset_cache[dataset_id] = dataset
+                return dataset
+
             return super()._load_dataset(dataset_id)
 
 

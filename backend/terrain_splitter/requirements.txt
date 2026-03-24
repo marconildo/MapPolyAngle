@@ -1,12 +1,13 @@
 fastapi==0.115.14
 mangum==0.19.0
-# Lambda/SAM build image compatibility: pin to wheel-backed versions that
-# install cleanly on the Amazon Linux Python 3.11 container.
+# Lambda/SAM build image compatibility: pin to older wheel-backed versions that
+# install cleanly on the Amazon Linux Python 3.11 container and keep the
+# unzipped Lambda artifact under AWS' 250 MB limit.
 numpy==1.26.4
 pillow==10.4.0
 shapely==2.1.2
 httpx==0.28.1
-pyproj==3.7.2
+pyproj==3.5.0
 tifffile==2025.6.11
-imagecodecs==2026.1.1
+imagecodecs==2023.7.10
 python-multipart==0.0.20

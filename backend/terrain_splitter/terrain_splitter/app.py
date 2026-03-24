@@ -4,6 +4,7 @@ import io
 import base64
 import logging
 import os
+import shutil
 import time
 import uuid
 from urllib.parse import urlencode
@@ -48,12 +49,68 @@ from .schemas import (
 from .solver_graphcut import solve_partition_hierarchy
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = BASE_DIR.parent.parent
+LOCAL_RUNTIME_ROOT = Path(
+    os.environ.get("TERRAIN_SPLITTER_LOCAL_RUNTIME_ROOT") or (REPO_ROOT / ".terrain-splitter-runtime")
+)
+
+
+def _local_runtime_dir_name(local_dir_name: str) -> str:
+    return local_dir_name[1:] if local_dir_name.startswith(".") else local_dir_name
+
+
+def _migrate_legacy_runtime_dir(local_dir_name: str, destination: Path) -> None:
+    legacy_path = BASE_DIR / local_dir_name
+    if not legacy_path.exists() or destination.exists():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(legacy_path), str(destination))
+
+
+def _flatten_nested_legacy_runtime_dir(local_dir_name: str, destination: Path) -> None:
+    nested_legacy_path = destination / local_dir_name
+    if not nested_legacy_path.exists() or not nested_legacy_path.is_dir():
+        return
+    for child in nested_legacy_path.iterdir():
+        target = destination / child.name
+        if child.is_dir() and target.exists() and target.is_dir():
+            _merge_directory_contents(child, target)
+            continue
+        if target.exists():
+            continue
+        shutil.move(str(child), str(target))
+    try:
+        nested_legacy_path.rmdir()
+    except OSError:
+        pass
+
+
+def _merge_directory_contents(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        target = destination / child.name
+        if child.is_dir():
+            if target.exists() and target.is_dir():
+                _merge_directory_contents(child, target)
+            elif not target.exists():
+                shutil.move(str(child), str(target))
+        elif not target.exists():
+            shutil.move(str(child), str(target))
+    try:
+        source.rmdir()
+    except OSError:
+        pass
 
 
 def _runtime_dir(env_name: str, local_dir_name: str) -> Path:
-    configured = (Path(path) for path in [os.environ.get(env_name)] if path)
-    path = next(configured, BASE_DIR / local_dir_name)
+    configured = os.environ.get(env_name)
+    if configured:
+        path = Path(configured)
+    else:
+        path = LOCAL_RUNTIME_ROOT / _local_runtime_dir_name(local_dir_name)
+        _migrate_legacy_runtime_dir(local_dir_name, path)
     path.mkdir(parents=True, exist_ok=True)
+    _flatten_nested_legacy_runtime_dir(local_dir_name, path)
     return path
 
 
@@ -359,6 +416,16 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         request.tradeoff,
         request.debug,
     )
+    logger.warning(
+        "[terrain-split-autosplit][%s] start polygonId=%s payload=%s terrainMode=%s datasetId=%s exactBridge=%s exactTopK=%d",
+        request_id,
+        request.polygonId or "<none>",
+        request.payloadKind,
+        request.terrainSource.mode,
+        request.terrainSource.datasetId or "<none>",
+        EXACT_RUNTIME_BRIDGE.__class__.__name__ if EXACT_RUNTIME_BRIDGE is not None else "<disabled>",
+        EXACT_POSTPROCESS_TOP_K,
+    )
     try:
         stage_started_at = time.perf_counter()
         dem, zoom = fetch_dem_for_ring(
@@ -395,6 +462,13 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         if EXACT_RUNTIME_BRIDGE is not None and len(solutions) > 1:
             try:
                 exact_candidates = solutions[: min(EXACT_POSTPROCESS_TOP_K, len(solutions))]
+                logger.warning(
+                    "[terrain-split-autosplit][%s] exact-rerank start polygonId=%s surrogateSolutions=%d candidateSolutions=%d",
+                    request_id,
+                    request.polygonId or "<none>",
+                    len(solutions),
+                    len(exact_candidates),
+                )
                 # Exact-enabled responses intentionally replace the surrogate tail with the
                 # exact-reranked shortlist instead of appending discarded surrogate options.
                 exact_response = EXACT_RUNTIME_BRIDGE.rerank_solutions(
@@ -417,12 +491,40 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                 ]
                 if exact_solutions:
                     solutions = exact_solutions
+                logger.warning(
+                    "[terrain-split-autosplit][%s] exact-rerank finish polygonId=%s returnedSolutions=%d replaced=%s rankingSources=%s",
+                    request_id,
+                    request.polygonId or "<none>",
+                    len(exact_solutions),
+                    bool(exact_solutions),
+                    [solution.rankingSource for solution in exact_solutions],
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "[terrain-split-backend][%s] exact partition rerank failed; using surrogate ordering error=%s",
                     request_id,
                     exc,
                 )
+                logger.warning(
+                    "[terrain-split-autosplit][%s] exact-rerank failed polygonId=%s error=%s",
+                    request_id,
+                    request.polygonId or "<none>",
+                    exc,
+                )
+        elif EXACT_RUNTIME_BRIDGE is None:
+            logger.warning(
+                "[terrain-split-autosplit][%s] exact-rerank skipped polygonId=%s reason=no-exact-bridge surrogateSolutions=%d",
+                request_id,
+                request.polygonId or "<none>",
+                len(solutions),
+            )
+        else:
+            logger.warning(
+                "[terrain-split-autosplit][%s] exact-rerank skipped polygonId=%s reason=not-enough-solutions surrogateSolutions=%d",
+                request_id,
+                request.polygonId or "<none>",
+                len(solutions),
+            )
         exact_postprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         debug_payload = None
@@ -485,6 +587,18 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
             solve_ms,
             exact_postprocess_ms,
             debug_artifacts_ms,
+            total_ms,
+        )
+        logger.warning(
+            "[terrain-split-autosplit][%s] finish polygonId=%s payload=%s solutions=%d rankingSources=%s fetchDemMs=%.1f solveMs=%.1f exactPostprocessMs=%.1f totalMs=%.1f",
+            request_id,
+            request.polygonId or "<none>",
+            request.payloadKind,
+            len(solutions),
+            [solution.rankingSource for solution in solutions],
+            fetch_dem_ms,
+            solve_ms,
+            exact_postprocess_ms,
             total_ms,
         )
 

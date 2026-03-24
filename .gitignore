@@ -19,6 +19,7 @@ backend/terrain_splitter/.dsm-upload-staging/
 backend/terrain_splitter/.aws-sam/
 backend/terrain_splitter/exact-runtime/
 .aws-sam/
+/.terrain-splitter-runtime/
 
 # Local planning / status notes
 /PLAN.md

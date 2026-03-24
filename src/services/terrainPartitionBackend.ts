@@ -32,15 +32,37 @@ export async function solveTerrainPartitionWithBackend(
   if (!isTerrainPartitionBackendEnabled()) {
     throw new Error('Terrain partition backend is not configured.');
   }
-  const response = await fetch(`${backendBaseUrl!.replace(/\/$/, '')}/v1/partition/solve`, {
+  const endpoint = `${backendBaseUrl!.replace(/\/$/, '')}/v1/partition/solve`;
+  console.log('[terrain-split][backend-request] POST /v1/partition/solve', {
+    polygonId: request.polygonId ?? null,
+    payloadKind: request.payloadKind,
+    terrainMode: request.terrainSource.mode,
+    datasetId: request.terrainSource.datasetId ?? null,
+    ringPoints: request.ring.length,
+    endpoint,
+  });
+  const response = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
   });
   if (!response.ok) {
     const text = await response.text();
+    console.warn('[terrain-split][backend-request] POST /v1/partition/solve failed', {
+      polygonId: request.polygonId ?? null,
+      status: response.status,
+      detail: text || null,
+    });
     throw new Error(text || `Backend request failed with status ${response.status}`);
   }
   const payload = await response.json() as TerrainPartitionBackendResponse;
-  return Array.isArray(payload.solutions) ? payload.solutions : [];
+  const solutions = Array.isArray(payload.solutions) ? payload.solutions : [];
+  console.log('[terrain-split][backend-request] POST /v1/partition/solve succeeded', {
+    polygonId: request.polygonId ?? null,
+    requestId: payload.requestId,
+    solutionCount: solutions.length,
+    regionCounts: solutions.map((solution) => solution.regionCount),
+    rankingSources: solutions.map((solution) => solution.rankingSource ?? 'surrogate'),
+  });
+  return solutions;
 }

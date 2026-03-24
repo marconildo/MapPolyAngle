@@ -15,9 +15,34 @@ const STORAGE_KEY = 'terrain-source-selection-v1';
 interface PersistedTerrainSelection {
   mode: TerrainSourceMode;
   selectedDatasetId: string | null;
+  rememberedDescriptor: DsmSourceDescriptor | null;
 }
 
 let terrainSourceState: TerrainSourceState = initialTerrainSourceState();
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function readPersistedDescriptor(raw: unknown): DsmSourceDescriptor | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const candidate = raw as Partial<DsmSourceDescriptor>;
+  if (typeof candidate.id !== 'string' || candidate.id.trim().length === 0) return null;
+  if (typeof candidate.name !== 'string' || candidate.name.trim().length === 0) return null;
+  if (!isFiniteNumber(candidate.fileSizeBytes) || !isFiniteNumber(candidate.width) || !isFiniteNumber(candidate.height)) return null;
+  if (typeof candidate.sourceCrsLabel !== 'string') return null;
+  if (!candidate.footprintLngLat || typeof candidate.footprintLngLat !== 'object') return null;
+  if (
+    !isFiniteNumber(candidate.footprintLngLat.minLng) ||
+    !isFiniteNumber(candidate.footprintLngLat.minLat) ||
+    !isFiniteNumber(candidate.footprintLngLat.maxLng) ||
+    !isFiniteNumber(candidate.footprintLngLat.maxLat)
+  ) {
+    return null;
+  }
+  if (!Array.isArray(candidate.footprintRingLngLat)) return null;
+  return candidate as DsmSourceDescriptor;
+}
 
 function readPersistedTerrainSelection(): PersistedTerrainSelection | null {
   if (typeof window === 'undefined') return null;
@@ -31,6 +56,7 @@ function readPersistedTerrainSelection(): PersistedTerrainSelection | null {
         typeof parsed.selectedDatasetId === 'string' && parsed.selectedDatasetId.trim().length > 0
           ? parsed.selectedDatasetId
           : null,
+      rememberedDescriptor: readPersistedDescriptor((parsed as { rememberedDescriptor?: unknown }).rememberedDescriptor),
     };
   } catch {
     return null;
@@ -40,9 +66,11 @@ function readPersistedTerrainSelection(): PersistedTerrainSelection | null {
 function persistTerrainSelection() {
   if (typeof window === 'undefined') return;
   try {
+    const rememberedDescriptor = terrainSourceState.descriptor ?? terrainSourceState.rememberedDescriptor;
     const payload: PersistedTerrainSelection = {
       mode: terrainSourceState.source.mode,
-      selectedDatasetId: terrainSourceState.descriptor?.id ?? null,
+      selectedDatasetId: rememberedDescriptor?.id ?? null,
+      rememberedDescriptor,
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   } catch {
@@ -65,6 +93,7 @@ function initialTerrainSourceState(): TerrainSourceState {
   return {
     source: { mode: 'mapbox', datasetId: null },
     descriptor: null,
+    rememberedDescriptor: null,
     isLoading: false,
     error: null,
     backendEnabled: isDsmTerrainBackendEnabled(),
@@ -115,6 +144,7 @@ export function clearTerrainSourceSelection() {
     ...terrainSourceState,
     source: { mode: 'mapbox', datasetId: null },
     descriptor: null,
+    rememberedDescriptor: null,
     isLoading: false,
     error: null,
   };
@@ -135,53 +165,16 @@ export function __resetTerrainSourceForTests(options?: { clearStorage?: boolean 
 }
 
 export async function initializeTerrainSourceState(): Promise<void> {
-  if (!isDsmTerrainBackendEnabled()) return;
   const persisted = readPersistedTerrainSelection();
-  if (persisted?.mode !== 'blended' || !persisted.selectedDatasetId) {
-    terrainSourceState = {
-      ...terrainSourceState,
-      source: { mode: 'mapbox', datasetId: null },
-      descriptor: null,
-      isLoading: false,
-      error: null,
-    };
-    emit({ persist: false });
-    return;
-  }
-
   terrainSourceState = {
     ...terrainSourceState,
-    isLoading: true,
+    source: { mode: 'mapbox', datasetId: null },
+    descriptor: null,
+    rememberedDescriptor: persisted?.rememberedDescriptor ?? null,
+    isLoading: false,
     error: null,
   };
   emit({ persist: false });
-
-  try {
-    const fetched = await findDsmDatasetFromTerrainBackend(persisted.selectedDatasetId);
-    if (!fetched?.descriptor) {
-      clearTerrainSourceSelection();
-      return;
-    }
-    terrainSourceState = {
-      ...terrainSourceState,
-      descriptor: fetched.descriptor,
-      source: {
-        mode: 'blended',
-        datasetId: fetched.descriptor.id,
-      },
-      isLoading: false,
-      error: null,
-    };
-    emit();
-  } catch (error) {
-    terrainSourceState = {
-      ...terrainSourceState,
-      isLoading: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-    emit({ persist: false });
-    throw error;
-  }
 }
 
 export async function selectTerrainSourceDataset(datasetId: string, mode: TerrainSourceMode = 'blended'): Promise<DsmSourceDescriptor> {
@@ -208,6 +201,7 @@ export async function selectTerrainSourceDataset(datasetId: string, mode: Terrai
     terrainSourceState = {
       ...terrainSourceState,
       descriptor: fetched,
+      rememberedDescriptor: fetched,
       source: {
         mode: mode === 'blended' ? 'blended' : 'mapbox',
         datasetId: mode === 'blended' ? fetched.id : null,
@@ -224,6 +218,59 @@ export async function selectTerrainSourceDataset(datasetId: string, mode: Terrai
       error: error instanceof Error ? error.message : String(error),
     };
     emit();
+    throw error;
+  }
+}
+
+export async function activateRememberedTerrainSource(): Promise<DsmSourceDescriptor> {
+  const rememberedDescriptor = terrainSourceState.rememberedDescriptor;
+  if (!rememberedDescriptor) {
+    throw new Error('There is no saved DSM to load.');
+  }
+  if (!isDsmTerrainBackendEnabled()) {
+    throw new Error('Loading a saved DSM requires a configured terrain backend.');
+  }
+
+  terrainSourceState = {
+    ...terrainSourceState,
+    isLoading: true,
+    error: null,
+  };
+  emit();
+
+  try {
+    const fetched = await findDsmDatasetFromTerrainBackend(rememberedDescriptor.id);
+    if (!fetched?.descriptor) {
+      terrainSourceState = {
+        ...terrainSourceState,
+        source: { mode: 'mapbox', datasetId: null },
+        descriptor: null,
+        rememberedDescriptor: null,
+        isLoading: false,
+        error: `Saved DSM ${rememberedDescriptor.name} is no longer available.`,
+      };
+      emit();
+      throw new Error(`Saved DSM ${rememberedDescriptor.name} is no longer available.`);
+    }
+    terrainSourceState = {
+      ...terrainSourceState,
+      source: { mode: 'blended', datasetId: fetched.descriptor.id },
+      descriptor: fetched.descriptor,
+      rememberedDescriptor: fetched.descriptor,
+      isLoading: false,
+      error: null,
+    };
+    emit();
+    return fetched.descriptor;
+  } catch (error) {
+    if (terrainSourceState.isLoading) {
+      terrainSourceState = {
+        ...terrainSourceState,
+        isLoading: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      emit();
+    }
     throw error;
   }
 }
@@ -254,6 +301,7 @@ export async function loadTerrainSourceFromFile(
           ...terrainSourceState,
           source: { mode: 'blended', datasetId: uploaded.datasetId },
           descriptor: uploaded.descriptor,
+          rememberedDescriptor: uploaded.descriptor,
           isLoading: false,
           error: null,
         };
@@ -270,6 +318,7 @@ export async function loadTerrainSourceFromFile(
       ...terrainSourceState,
       source: { mode: 'blended', datasetId: localDescriptor.id },
       descriptor: localDescriptor,
+      rememberedDescriptor: localDescriptor,
       isLoading: false,
       error: null,
     };
