@@ -1656,15 +1656,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
   React.useEffect(() => {
     if (combinedPolygons.length === 0) {
-      if (!isControlled && activeSelectedId) setInternalSelectedId(null);
+      if (activeSelectedId) setSelection(null);
       return;
     }
-    if (activeSelectedId && !combinedPolygons.some(item => item.polygonId === activeSelectedId)) {
-      if (!isControlled) setInternalSelectedId(combinedPolygons[0].polygonId);
-    } else if (!activeSelectedId && !isControlled) {
-      setInternalSelectedId(combinedPolygons[0].polygonId);
+
+    const hasActiveSelection = !!activeSelectedId && combinedPolygons.some((item) => item.polygonId === activeSelectedId);
+    if (hasActiveSelection) return;
+
+    if (combinedPolygons.length === 1) {
+      setSelection(combinedPolygons[0].polygonId);
+      return;
     }
-  }, [combinedPolygons, activeSelectedId, isControlled]);
+
+    if (activeSelectedId) {
+      setSelection(null);
+    }
+  }, [combinedPolygons, activeSelectedId, setSelection]);
 
   React.useEffect(() => {
     if (!activeSelectedId) return;
