@@ -618,7 +618,7 @@ export default function Home() {
     ? `Terrain source: ${terrainDescriptor.name.length > 9 ? `${terrainDescriptor.name.slice(0, 9)}...` : terrainDescriptor.name}`
     : rememberedTerrainDescriptor
       ? `Terrain source: ${rememberedTerrainDescriptor.name.length > 9 ? `${rememberedTerrainDescriptor.name.slice(0, 9)}...` : rememberedTerrainDescriptor.name}`
-    : imageryDescriptor
+      : imageryOverlayImportEnabled && imageryDescriptor
       ? `Imagery overlay: ${imageryDescriptor.name.length > 9 ? `${imageryDescriptor.name.slice(0, 9)}...` : imageryDescriptor.name}`
       : 'Terrain source';
 
@@ -860,40 +860,42 @@ export default function Home() {
                       )}
                     </div>
 
-                    <div className="border-t border-slate-200 pt-3 space-y-2">
-                      <div className="text-[11px] font-medium text-slate-700">Imagery overlay</div>
-                      {imageryDescriptor ? (
-                        <div className="space-y-1 text-[11px] text-slate-600">
-                          <div className="font-medium text-slate-800">{imageryDescriptor.name}</div>
-                          <div>
-                            {imageryDescriptor.width.toLocaleString()} x {imageryDescriptor.height.toLocaleString()} px · {formatBytes(imageryDescriptor.fileSizeBytes)}
+                    {imageryOverlayImportEnabled ? (
+                      <div className="border-t border-slate-200 pt-3 space-y-2">
+                        <div className="text-[11px] font-medium text-slate-700">Imagery overlay</div>
+                        {imageryDescriptor ? (
+                          <div className="space-y-1 text-[11px] text-slate-600">
+                            <div className="font-medium text-slate-800">{imageryDescriptor.name}</div>
+                            <div>
+                              {imageryDescriptor.width.toLocaleString()} x {imageryDescriptor.height.toLocaleString()} px · {formatBytes(imageryDescriptor.fileSizeBytes)}
+                            </div>
+                            <div>{imageryDescriptor.sourceCrsLabel}</div>
                           </div>
-                          <div>{imageryDescriptor.sourceCrsLabel}</div>
-                        </div>
-                      ) : (
-                        <div className="text-[11px] text-slate-500">
-                          Import a georeferenced GeoTIFF ortho to view it as an imagery overlay.
-                        </div>
-                      )}
-                      {imageryOverlayState.error && (
-                        <div className="mt-1 text-[11px] text-red-600">{imageryOverlayState.error}</div>
-                      )}
-                      {imageryDescriptor && (
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToImageryOverlay}>
-                            Zoom
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-7 px-2 text-[11px]"
-                            onClick={() => clearActiveImageryOverlay()}
-                          >
-                            Clear
-                          </Button>
-                        </div>
-                      )}
-                    </div>
+                        ) : (
+                          <div className="text-[11px] text-slate-500">
+                            Import a georeferenced GeoTIFF ortho to view it as an imagery overlay.
+                          </div>
+                        )}
+                        {imageryOverlayState.error && (
+                          <div className="mt-1 text-[11px] text-red-600">{imageryOverlayState.error}</div>
+                        )}
+                        {imageryDescriptor && (
+                          <div className="flex gap-2">
+                            <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToImageryOverlay}>
+                              Zoom
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 px-2 text-[11px]"
+                              onClick={() => clearActiveImageryOverlay()}
+                            >
+                              Clear
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
                   </div>
                 )}
               </div>

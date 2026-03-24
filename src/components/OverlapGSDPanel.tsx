@@ -2473,7 +2473,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
   const formatMetricValue = useCallback((metricKind: MetricKind, value: number, precision = 1) => {
     if (metricKind === 'density') return `${value.toFixed(precision)} pts/m²`;
-    return `${(value * 100).toFixed(precision)} cm`;
+    return `${(value * 100).toFixed(precision)} cm/px`;
   }, []);
 
   const metricSummaryValues = useCallback((stats: GSDStats) => {
@@ -2513,7 +2513,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       min: 'P5 GSD',
       mean: 'Mean GSD',
       max: 'P95 GSD',
-      xAxis: 'GSD (cm)',
+      xAxis: 'GSD (cm/px)',
       tooltipLabel: 'GSD',
     };
   }, []);
@@ -2905,9 +2905,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
               </div>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={convertHistogramToArea(stats, metricKind).map(bin => ({ metric: metricKind === 'density' ? (bin.isZeroBucket ? '0' : bin.bin.toFixed(0)) : (bin.bin * 100).toFixed(1), metricLabel: metricKind === 'density' ? (bin.isZeroBucket ? 'Holes / 0 pts/m²' : `${bin.bin.toFixed(0)} pts/m²`) : `${(bin.bin * 100).toFixed(1)} cm`, areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2, isZeroBucket: !!bin.isZeroBucket }))}>
+                  <BarChart
+                    data={convertHistogramToArea(stats, metricKind).map(bin => ({ metric: metricKind === 'density' ? (bin.isZeroBucket ? '0' : bin.bin.toFixed(0)) : (bin.bin * 100).toFixed(1), metricLabel: metricKind === 'density' ? (bin.isZeroBucket ? 'Holes / 0 pts/m²' : `${bin.bin.toFixed(0)} pts/m²`) : `${(bin.bin * 100).toFixed(1)} cm/px`, areaM2: bin.areaM2, areaAcres: bin.areaM2 / ACRE_M2, isZeroBucket: !!bin.isZeroBucket }))}
+                    margin={{ top: 4, right: 8, bottom: 18 }}
+                  >
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                    <XAxis dataKey="metric" tick={{ fontSize: 10 }} label={{ value: labels.xAxis, position: 'insideBottom', offset: -5, style: { fontSize: '10px' } }} />
+                    <XAxis
+                      dataKey="metric"
+                      tick={{ fontSize: 10 }}
+                      height={28}
+                      label={{ value: labels.xAxis, position: 'bottom', offset: 6, style: { fontSize: '10px' } }}
+                    />
                     <YAxis tick={{ fontSize: 10 }} tickFormatter={(v:number)=> (v/ACRE_M2).toFixed(2)} label={{ value: 'Area (acres)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }} />
                     <Tooltip
                       formatter={(value)=>{
