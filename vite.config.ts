@@ -14,6 +14,41 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return;
+
+          if (
+            id.includes('mapbox-gl') ||
+            id.includes('@mapbox/mapbox-gl-draw') ||
+            id.includes('@deck.gl')
+          ) {
+            return 'map-vendor';
+          }
+
+          if (id.includes('@turf/turf')) {
+            return 'terrain-vendor';
+          }
+
+          if (id.includes('recharts')) {
+            return 'charts-vendor';
+          }
+
+          if (id.includes('jszip')) {
+            return 'zip-vendor';
+          }
+
+          if (id.includes('egm96-universal')) {
+            return 'geodesy-vendor';
+          }
+
+          if (id.includes('@radix-ui')) {
+            return 'ui-vendor';
+          }
+        },
+      },
+    },
   },
   define: {
     // Make sure Mapbox token is available

@@ -15,18 +15,15 @@ from .geometry import (
     clamp,
     deg_to_rad,
     forward_spacing_camera,
-    line_spacing_camera,
     lidar_line_spacing,
     lidar_swath_width,
+    line_spacing_camera,
     polygon_compactness,
     polygon_convexity,
     project_extents,
-    weighted_mean,
-    weighted_quantile,
 )
 from .grid import GridCell
 from .schemas import FlightParamsModel
-
 
 CAMERA_REGISTRY = {
     "SONY_RX1R2": {"f_m": 0.035, "sx_m": 4.88e-6, "sy_m": 4.88e-6, "w_px": 7952, "h_px": 5304},

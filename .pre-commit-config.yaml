@@ -1,0 +1,32 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '(^attached_assets/)|(^example/.*\.flightplan$)|(\.flightplan$)|(\.kml$)|(^lidar_info\.md$)'
+      - id: end-of-file-fixer
+        exclude: '(^attached_assets/)|(^example/.*\.flightplan$)|(\.flightplan$)|(\.kml$)|(^lidar_info\.md$)'
+      - id: check-merge-conflict
+      - id: check-yaml
+        exclude: '^backend/terrain_splitter/template\.yaml$'
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.13
+    hooks:
+      - id: ruff
+        files: ^backend/terrain_splitter/
+
+  - repo: local
+    hooks:
+      - id: frontend-eslint
+        name: frontend-eslint
+        entry: npm run lint
+        language: system
+        pass_filenames: false
+        files: ^src/.*\.(ts|tsx)$
+      - id: frontend-typecheck
+        name: frontend-typecheck
+        entry: npm run typecheck
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

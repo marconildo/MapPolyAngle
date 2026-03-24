@@ -1,16 +1,27 @@
-import type { CameraModel, PoseMeters, PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
-import { lngLatToTile, tileCornersLngLat } from "./mercator";
+import type { PolygonLngLat, WorkerOut, LidarWorkerOut } from "./types";
+import { tileCornersLngLat } from "./mercator";
+import { tilesCoveringPolygon } from "./tileCoverage";
+import { applyActiveDsmToTerrainRgbTile } from "@/terrain/dsmSource";
+import { getTerrainTileUrlForCurrentSource } from "@/terrain/terrainSource";
+
+export { tilesCoveringPolygon } from "./tileCoverage";
 
 export async function fetchTerrainRGBA(
-  z: number, x: number, y: number, token: string, size = 512, signal?: AbortSignal
+  z: number, x: number, y: number, token: string, _size = 512, signal?: AbortSignal
 ): Promise<ImageData> {
-  const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`;
+  const terrainUrl = getTerrainTileUrlForCurrentSource(z, x, y);
+  const url = terrainUrl
+    ?? `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`;
   const img = await loadImage(url, signal);
   const canvas = document.createElement("canvas");
   canvas.width = img.width; canvas.height = img.height;
   const ctx = canvas.getContext("2d")!;
   ctx.drawImage(img, 0, 0);
-  return ctx.getImageData(0, 0, img.width, img.height);
+  const imageData = ctx.getImageData(0, 0, img.width, img.height);
+  if (!terrainUrl) {
+    await applyActiveDsmToTerrainRgbTile(z, x, y, img.width, imageData.data);
+  }
+  return imageData;
 }
 
 function loadImage(url: string, signal?: AbortSignal): Promise<HTMLImageElement> {
@@ -30,20 +41,6 @@ function loadImage(url: string, signal?: AbortSignal): Promise<HTMLImageElement>
     }
     img.src = url;
   });
-}
-
-export function tilesCoveringPolygon(polygon: PolygonLngLat, z: number, pad: number = 0) {
-  const lons = polygon.ring.map(p=>p[0]);
-  const lats = polygon.ring.map(p=>p[1]);
-  const min = { lon: Math.min(...lons), lat: Math.min(...lats) };
-  const max = { lon: Math.max(...lons), lat: Math.max(...lats) };
-  const tMin = lngLatToTile(min.lon, max.lat, z);
-  const tMax = lngLatToTile(max.lon, min.lat, z);
-  const tiles: {x:number;y:number}[] = [];
-  for (let x=tMin.x - pad; x<=tMax.x + pad; x++) {
-    for (let y=tMin.y - pad; y<=tMax.y + pad; y++) tiles.push({x,y});
-  }
-  return tiles;
 }
 
 export function tileCornersForImageSource(z:number,x:number,y:number) {

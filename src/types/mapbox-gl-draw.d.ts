@@ -1,6 +1,6 @@
 declare module '@mapbox/mapbox-gl-draw' {
   import { IControl, Map } from 'mapbox-gl';
-  
+
   interface DrawOptions {
     displayControlsDefault?: boolean;
     controls?: {
@@ -16,10 +16,10 @@ declare module '@mapbox/mapbox-gl-draw' {
 
   class MapboxDraw implements IControl {
     constructor(options?: DrawOptions);
-    
+
     onAdd(map: Map): HTMLElement;
     onRemove(map: Map): void;
-    
+
     getAll(): {
       type: 'FeatureCollection';
       features: Array<{

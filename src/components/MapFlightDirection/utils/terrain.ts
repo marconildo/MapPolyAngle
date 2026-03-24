@@ -8,14 +8,21 @@
 
 import { Polygon, TerrainTile } from '@/utils/terrainAspectHybrid';
 import { getPolygonBounds } from './geometry';
+import { applyActiveDsmToTerrainRgbTile } from '@/terrain/dsmSource';
+import { getTerrainTileUrlForCurrentSource } from '@/terrain/terrainSource';
 
 async function getTileData(
-  url: string,
+  z: number,
+  x: number,
+  y: number,
   token: string,
   signal: AbortSignal
 ): Promise<TerrainTile | null> {
   try {
-    const response = await fetch(`${url}?access_token=${token}`, { signal });
+    const terrainUrl = getTerrainTileUrlForCurrentSource(z, x, y);
+    const response = terrainUrl
+      ? await fetch(terrainUrl, { signal })
+      : await fetch(`https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${token}`, { signal });
     if (!response.ok) {
       throw new Error(`Failed to fetch tile: ${response.statusText}`);
     }
@@ -27,13 +34,10 @@ async function getTileData(
     ctx.drawImage(image, 0, 0);
     const imageData = ctx.getImageData(0, 0, image.width, image.height);
     const data = new Uint8ClampedArray(imageData.data);
-    
-    // Calculate tile coordinates from URL
-    const urlParts = url.split('/');
-    const z = parseInt(urlParts[urlParts.length - 3]);
-    const x = parseInt(urlParts[urlParts.length - 2]);
-    const y = parseInt(urlParts[urlParts.length - 1].split('.')[0]);
-    
+    if (!terrainUrl) {
+      await applyActiveDsmToTerrainRgbTile(z, x, y, image.width, data);
+    }
+
     return {
       x,
       y,
@@ -79,8 +83,7 @@ export async function fetchTilesForPolygon(
   const promises: Promise<TerrainTile | null>[] = [];
   for (let x = minTileX; x <= maxTileX; x++) {
     for (let y = minTileY; y <= maxTileY; y++) {
-      const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${zoom}/${x}/${y}.pngraw`;
-      promises.push(getTileData(url, token, signal));
+      promises.push(getTileData(zoom, x, y, token, signal));
     }
   }
 

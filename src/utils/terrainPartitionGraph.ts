@@ -82,6 +82,13 @@ export type FrontierSolution = {
   totalScore: number;
 };
 
+type ModeSeedPair = {
+  modeA: number;
+  modeB: number;
+  separationDeg: number;
+  score: number;
+};
+
 const DEFAULT_OPTIONS: Required<TerrainAtomizationOptions> = {
   tradeoff: 0.5,
   gridStepM: 0,
@@ -209,7 +216,7 @@ function featureToSingleRing(feature: any): Ring | null {
   if (!geom) return null;
   if (geom.type === "Polygon") {
     if (!Array.isArray(geom.coordinates) || geom.coordinates.length === 0) return null;
-    return normalizeRing(geom.coordinates[0] as Ring);
+    return normalizeRing(geom.coordinates[0] as unknown as Ring);
   }
   if (geom.type === "MultiPolygon") {
     const polys = geom.coordinates as Ring[];
@@ -217,7 +224,7 @@ function featureToSingleRing(feature: any): Ring | null {
     let best: Ring | null = null;
     let bestArea = -Infinity;
     for (const coords of polys) {
-      const ring = normalizeRing(coords[0] as Ring);
+      const ring = normalizeRing(coords[0] as unknown as Ring);
       if (!ring) continue;
       const area = ringAreaM2(ring);
       if (area > bestArea) {
@@ -1270,7 +1277,6 @@ function completeRegionCoverage(
   for (const gapRing of uncoveredRings) {
     const gapFeature = turf.polygon([gapRing]);
     const gapCentroidPoint = turf.centroid(gapFeature);
-    const gapCentroid = gapCentroidPoint.geometry.coordinates as [number, number];
     let bestRegionId: string | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
 
@@ -2255,7 +2261,7 @@ function buildPartitionEvaluationFromAssignments(
 function initializeAssignments(
   seedAtoms: RegionSeed[],
   graph: TerrainAtomGraph,
-  atomMap: Map<string, TerrainAtom>,
+  _atomMap: Map<string, TerrainAtom>,
 ) {
   const polygonScaleM = Math.max(1, Math.sqrt(Math.max(1, graph.guidance.areaM2)));
   const assignments = new Map<string, string>();

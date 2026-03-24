@@ -53,7 +53,7 @@ export function usePolygonAnalysis({
 
         const optimalTerrainZoom = calculateOptimalTerrainZoom(polygon);
         console.log(`Using terrain zoom ${optimalTerrainZoom} for polygon ${polygonId}`);
-        
+
         const tiles = await fetchTilesForPolygon(polygon, optimalTerrainZoom, mapboxToken, signal);
         console.log(`Fetched ${tiles.length} tiles for polygon ${polygonId}`);
 

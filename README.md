@@ -68,6 +68,8 @@ Backend deployment details live in [backend/terrain_splitter/README.md](/Users/b
 ```bash
 npm run dev
 npm run build
+npm run lint
+npm run typecheck
 npm run test:terrain-split
 npm run test:terrain-objective
 npm run test:terrain-graph
@@ -78,6 +80,14 @@ Backend:
 ```bash
 backend/terrain_splitter/.venv/bin/python -m pytest -q backend/terrain_splitter/tests
 sam validate --template-file backend/terrain_splitter/template.yaml
+```
+
+Optional pre-commit setup:
+
+```bash
+python3 -m pip install pre-commit
+pre-commit install
+pre-commit install --hook-type pre-push
 ```
 
 ## Project layout

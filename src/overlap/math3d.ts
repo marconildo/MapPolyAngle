@@ -10,7 +10,7 @@ export function rotMat(omega_deg: number, phi_deg: number, kappa_deg: number): F
   const A = mul3(Ry,Rx); return mul3(Rz, A);
 }
 
-function mul3(A: number[], B: number[]): Float64Array {
+function mul3(A: ArrayLike<number>, B: ArrayLike<number>): Float64Array {
   const R = new Float64Array(9);
   R[0]=A[0]*B[0]+A[1]*B[3]+A[2]*B[6];
   R[1]=A[0]*B[1]+A[1]*B[4]+A[2]*B[7];

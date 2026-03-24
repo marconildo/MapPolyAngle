@@ -6,8 +6,8 @@ import math
 import os
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -34,22 +34,43 @@ from .grid import GridCell, GridData, GridEdge
 from .postprocess import region_polygon_from_cells
 from .schemas import FlightParamsModel, PartitionSolutionPreviewModel, RegionPreview
 
-
 MAX_REGIONS = 8
-MAX_SPLIT_OPTIONS = 6
-MAX_FRONTIER_STATES = 14
+MAX_SPLIT_OPTIONS = 8
+MAX_FRONTIER_STATES = 20
 MIN_CHILD_AREA_FRACTION = 0.14
 COARSE_NON_LARGEST_FRACTION_MIN = 0.22
-INTER_REGION_TRANSITION_SEC = 35.0
-REGION_COUNT_PENALTY = 0.012
+INTER_REGION_TRANSITION_SEC = 45.0
+REGION_COUNT_PENALTY = 0.02
 DOMINANCE_EPS = 1e-6
+DEFAULT_BASIC_LINE_LENGTH_SCALE = 0.35
+DEFAULT_PRACTICAL_LINE_LENGTH_SCALE = 0.40
+LINE_LENGTH_NEAR_MISS_RATIO_BASIC = 0.10
+LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL = 0.08
+LINE_LENGTH_NEAR_MISS_MIN_M = 12.0
+LINE_LENGTH_NEAR_MISS_MAX_M = 30.0
+RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M = 20.0
+RELAXED_FALLBACK_TIME_DIVISOR_SEC = 7_500.0
+RELAXED_FALLBACK_SOFT_TOTAL_WEIGHT = 0.01
+RELAXED_FALLBACK_SOFT_MAX_WEIGHT = 0.002
+MAX_RELAXED_FALLBACK_CANDIDATES = 6
+PRACTICAL_FRONTIER_BUCKET_KEEP = 5
+NON_PRACTICAL_FRONTIER_BUCKET_KEEP = 3
+SPLIT_RANK_TIME_DIVISOR_SEC = 6_000.0
+SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION = 0.03
+SPLIT_NON_IMPROVING_MIN_RANK_SCORE = -0.02
 DEFAULT_DEPTH_SMALL = 3
-DEFAULT_DEPTH_LARGE = 2
+DEFAULT_DEPTH_LARGE = 3
+DEFAULT_NESTED_LAMBDA_MIN_DEPTH = 2
+DEFAULT_NESTED_LAMBDA_MIN_CELLS = 64
+DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT = 8
 SPLIT_QUANTILES = (0.20, 0.25, 0.33, 0.40, 0.50, 0.60, 0.67, 0.75, 0.80)
 OUTPUT_RING_SIMPLIFY_FACTOR = 0.4
 OUTPUT_RING_SIMPLIFY_MIN_M = 6.0
 OUTPUT_RING_SIMPLIFY_MAX_M = 24.0
 logger = logging.getLogger("uvicorn.error")
+_LAMBDA_CLIENT: Any | None = None
+_LAMBDA_CLIENT_MAX_POOL_CONNECTIONS = 0
+_LAMBDA_CLIENT_READ_TIMEOUT_SEC = 0
 
 
 @dataclass(slots=True)
@@ -91,7 +112,32 @@ class SplitCandidate:
     left_ids: tuple[int, ...]
     right_ids: tuple[int, ...]
     boundary: BoundaryStats
+    direction_deg: float
+    threshold: float
     rank_score: float
+
+
+@dataclass(slots=True)
+class RelaxedFallbackCandidate:
+    plan: PartitionPlan
+    direction_deg: float
+    threshold: float
+    soft_total_margin: float
+    soft_max_margin: float
+    fallback_score: float
+
+
+@dataclass(slots=True)
+class PartitionLeafGeometry:
+    cell_ids: tuple[int, ...]
+
+
+@dataclass(slots=True)
+class PartitionSplitGeometry:
+    direction_deg: float
+    threshold: float
+    left: PartitionLeafGeometry | PartitionSplitGeometry
+    right: PartitionLeafGeometry | PartitionSplitGeometry
 
 
 @dataclass(slots=True)
@@ -105,6 +151,7 @@ class PartitionPlan:
     largest_region_fraction: float
     mean_convexity: float
     region_count: int
+    geometry_tree: PartitionLeafGeometry | PartitionSplitGeometry | None = None
 
 
 @dataclass(slots=True)
@@ -116,6 +163,8 @@ class SolverContext:
     feature_lookup: dict[int, CellFeatures]
     cell_lookup: dict[int, GridCell]
     neighbors: dict[int, list[int]]
+    basic_line_length_scale: float
+    practical_line_length_scale: float
 
 
 @dataclass(slots=True)
@@ -127,6 +176,8 @@ class SolverCaches:
     heading_candidates_cache: dict[tuple[int, ...], list[float]]
     polygon_cache: dict[tuple[int, ...], Polygon | None]
     frontier_cache: dict[tuple[tuple[int, ...], int], list[PartitionPlan]]
+    basic_rejection_summary: dict[str, Any]
+    basic_split_rejection_summary: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -135,6 +186,8 @@ class RootSplitTask:
     right_ids: tuple[int, ...]
     boundary: BoundaryStats
     depth: int
+    direction_deg: float = 0.0
+    threshold: float = 0.0
 
 
 @dataclass(slots=True)
@@ -155,6 +208,8 @@ def _make_solver_caches() -> SolverCaches:
         heading_candidates_cache={},
         polygon_cache={},
         frontier_cache={},
+        basic_rejection_summary={},
+        basic_split_rejection_summary={},
     )
 
 
@@ -199,6 +254,87 @@ def _resolve_root_parallel_granularity(requested: Literal["branch", "subtree"] |
     if raw == "subtree":
         return "subtree"
     return "branch"
+
+
+def _resolve_root_parallel_max_inflight(requested: int | None) -> int | None:
+    if requested is not None:
+        return max(0, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_ROOT_PARALLEL_MAX_INFLIGHT=%r; falling back to worker limit",
+            raw,
+        )
+        return None
+
+
+def _resolve_lambda_invoke_read_timeout_sec(requested: int | None) -> int:
+    if requested is not None:
+        return max(1, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC")
+    if raw is None or raw.strip() == "":
+        return 300
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC=%r; falling back to 300s",
+            raw,
+        )
+        return 300
+
+
+def _resolve_nested_lambda_min_cells(requested: int | None) -> int:
+    if requested is not None:
+        return max(1, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_NESTED_LAMBDA_MIN_CELLS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS=%r; falling back to %d",
+            raw,
+            DEFAULT_NESTED_LAMBDA_MIN_CELLS,
+        )
+        return DEFAULT_NESTED_LAMBDA_MIN_CELLS
+
+
+def _resolve_nested_lambda_max_inflight(requested: int | None) -> int:
+    if requested is not None:
+        return max(0, int(requested))
+    raw = os.environ.get("TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT=%r; falling back to %d",
+            raw,
+            DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT,
+        )
+        return DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT
+
+
+
+def _resolve_lambda_parallel_invocations(
+    task_count: int,
+    fallback_workers: int,
+    max_inflight: int | None,
+) -> int:
+    if task_count <= 0:
+        return 0
+    if max_inflight is None:
+        return min(task_count, max(1, fallback_workers))
+    if max_inflight <= 0:
+        return task_count
+    return min(task_count, max_inflight)
 
 
 def _init_parallel_solver_context(context: SolverContext) -> None:
@@ -283,45 +419,581 @@ def _capture_efficiency(objective: RegionObjective) -> float:
     )
 
 
+def _line_length_tolerance_m(min_line_length_m: float, *, practical: bool) -> float:
+    ratio = LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL if practical else LINE_LENGTH_NEAR_MISS_RATIO_BASIC
+    return clamp(min_line_length_m * ratio, LINE_LENGTH_NEAR_MISS_MIN_M, LINE_LENGTH_NEAR_MISS_MAX_M)
+
+
+def _region_gate_thresholds(*, practical: bool, line_length_scale: float) -> dict[str, float]:
+    return {
+        "min_child_fraction": MIN_CHILD_AREA_FRACTION,
+        "min_flight_line_count": 1.0,
+        "line_length_scale": line_length_scale,
+        "line_length_floor_m": 10.0 if practical else 8.0,
+        "min_convexity": 0.64 if practical else 0.56,
+        "max_compactness": 6.25 if practical else 8.5,
+        "min_capture_efficiency": 0.22 if practical else 0.12,
+        "max_overflight_transit_fraction": 0.55 if practical else 1.0,
+    }
+
+
+def _region_gate_diagnostics(
+    region: EvaluatedRegion,
+    area_reference_m2: float,
+    *,
+    practical: bool,
+    line_length_scale: float,
+) -> dict[str, float | int | bool]:
+    thresholds = _region_gate_thresholds(practical=practical, line_length_scale=line_length_scale)
+    fraction = region.objective.area_m2 / max(1.0, area_reference_m2)
+    line_length_span = max(1.0, region.objective.along_track_length_m, region.objective.cross_track_width_m)
+    min_line_length = max(
+        thresholds["line_length_floor_m"],
+        thresholds["line_length_scale"] * line_length_span,
+    )
+    line_length_shortfall = max(0.0, min_line_length - region.objective.mean_line_length_m)
+    line_length_tolerance = _line_length_tolerance_m(min_line_length, practical=practical)
+    return {
+        "hard_invalid": region.hard_invalid,
+        "fraction": fraction,
+        "min_child_fraction": thresholds["min_child_fraction"],
+        "flight_line_count": region.objective.flight_line_count,
+        "min_flight_line_count": int(thresholds["min_flight_line_count"]),
+        "mean_line_length_m": region.objective.mean_line_length_m,
+        "min_line_length_m": min_line_length,
+        "line_length_shortfall_m": line_length_shortfall,
+        "line_length_tolerance_m": line_length_tolerance,
+        "line_length_near_miss_allowed": 0.0 < line_length_shortfall <= line_length_tolerance,
+        "along_track_length_m": region.objective.along_track_length_m,
+        "cross_track_width_m": region.objective.cross_track_width_m,
+        "convexity": region.objective.convexity,
+        "min_convexity": thresholds["min_convexity"],
+        "compactness": region.objective.compactness,
+        "max_compactness": thresholds["max_compactness"],
+        "capture_efficiency": _capture_efficiency(region.objective),
+        "min_capture_efficiency": thresholds["min_capture_efficiency"],
+        "overflight_transit_fraction": region.objective.overflight_transit_fraction,
+        "max_overflight_transit_fraction": thresholds["max_overflight_transit_fraction"],
+        "bearing_deg": region.objective.bearing_deg,
+        "area_m2": region.objective.area_m2,
+    }
+
+
+def _region_gate_failure_margins(diagnostics: dict[str, float | int | bool], *, practical: bool) -> dict[str, float]:
+    failures: dict[str, float] = {}
+    if diagnostics["hard_invalid"]:
+        failures["hard_invalid"] = 1.0
+    if diagnostics["fraction"] < diagnostics["min_child_fraction"]:
+        failures["min_child_fraction"] = float(diagnostics["min_child_fraction"] - diagnostics["fraction"])
+    if diagnostics["flight_line_count"] < diagnostics["min_flight_line_count"]:
+        failures["flight_line_count"] = float(diagnostics["min_flight_line_count"] - diagnostics["flight_line_count"])
+    if diagnostics["convexity"] < diagnostics["min_convexity"]:
+        failures["convexity"] = float(diagnostics["min_convexity"] - diagnostics["convexity"])
+    if diagnostics["compactness"] > diagnostics["max_compactness"]:
+        failures["compactness"] = float(diagnostics["compactness"] - diagnostics["max_compactness"])
+    if diagnostics["capture_efficiency"] < diagnostics["min_capture_efficiency"]:
+        failures["capture_efficiency"] = float(diagnostics["min_capture_efficiency"] - diagnostics["capture_efficiency"])
+    if practical and diagnostics["overflight_transit_fraction"] > diagnostics["max_overflight_transit_fraction"]:
+        failures["overflight_transit_fraction"] = float(
+            diagnostics["overflight_transit_fraction"] - diagnostics["max_overflight_transit_fraction"]
+        )
+    line_length_shortfall = float(diagnostics["line_length_shortfall_m"])
+    if line_length_shortfall > 0.0:
+        line_length_tolerance = float(diagnostics["line_length_tolerance_m"])
+        if line_length_shortfall > line_length_tolerance or failures:
+            failures["mean_line_length_m"] = line_length_shortfall
+    return failures
+
+
+def _region_gate_passes(diagnostics: dict[str, float | int | bool], *, practical: bool) -> bool:
+    return not _region_gate_failure_margins(diagnostics, practical=practical)
+
+
+def _plan_gate_thresholds() -> dict[str, float]:
+    return {
+        "min_non_largest_fraction": COARSE_NON_LARGEST_FRACTION_MIN,
+        "min_child_fraction": MIN_CHILD_AREA_FRACTION,
+        "min_mean_convexity": 0.65,
+        "max_two_region_largest_fraction": 0.88,
+    }
+
+
+def _plan_gate_diagnostics(plan: PartitionPlan, root_area_m2: float, *, line_length_scale: float) -> dict[str, Any]:
+    fractions = sorted((region.objective.area_m2 / max(1.0, root_area_m2) for region in plan.regions), reverse=True)
+    thresholds = _plan_gate_thresholds()
+    region_diags = [
+        _region_gate_diagnostics(region, root_area_m2, practical=True, line_length_scale=line_length_scale)
+        for region in plan.regions
+    ]
+    return {
+        "region_count": plan.region_count,
+        "largest_region_fraction": fractions[0] if fractions else 1.0,
+        "non_largest_fraction": (1.0 - fractions[0]) if fractions else 0.0,
+        "smallest_region_fraction": fractions[-1] if fractions else 0.0,
+        "mean_convexity": plan.mean_convexity,
+        "min_non_largest_fraction": thresholds["min_non_largest_fraction"],
+        "min_child_fraction": thresholds["min_child_fraction"],
+        "min_mean_convexity": thresholds["min_mean_convexity"],
+        "max_two_region_largest_fraction": thresholds["max_two_region_largest_fraction"],
+        "quality_cost": plan.quality_cost,
+        "mission_time_sec": plan.mission_time_sec,
+        "region_diagnostics": region_diags,
+    }
+
+
+def _plan_gate_failure_margins(diagnostics: dict[str, Any]) -> tuple[dict[str, float], list[tuple[int, dict[str, float | int | bool], dict[str, float]]]]:
+    failures: dict[str, float] = {}
+    region_failures: list[tuple[int, dict[str, float | int | bool], dict[str, float]]] = []
+    if diagnostics["region_count"] <= 1:
+        failures["region_count"] = 1.0
+        return failures, region_failures
+    if diagnostics["non_largest_fraction"] < diagnostics["min_non_largest_fraction"]:
+        failures["non_largest_fraction"] = float(
+            diagnostics["min_non_largest_fraction"] - diagnostics["non_largest_fraction"]
+        )
+    if diagnostics["smallest_region_fraction"] < diagnostics["min_child_fraction"]:
+        failures["smallest_region_fraction"] = float(
+            diagnostics["min_child_fraction"] - diagnostics["smallest_region_fraction"]
+        )
+    if diagnostics["mean_convexity"] < diagnostics["min_mean_convexity"]:
+        failures["mean_convexity"] = float(diagnostics["min_mean_convexity"] - diagnostics["mean_convexity"])
+    if diagnostics["region_count"] == 2 and diagnostics["largest_region_fraction"] > diagnostics["max_two_region_largest_fraction"]:
+        failures["largest_region_fraction"] = float(
+            diagnostics["largest_region_fraction"] - diagnostics["max_two_region_largest_fraction"]
+        )
+
+    for index, region_diag in enumerate(diagnostics["region_diagnostics"]):
+        region_reasons = _region_gate_failure_margins(region_diag, practical=True)
+        if region_reasons:
+            region_failures.append((index, region_diag, region_reasons))
+    if region_failures:
+        failures["region_practicality"] = 1.0
+    return failures, region_failures
+
+
+def _summarize_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 4)
+    return value
+
+
+def _rounded_debug_mapping(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: _summarize_diagnostic_value(value) for key, value in values.items()}
+
+
+def _rejection_debug_payload(
+    *,
+    caches: SolverCaches,
+    basic_line_length_scale: float,
+    practical_line_length_scale: float,
+    practical_plan_rejection_summary: dict[str, Any],
+    practical_region_rejection_summary: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "basicRegionValidity": {
+            "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
+            **caches.basic_rejection_summary,
+        },
+        "basicSplitValidity": {
+            "thresholds": _region_gate_thresholds(practical=False, line_length_scale=basic_line_length_scale),
+            **caches.basic_split_rejection_summary,
+        },
+        "practicalPlan": {
+            "thresholds": _plan_gate_thresholds(),
+            **practical_plan_rejection_summary,
+        },
+        "practicalRegion": {
+            "thresholds": _region_gate_thresholds(practical=True, line_length_scale=practical_line_length_scale),
+            **practical_region_rejection_summary,
+        },
+    }
+
+
+def _plan_debug_signature(plan: PartitionPlan) -> str:
+    return hash_signature(
+        {
+            "regions": [
+                {
+                    "cellIds": list(region.cell_ids),
+                    "bearingDeg": round(region.objective.bearing_deg, 4),
+                }
+                for region in plan.regions
+            ]
+        }
+    )
+
+
+def _serialize_plan_debug_snapshot(
+    plan: PartitionPlan,
+    root_area_m2: float,
+    *,
+    line_length_scale: float,
+) -> dict[str, Any]:
+    diagnostics = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=line_length_scale)
+    plan_failures, region_failures = _plan_gate_failure_margins(diagnostics)
+    region_failure_lookup = {
+        index: {
+            "diagnostics": region_diag,
+            "failures": failures,
+        }
+        for index, region_diag, failures in region_failures
+    }
+    regions: list[dict[str, Any]] = []
+    for index, (region, region_diag) in enumerate(zip(plan.regions, diagnostics["region_diagnostics"], strict=True)):
+        failure_payload = region_failure_lookup.get(index, {})
+        regions.append(
+            {
+                "regionIndex": index,
+                "areaM2": round(region.objective.area_m2, 3),
+                "bearingDeg": round(region.objective.bearing_deg, 4),
+                "atomCount": len(region.cell_ids),
+                "captureEfficiency": _summarize_diagnostic_value(region_diag["capture_efficiency"]),
+                "meanLineLengthM": _summarize_diagnostic_value(region_diag["mean_line_length_m"]),
+                "minLineLengthM": _summarize_diagnostic_value(region_diag["min_line_length_m"]),
+                "lineLengthShortfallM": _summarize_diagnostic_value(region_diag["line_length_shortfall_m"]),
+                "lineLengthToleranceM": _summarize_diagnostic_value(region_diag["line_length_tolerance_m"]),
+                "lineLengthNearMissAllowed": bool(region_diag["line_length_near_miss_allowed"]),
+                "convexity": _summarize_diagnostic_value(region_diag["convexity"]),
+                "compactness": _summarize_diagnostic_value(region_diag["compactness"]),
+                "overflightTransitFraction": _summarize_diagnostic_value(region_diag["overflight_transit_fraction"]),
+                "failures": _rounded_debug_mapping(failure_payload.get("failures", {})),
+            }
+        )
+    return {
+        "signature": _plan_debug_signature(plan),
+        "regionCount": plan.region_count,
+        "qualityCost": round(plan.quality_cost, 6),
+        "missionTimeSec": round(plan.mission_time_sec, 3),
+        "largestRegionFraction": round(plan.largest_region_fraction, 4),
+        "meanConvexity": round(plan.mean_convexity, 4),
+        "boundaryBreakAlignment": round(_plan_boundary_alignment(plan), 4),
+        "isPractical": not plan_failures,
+        "planFailures": _rounded_debug_mapping(plan_failures),
+        "regions": regions,
+    }
+
+
+def _populate_solver_debug_output(
+    debug_output: dict[str, Any] | None,
+    *,
+    request_id: str | None,
+    polygon_id: str | None,
+    grid: GridData,
+    requested_tradeoff: float | None,
+    max_depth: int,
+    basic_line_length_scale: float,
+    practical_line_length_scale: float,
+    caches: SolverCaches,
+    perf: dict[str, float],
+    all_plans: list[PartitionPlan],
+    practical_plans: list[PartitionPlan],
+    returned_plans: list[PartitionPlan],
+    returned_previews: list[PartitionSolutionPreviewModel],
+    practical_plan_rejection_summary: dict[str, Any],
+    practical_region_rejection_summary: dict[str, Any],
+    relaxed_fallback: list[RelaxedFallbackCandidate] | None = None,
+) -> None:
+    if debug_output is None:
+        return
+    root_area_m2 = max(1.0, grid.area_m2)
+    debug_output.clear()
+    debug_output.update(
+        {
+            "solverSummary": {
+                "requestId": request_id,
+                "polygonId": polygon_id,
+                "requestedTradeoff": requested_tradeoff,
+                "gridCellCount": len(grid.cells),
+                "gridEdgeCount": len(grid.edges),
+                "gridStepM": round(grid.grid_step_m, 4),
+                "maxDepth": max_depth,
+                "counts": {
+                    "allPlans": len(all_plans),
+                    "practicalPlans": len(practical_plans),
+                    "returnedSolutions": len(returned_previews),
+                    "relaxedFallbackCandidates": len(relaxed_fallback or []),
+                },
+                "constants": {
+                    "maxSplitOptions": MAX_SPLIT_OPTIONS,
+                    "maxFrontierStates": MAX_FRONTIER_STATES,
+                    "interRegionTransitionSec": INTER_REGION_TRANSITION_SEC,
+                    "regionCountPenalty": REGION_COUNT_PENALTY,
+                    "defaultDepthSmall": DEFAULT_DEPTH_SMALL,
+                    "defaultDepthLarge": DEFAULT_DEPTH_LARGE,
+                    "basicLineLengthScale": basic_line_length_scale,
+                    "practicalLineLengthScale": practical_line_length_scale,
+                    "lineLengthNearMissRatioBasic": LINE_LENGTH_NEAR_MISS_RATIO_BASIC,
+                    "lineLengthNearMissRatioPractical": LINE_LENGTH_NEAR_MISS_RATIO_PRACTICAL,
+                    "defaultNestedLambdaMinDepth": DEFAULT_NESTED_LAMBDA_MIN_DEPTH,
+                    "defaultNestedLambdaMinCells": DEFAULT_NESTED_LAMBDA_MIN_CELLS,
+                    "defaultNestedLambdaMaxInflight": DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT,
+                },
+                "performance": _rounded_debug_mapping(dict(perf)),
+            },
+            "rejectionDiagnostics": _rejection_debug_payload(
+                caches=caches,
+                basic_line_length_scale=basic_line_length_scale,
+                practical_line_length_scale=practical_line_length_scale,
+                practical_plan_rejection_summary=practical_plan_rejection_summary,
+                practical_region_rejection_summary=practical_region_rejection_summary,
+            ),
+            "returnedPreviewSignatures": [preview.signature for preview in returned_previews],
+            "returnedPlans": [
+                _serialize_plan_debug_snapshot(plan, root_area_m2, line_length_scale=practical_line_length_scale)
+                for plan in returned_plans
+            ],
+            "practicalPlanSample": [
+                _serialize_plan_debug_snapshot(plan, root_area_m2, line_length_scale=practical_line_length_scale)
+                for plan in practical_plans[: min(len(practical_plans), 12)]
+            ],
+        }
+    )
+    if relaxed_fallback:
+        debug_output["relaxedFallback"] = [
+            {
+                "signature": _plan_debug_signature(candidate.plan),
+                "directionDeg": round(candidate.direction_deg, 4),
+                "threshold": round(candidate.threshold, 4),
+                "softTotalMargin": round(candidate.soft_total_margin, 4),
+                "softMaxMargin": round(candidate.soft_max_margin, 4),
+                "fallbackScore": round(candidate.fallback_score, 6),
+            }
+            for candidate in relaxed_fallback
+        ]
+
+
+def _update_failure_summary(
+    summary: dict[str, Any],
+    reason: str,
+    margin: float,
+    snapshot: dict[str, Any],
+) -> None:
+    counts = summary.setdefault("counts", {})
+    counts[reason] = int(counts.get(reason, 0)) + 1
+    closest = summary.setdefault("closest", {})
+    existing = closest.get(reason)
+    if existing is None or margin < existing["margin"]:
+        closest[reason] = {
+            "margin": round(margin, 4),
+            "snapshot": {key: _summarize_diagnostic_value(value) for key, value in snapshot.items()},
+        }
+
+
+def _record_region_failure_summary(
+    summary: dict[str, Any],
+    region: EvaluatedRegion,
+    diagnostics: dict[str, float | int | bool],
+    failures: dict[str, float],
+) -> None:
+    snapshot = {
+        "bearing_deg": region.objective.bearing_deg,
+        "area_m2": diagnostics["area_m2"],
+        "fraction": diagnostics["fraction"],
+        "min_child_fraction": diagnostics["min_child_fraction"],
+        "flight_line_count": diagnostics["flight_line_count"],
+        "mean_line_length_m": diagnostics["mean_line_length_m"],
+        "min_line_length_m": diagnostics["min_line_length_m"],
+        "along_track_length_m": diagnostics["along_track_length_m"],
+        "cross_track_width_m": diagnostics["cross_track_width_m"],
+        "convexity": diagnostics["convexity"],
+        "min_convexity": diagnostics["min_convexity"],
+        "compactness": diagnostics["compactness"],
+        "max_compactness": diagnostics["max_compactness"],
+        "capture_efficiency": diagnostics["capture_efficiency"],
+        "min_capture_efficiency": diagnostics["min_capture_efficiency"],
+        "overflight_transit_fraction": diagnostics["overflight_transit_fraction"],
+        "max_overflight_transit_fraction": diagnostics["max_overflight_transit_fraction"],
+    }
+    for reason, margin in failures.items():
+        _update_failure_summary(summary, reason, margin, snapshot)
+
+
+def _region_failure_snapshot(
+    diagnostics: dict[str, float | int | bool],
+    failures: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "failureCount": len(failures),
+        "failureMargins": {reason: round(margin, 4) for reason, margin in sorted(failures.items())},
+        "bearing_deg": _summarize_diagnostic_value(diagnostics["bearing_deg"]),
+        "area_m2": _summarize_diagnostic_value(diagnostics["area_m2"]),
+        "fraction": _summarize_diagnostic_value(diagnostics["fraction"]),
+        "min_child_fraction": _summarize_diagnostic_value(diagnostics["min_child_fraction"]),
+        "flight_line_count": diagnostics["flight_line_count"],
+        "mean_line_length_m": _summarize_diagnostic_value(diagnostics["mean_line_length_m"]),
+        "min_line_length_m": _summarize_diagnostic_value(diagnostics["min_line_length_m"]),
+        "along_track_length_m": _summarize_diagnostic_value(diagnostics["along_track_length_m"]),
+        "cross_track_width_m": _summarize_diagnostic_value(diagnostics["cross_track_width_m"]),
+        "convexity": _summarize_diagnostic_value(diagnostics["convexity"]),
+        "min_convexity": _summarize_diagnostic_value(diagnostics["min_convexity"]),
+        "compactness": _summarize_diagnostic_value(diagnostics["compactness"]),
+        "max_compactness": _summarize_diagnostic_value(diagnostics["max_compactness"]),
+        "capture_efficiency": _summarize_diagnostic_value(diagnostics["capture_efficiency"]),
+        "min_capture_efficiency": _summarize_diagnostic_value(diagnostics["min_capture_efficiency"]),
+        "overflight_transit_fraction": _summarize_diagnostic_value(diagnostics["overflight_transit_fraction"]),
+        "max_overflight_transit_fraction": _summarize_diagnostic_value(diagnostics["max_overflight_transit_fraction"]),
+    }
+
+
+def _record_split_failure_summary(
+    summary: dict[str, Any],
+    *,
+    direction_deg: float,
+    threshold: float,
+    boundary: BoundaryStats,
+    left_diagnostics: dict[str, float | int | bool],
+    left_failures: dict[str, float],
+    right_diagnostics: dict[str, float | int | bool],
+    right_failures: dict[str, float],
+) -> None:
+    summary["splitFailureCount"] = int(summary.get("splitFailureCount", 0)) + 1
+    counts = summary.setdefault("counts", {})
+    for reason in sorted(set(left_failures) | set(right_failures)):
+        counts[reason] = int(counts.get(reason, 0)) + 1
+
+    total_margin = sum(left_failures.values()) + sum(right_failures.values())
+    max_margin = max([0.0, *left_failures.values(), *right_failures.values()])
+    split_snapshot = {
+        "totalMargin": round(total_margin, 4),
+        "maxMargin": round(max_margin, 4),
+        "direction_deg": round(direction_deg, 4),
+        "threshold": round(threshold, 4),
+        "shared_boundary_m": round(boundary.shared_boundary_m, 4),
+        "break_weight_sum": round(boundary.break_weight_sum, 4),
+        "left": _region_failure_snapshot(left_diagnostics, left_failures),
+        "right": _region_failure_snapshot(right_diagnostics, right_failures),
+    }
+    closest_splits = summary.setdefault("closestSplits", [])
+    closest_splits.append(split_snapshot)
+    closest_splits.sort(key=lambda item: (item["totalMargin"], item["maxMargin"]))
+    del closest_splits[5:]
+
+
+def _record_plan_failure_summary(
+    plan_summary: dict[str, Any],
+    region_summary: dict[str, Any],
+    plan: PartitionPlan,
+    diagnostics: dict[str, Any],
+    failures: dict[str, float],
+    region_failures: list[tuple[int, dict[str, float | int | bool], dict[str, float]]],
+) -> None:
+    snapshot = {
+        "region_count": diagnostics["region_count"],
+        "largest_region_fraction": diagnostics["largest_region_fraction"],
+        "non_largest_fraction": diagnostics["non_largest_fraction"],
+        "min_non_largest_fraction": diagnostics["min_non_largest_fraction"],
+        "smallest_region_fraction": diagnostics["smallest_region_fraction"],
+        "min_child_fraction": diagnostics["min_child_fraction"],
+        "mean_convexity": diagnostics["mean_convexity"],
+        "min_mean_convexity": diagnostics["min_mean_convexity"],
+        "max_two_region_largest_fraction": diagnostics["max_two_region_largest_fraction"],
+        "quality_cost": diagnostics["quality_cost"],
+        "mission_time_sec": diagnostics["mission_time_sec"],
+    }
+    for reason, margin in failures.items():
+        _update_failure_summary(plan_summary, reason, margin, snapshot)
+
+    for index, region_diag, region_reasons in region_failures:
+        region_snapshot = {
+            "region_index": index,
+            **snapshot,
+            "bearing_deg": region_diag["bearing_deg"],
+            "area_m2": region_diag["area_m2"],
+            "fraction": region_diag["fraction"],
+            "flight_line_count": region_diag["flight_line_count"],
+            "mean_line_length_m": region_diag["mean_line_length_m"],
+            "min_line_length_m": region_diag["min_line_length_m"],
+            "along_track_length_m": region_diag["along_track_length_m"],
+            "cross_track_width_m": region_diag["cross_track_width_m"],
+            "convexity": region_diag["convexity"],
+            "min_convexity": region_diag["min_convexity"],
+            "compactness": region_diag["compactness"],
+            "max_compactness": region_diag["max_compactness"],
+            "capture_efficiency": region_diag["capture_efficiency"],
+            "min_capture_efficiency": region_diag["min_capture_efficiency"],
+            "overflight_transit_fraction": region_diag["overflight_transit_fraction"],
+            "max_overflight_transit_fraction": region_diag["max_overflight_transit_fraction"],
+        }
+        for reason, margin in region_reasons.items():
+            _update_failure_summary(region_summary, reason, margin, region_snapshot)
+
+
+def _relaxed_region_failure_sets(
+    diagnostics: dict[str, float | int | bool],
+    *,
+    practical: bool,
+) -> tuple[dict[str, float], dict[str, float]]:
+    failures = _region_gate_failure_margins(diagnostics, practical=practical)
+    hard_failures: dict[str, float] = {}
+    soft_failures: dict[str, float] = {}
+    mean_line_length_m = float(diagnostics["mean_line_length_m"])
+    for reason, margin in failures.items():
+        if reason in {"hard_invalid", "min_child_fraction", "flight_line_count"}:
+            hard_failures[reason] = margin
+        elif reason == "convexity":
+            hard_failures[reason] = margin
+        elif reason == "mean_line_length_m" and mean_line_length_m < RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M:
+            hard_failures["mean_line_length_hard_floor_m"] = RELAXED_HARD_MIN_MEAN_LINE_LENGTH_M - mean_line_length_m
+        else:
+            soft_failures[reason] = margin
+    return hard_failures, soft_failures
+
+
+def _score_relaxed_fallback_candidate(
+    plan: PartitionPlan,
+    baseline_plan: PartitionPlan,
+    *,
+    soft_total_margin: float,
+    soft_max_margin: float,
+) -> float:
+    quality_regression = max(0.0, plan.quality_cost - baseline_plan.quality_cost)
+    mission_time_penalty = max(0.0, plan.mission_time_sec - baseline_plan.mission_time_sec) / RELAXED_FALLBACK_TIME_DIVISOR_SEC
+    return (
+        plan.quality_cost
+        + quality_regression
+        + mission_time_penalty
+        + RELAXED_FALLBACK_SOFT_TOTAL_WEIGHT * soft_total_margin
+        + RELAXED_FALLBACK_SOFT_MAX_WEIGHT * soft_max_margin
+    )
+
+
+def _relaxed_plan_soft_failure_values(
+    plan: PartitionPlan,
+    root_area_m2: float,
+    *,
+    line_length_scale: float,
+) -> list[float]:
+    diagnostics = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=line_length_scale)
+    failures, region_failures = _plan_gate_failure_margins(diagnostics)
+    soft_values: list[float] = []
+    for reason, margin in failures.items():
+        if reason in {"region_count", "region_practicality"}:
+            continue
+        soft_values.append(float(margin))
+    for _, region_diag, region_reasons in region_failures:
+        hard_failures, soft_failures = _relaxed_region_failure_sets(region_diag, practical=True)
+        if hard_failures:
+            return [float("inf")]
+        soft_values.extend(float(margin) for margin in soft_failures.values())
+    return soft_values
+
+
 def _region_basic_validity(
     region: EvaluatedRegion,
     parent_area_m2: float,
+    line_length_scale: float,
 ) -> bool:
-    fraction = region.objective.area_m2 / max(1.0, parent_area_m2)
-    min_line_length = max(
-        8.0,
-        0.35 * max(1.0, region.objective.along_track_length_m, region.objective.cross_track_width_m),
-    )
-    return (
-        not region.hard_invalid
-        and fraction >= MIN_CHILD_AREA_FRACTION
-        and region.objective.flight_line_count >= 1
-        and region.objective.mean_line_length_m >= min_line_length
-        and region.objective.convexity >= 0.56
-        and region.objective.compactness <= 8.5
-        and _capture_efficiency(region.objective) >= 0.12
-    )
+    diagnostics = _region_gate_diagnostics(region, parent_area_m2, practical=False, line_length_scale=line_length_scale)
+    return _region_gate_passes(diagnostics, practical=False)
 
 
 def _region_practical(
     region: EvaluatedRegion,
     root_area_m2: float,
+    line_length_scale: float,
 ) -> bool:
-    fraction = region.objective.area_m2 / max(1.0, root_area_m2)
-    min_line_length = max(
-        10.0,
-        0.45 * max(1.0, region.objective.along_track_length_m, region.objective.cross_track_width_m),
-    )
-    return (
-        not region.hard_invalid
-        and fraction >= MIN_CHILD_AREA_FRACTION
-        and region.objective.flight_line_count >= 1
-        and region.objective.mean_line_length_m >= min_line_length
-        and region.objective.convexity >= 0.64
-        and region.objective.compactness <= 6.25
-        and region.objective.overflight_transit_fraction <= 0.55
-        and _capture_efficiency(region.objective) >= 0.22
-    )
+    diagnostics = _region_gate_diagnostics(region, root_area_m2, practical=True, line_length_scale=line_length_scale)
+    return _region_gate_passes(diagnostics, practical=True)
 
 
 def _plan_boundary_alignment(plan: PartitionPlan) -> float:
@@ -330,38 +1002,26 @@ def _plan_boundary_alignment(plan: PartitionPlan) -> float:
     return plan.break_weight_sum / plan.internal_boundary_m
 
 
-def _plan_is_practical(plan: PartitionPlan, root_area_m2: float) -> bool:
-    if plan.region_count <= 1:
-        return False
-    fractions = sorted((region.objective.area_m2 / max(1.0, root_area_m2) for region in plan.regions), reverse=True)
-    if not fractions:
-        return False
-    if 1.0 - fractions[0] < COARSE_NON_LARGEST_FRACTION_MIN:
-        return False
-    if fractions[-1] < MIN_CHILD_AREA_FRACTION:
-        return False
-    if plan.mean_convexity < 0.65:
-        return False
-    if not all(_region_practical(region, root_area_m2) for region in plan.regions):
-        return False
-    if plan.region_count == 2 and plan.largest_region_fraction > 0.88:
-        return False
-    return True
+def _plan_is_practical(plan: PartitionPlan, root_area_m2: float, line_length_scale: float) -> bool:
+    diagnostics = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=line_length_scale)
+    failures, _ = _plan_gate_failure_margins(diagnostics)
+    return not failures
 
 
 def _dominates(
     a: PartitionPlan,
     b: PartitionPlan,
     root_area_m2: float,
+    line_length_scale: float,
     status_cache: dict[tuple[tuple[tuple[int, ...], int], ...], int],
 ) -> bool:
     status_a = status_cache.get(_plan_signature(a))
     if status_a is None:
-        status_a = 2 if a.region_count <= 1 else (1 if _plan_is_practical(a, root_area_m2) else 0)
+        status_a = 2 if a.region_count <= 1 else (1 if _plan_is_practical(a, root_area_m2, line_length_scale) else 0)
         status_cache[_plan_signature(a)] = status_a
     status_b = status_cache.get(_plan_signature(b))
     if status_b is None:
-        status_b = 2 if b.region_count <= 1 else (1 if _plan_is_practical(b, root_area_m2) else 0)
+        status_b = 2 if b.region_count <= 1 else (1 if _plan_is_practical(b, root_area_m2, line_length_scale) else 0)
         status_cache[_plan_signature(b)] = status_b
 
     # Keep "don't split" baselines as first-class options for parent composition.
@@ -384,14 +1044,14 @@ def _dominates(
     return better_or_equal and strictly_better
 
 
-def _thin_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[PartitionPlan]:
+def _thin_frontier(plans: list[PartitionPlan], root_area_m2: float, line_length_scale: float) -> list[PartitionPlan]:
     baseline_bucket: list[PartitionPlan] = []
     practical_buckets: dict[int, list[PartitionPlan]] = defaultdict(list)
     non_practical_buckets: dict[int, list[PartitionPlan]] = defaultdict(list)
     for plan in plans:
         if plan.region_count <= 1:
             baseline_bucket.append(plan)
-        elif _plan_is_practical(plan, root_area_m2):
+        elif _plan_is_practical(plan, root_area_m2, line_length_scale):
             practical_buckets[plan.region_count].append(plan)
         else:
             non_practical_buckets[plan.region_count].append(plan)
@@ -401,15 +1061,36 @@ def _thin_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[Part
         baseline_bucket.sort(key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
         retained.extend(baseline_bucket[:1])
 
+    def append_unique(bucket_retained: list[PartitionPlan], source: list[PartitionPlan], limit: int) -> None:
+        seen = {_plan_signature(plan) for plan in bucket_retained}
+        for plan in source:
+            signature = _plan_signature(plan)
+            if signature in seen:
+                continue
+            bucket_retained.append(plan)
+            seen.add(signature)
+            if len(bucket_retained) >= limit:
+                break
+
     for region_count, bucket in practical_buckets.items():
-        bucket.sort(key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
-        retained.extend(bucket[:4])
+        quality_sorted = sorted(bucket, key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
+        time_sorted = sorted(bucket, key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
+        bucket_retained: list[PartitionPlan] = []
+        append_unique(bucket_retained, quality_sorted[:1], PRACTICAL_FRONTIER_BUCKET_KEEP)
+        append_unique(bucket_retained, time_sorted[:1], PRACTICAL_FRONTIER_BUCKET_KEEP)
+        append_unique(bucket_retained, quality_sorted, PRACTICAL_FRONTIER_BUCKET_KEEP)
+        retained.extend(bucket_retained[:PRACTICAL_FRONTIER_BUCKET_KEEP])
 
     remaining = max(0, MAX_FRONTIER_STATES - len(retained))
     if remaining > 0:
         for region_count, bucket in non_practical_buckets.items():
-            bucket.sort(key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
-            retained.extend(bucket[: min(2, remaining)])
+            quality_sorted = sorted(bucket, key=lambda plan: (plan.quality_cost, plan.mission_time_sec))
+            time_sorted = sorted(bucket, key=lambda plan: (plan.mission_time_sec, plan.quality_cost))
+            bucket_retained: list[PartitionPlan] = []
+            append_unique(bucket_retained, quality_sorted[:1], NON_PRACTICAL_FRONTIER_BUCKET_KEEP)
+            append_unique(bucket_retained, time_sorted[:1], NON_PRACTICAL_FRONTIER_BUCKET_KEEP)
+            append_unique(bucket_retained, quality_sorted, NON_PRACTICAL_FRONTIER_BUCKET_KEEP)
+            retained.extend(bucket_retained[: min(NON_PRACTICAL_FRONTIER_BUCKET_KEEP, remaining)])
             remaining = max(0, MAX_FRONTIER_STATES - len(retained))
             if remaining <= 0:
                 break
@@ -418,7 +1099,7 @@ def _thin_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[Part
     return retained[:MAX_FRONTIER_STATES]
 
 
-def _pareto_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[PartitionPlan]:
+def _pareto_frontier(plans: list[PartitionPlan], root_area_m2: float, line_length_scale: float) -> list[PartitionPlan]:
     unique: dict[tuple[tuple[tuple[int, ...], int], ...], PartitionPlan] = {}
     for plan in plans:
         signature = _plan_signature(plan)
@@ -428,15 +1109,15 @@ def _pareto_frontier(plans: list[PartitionPlan], root_area_m2: float) -> list[Pa
     status_cache: dict[tuple[tuple[tuple[int, ...], int], ...], int] = {}
     nondominated: list[PartitionPlan] = []
     for plan in sorted(unique.values(), key=lambda item: (item.mission_time_sec, item.quality_cost, item.region_count)):
-        if any(_dominates(existing, plan, root_area_m2, status_cache) for existing in nondominated):
+        if any(_dominates(existing, plan, root_area_m2, line_length_scale, status_cache) for existing in nondominated):
             continue
         nondominated = [
             existing
             for existing in nondominated
-            if not _dominates(plan, existing, root_area_m2, status_cache)
+            if not _dominates(plan, existing, root_area_m2, line_length_scale, status_cache)
         ]
         nondominated.append(plan)
-    return _thin_frontier(nondominated, root_area_m2)
+    return _thin_frontier(nondominated, root_area_m2, line_length_scale)
 
 
 def _principal_axis_bearing(cell_ids: tuple[int, ...], cell_lookup: dict[int, GridCell]) -> float | None:
@@ -536,7 +1217,7 @@ def _cut_direction_candidates(
 
     for fallback in (0.0, 30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0):
         add(fallback)
-    return candidates[:10]
+    return candidates[:16]
 
 
 def _boundary_stats_for_split(
@@ -774,6 +1455,7 @@ def _plan_from_regions(
     regions: tuple[EvaluatedRegion, ...],
     internal_boundary_m: float,
     break_weight_sum: float,
+    geometry_tree: PartitionLeafGeometry | PartitionSplitGeometry | None = None,
 ) -> PartitionPlan:
     total_area = sum(region.objective.area_m2 for region in regions)
     quality_terms = []
@@ -795,6 +1477,8 @@ def _plan_from_regions(
     mission_time_sec = sum(region.objective.total_mission_time_sec for region in regions)
     if len(regions) > 1:
         mission_time_sec += INTER_REGION_TRANSITION_SEC * (len(regions) - 1)
+    if geometry_tree is None and len(regions) == 1:
+        geometry_tree = PartitionLeafGeometry(cell_ids=regions[0].cell_ids)
 
     return PartitionPlan(
         regions=tuple(sorted(regions, key=lambda region: region.objective.area_m2, reverse=True)),
@@ -806,14 +1490,21 @@ def _plan_from_regions(
         largest_region_fraction=max((region.objective.area_m2 / max(1.0, total_area) for region in regions), default=1.0),
         mean_convexity=weighted_mean(convexity_terms),
         region_count=len(regions),
+        geometry_tree=geometry_tree,
     )
 
 
-def _combine_plans(left: PartitionPlan, right: PartitionPlan, boundary: BoundaryStats) -> PartitionPlan:
+def _combine_plans(left: PartitionPlan, right: PartitionPlan, boundary: BoundaryStats, split: SplitCandidate) -> PartitionPlan:
     return _plan_from_regions(
         left.regions + right.regions,
         internal_boundary_m=left.internal_boundary_m + right.internal_boundary_m + boundary.shared_boundary_m,
         break_weight_sum=left.break_weight_sum + right.break_weight_sum + boundary.break_weight_sum,
+        geometry_tree=PartitionSplitGeometry(
+            direction_deg=split.direction_deg,
+            threshold=split.threshold,
+            left=left.geometry_tree,
+            right=right.geometry_tree,
+        ),
     )
 
 
@@ -838,7 +1529,7 @@ def _projection_values(
 def _split_cell_ids_by_projection_values(
     projected: list[tuple[int, float, float]],
     quantile: float,
-) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+) -> tuple[tuple[int, ...], tuple[int, ...], float] | None:
     if len(projected) < 4:
         return None
     min_projection = min(value for _, value, _ in projected)
@@ -850,7 +1541,202 @@ def _split_cell_ids_by_projection_values(
     right = tuple(sorted(cell_id for cell_id, value, _ in projected if value > threshold))
     if not left or not right:
         return None
-    return left, right
+    return left, right, threshold
+
+
+def _clip_polygon_by_half_plane(
+    polygon: Polygon,
+    direction_deg: float,
+    threshold: float,
+    *,
+    keep_left: bool,
+) -> Polygon | None:
+    if polygon.is_empty:
+        return None
+    min_x, min_y, max_x, max_y = polygon.bounds
+    span = max(max_x - min_x, max_y - min_y, 1.0) * 4.0 + 1000.0
+    rad = math.radians(direction_deg)
+    nx = math.sin(rad)
+    ny = math.cos(rad)
+    tx = -ny
+    ty = nx
+    centroid = polygon.representative_point()
+    centroid_projection = centroid.x * nx + centroid.y * ny
+    projection_delta = threshold - centroid_projection
+    line_x = centroid.x + nx * projection_delta
+    line_y = centroid.y + ny * projection_delta
+    side_sign = -1.0 if keep_left else 1.0
+    far_x = line_x + nx * span * side_sign
+    far_y = line_y + ny * span * side_sign
+    half_plane = Polygon(
+        [
+            (far_x - tx * span, far_y - ty * span),
+            (far_x + tx * span, far_y + ty * span),
+            (line_x + tx * span, line_y + ty * span),
+            (line_x - tx * span, line_y - ty * span),
+        ]
+    )
+    clipped = polygon.intersection(half_plane)
+    if clipped.is_empty:
+        return None
+    if not clipped.is_valid:
+        clipped = clipped.buffer(0)
+    if clipped.is_empty:
+        return None
+    if clipped.geom_type == "Polygon":
+        return clipped
+    if clipped.geom_type == "MultiPolygon":
+        return max(clipped.geoms, key=lambda geom: geom.area)
+    return None
+
+
+def _reconstruct_plan_polygons_from_tree(
+    polygon: Polygon,
+    node: PartitionLeafGeometry | PartitionSplitGeometry,
+) -> dict[tuple[int, ...], Polygon] | None:
+    if polygon.is_empty:
+        return None
+    if isinstance(node, PartitionLeafGeometry):
+        return {node.cell_ids: polygon}
+
+    left_polygon = _clip_polygon_by_half_plane(
+        polygon,
+        node.direction_deg,
+        node.threshold,
+        keep_left=True,
+    )
+    right_polygon = _clip_polygon_by_half_plane(
+        polygon,
+        node.direction_deg,
+        node.threshold,
+        keep_left=False,
+    )
+    if left_polygon is None or right_polygon is None:
+        return None
+
+    left_mapping = _reconstruct_plan_polygons_from_tree(left_polygon, node.left)
+    right_mapping = _reconstruct_plan_polygons_from_tree(right_polygon, node.right)
+    if left_mapping is None or right_mapping is None:
+        return None
+    return {**left_mapping, **right_mapping}
+
+
+def _reevaluate_region_with_polygon(
+    region: EvaluatedRegion,
+    polygon: Polygon,
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+) -> EvaluatedRegion | None:
+    if polygon.is_empty:
+        return None
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+    if polygon.is_empty or polygon.geom_type != "Polygon":
+        return None
+
+    static_region = caches.region_static_cache.get(region.cell_ids)
+    if static_region is None:
+        baseline_region = _build_region_for_context(
+            region.cell_ids,
+            region.objective.boundary_break_alignment,
+            context,
+            caches,
+            perf,
+        )
+        if baseline_region is None:
+            return None
+        static_region = caches.region_static_cache.get(region.cell_ids)
+        if static_region is None:
+            return None
+
+    candidate_bearings = caches.heading_candidates_cache.get(region.cell_ids)
+    if candidate_bearings is None:
+        candidate_bearings = _region_heading_candidates(
+            region.cell_ids,
+            context.feature_lookup,
+            context.cell_lookup,
+            context.feature_field,
+        )
+        caches.heading_candidates_cache[region.cell_ids] = candidate_bearings
+
+    ordered_bearings = [region.objective.bearing_deg]
+    ordered_bearings.extend(
+        bearing
+        for bearing in candidate_bearings
+        if axial_angle_delta_deg(bearing, region.objective.bearing_deg) > 1e-6
+    )
+
+    area_m2 = float(polygon.area)
+    convexity = polygon_convexity(polygon)
+    compactness = polygon_compactness(polygon)
+    ring = polygon_to_lnglat_ring(polygon)
+    best_objective: RegionObjective | None = None
+    best_score = float("inf")
+    boundary_alignment = region.objective.boundary_break_alignment
+    for bearing_deg in ordered_bearings:
+        perf["exact_region_objective_calls"] += 1
+        objective_started_at = time.perf_counter()
+        objective = evaluate_region_objective(
+            static_region.cells,
+            context.feature_lookup,
+            bearing_deg,
+            context.params,
+            polygon,
+            boundary_alignment,
+            perf=perf,
+            precomputed_area_m2=area_m2,
+            precomputed_convexity=convexity,
+            precomputed_compactness=compactness,
+            precomputed_static_inputs=static_region.static_inputs,
+        )
+        perf["exact_region_objective_ms"] += (time.perf_counter() - objective_started_at) * 1000.0
+        score = _region_score(objective)
+        if score < best_score:
+            best_score = score
+            best_objective = objective
+
+    if best_objective is None:
+        return None
+
+    return EvaluatedRegion(
+        cell_ids=region.cell_ids,
+        polygon=polygon,
+        ring=ring,
+        objective=best_objective,
+        score=best_score,
+        hard_invalid=False,
+    )
+
+
+def _reevaluate_plan_with_exact_geometry(
+    plan: PartitionPlan,
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+) -> PartitionPlan | None:
+    if plan.geometry_tree is None:
+        return plan
+    reconstructed = _reconstruct_plan_polygons_from_tree(context.grid.polygon_mercator, plan.geometry_tree)
+    if reconstructed is None:
+        return None
+
+    exact_regions: list[EvaluatedRegion] = []
+    for region in plan.regions:
+        polygon = reconstructed.get(region.cell_ids)
+        if polygon is None or polygon.is_empty:
+            return None
+        exact_region = _reevaluate_region_with_polygon(region, polygon, context, caches, perf)
+        if exact_region is None:
+            return None
+        exact_regions.append(exact_region)
+
+    return _plan_from_regions(
+        tuple(exact_regions),
+        internal_boundary_m=plan.internal_boundary_m,
+        break_weight_sum=plan.break_weight_sum,
+        geometry_tree=plan.geometry_tree,
+    )
 
 
 def _generate_split_candidates(
@@ -870,6 +1756,9 @@ def _generate_split_candidates(
     region_bearing_core_cache: dict[tuple[tuple[int, ...], int], RegionBearingCore],
     heading_candidates_cache: dict[tuple[int, ...], list[float]],
     polygon_cache: dict[tuple[int, ...], Polygon | None],
+    basic_rejection_summary: dict[str, Any],
+    basic_split_rejection_summary: dict[str, Any],
+    line_length_scale: float,
     perf: dict[str, float],
 ) -> list[SplitCandidate]:
     parent_area = max(1.0, baseline_region.objective.area_m2)
@@ -885,7 +1774,7 @@ def _generate_split_candidates(
             if split is None:
                 perf["split_projection_failures"] += 1
                 continue
-            left_ids, right_ids = split
+            left_ids, right_ids, threshold = split
             left_area = sum(cell_lookup[cell_id].area_m2 for cell_id in left_ids)
             right_area = sum(cell_lookup[cell_id].area_m2 for cell_id in right_ids)
             left_fraction = left_area / parent_area
@@ -948,14 +1837,37 @@ def _generate_split_candidates(
             if left_region is None or right_region is None:
                 perf["split_region_build_rejections"] += 1
                 continue
-            if not _region_basic_validity(left_region, parent_area) or not _region_basic_validity(right_region, parent_area):
+            left_basic_diag = _region_gate_diagnostics(left_region, parent_area, practical=False, line_length_scale=line_length_scale)
+            right_basic_diag = _region_gate_diagnostics(right_region, parent_area, practical=False, line_length_scale=line_length_scale)
+            left_basic_failures = _region_gate_failure_margins(left_basic_diag, practical=False)
+            right_basic_failures = _region_gate_failure_margins(right_basic_diag, practical=False)
+            if left_basic_failures or right_basic_failures:
                 perf["split_basic_validity_rejections"] += 1
+                if left_basic_failures:
+                    _record_region_failure_summary(basic_rejection_summary, left_region, left_basic_diag, left_basic_failures)
+                if right_basic_failures:
+                    _record_region_failure_summary(basic_rejection_summary, right_region, right_basic_diag, right_basic_failures)
+                _record_split_failure_summary(
+                    basic_split_rejection_summary,
+                    direction_deg=direction_deg,
+                    threshold=threshold,
+                    boundary=boundary,
+                    left_diagnostics=left_basic_diag,
+                    left_failures=left_basic_failures,
+                    right_diagnostics=right_basic_diag,
+                    right_failures=right_basic_failures,
+                )
                 continue
             immediate_plan = _plan_from_regions((left_region, right_region), boundary.shared_boundary_m, boundary.break_weight_sum)
             quality_gain = baseline_plan.quality_cost - immediate_plan.quality_cost
             time_delta = immediate_plan.mission_time_sec - baseline_plan.mission_time_sec
-            rank_score = quality_gain - max(0.0, time_delta) / 7_500.0 + boundary_alignment / 28.0 - abs(left_fraction - right_fraction) * 0.2
-            if quality_gain <= 0.0 and rank_score <= 0.05:
+            rank_score = (
+                quality_gain
+                - max(0.0, time_delta) / SPLIT_RANK_TIME_DIVISOR_SEC
+                + boundary_alignment / 28.0
+                - abs(left_fraction - right_fraction) * 0.2
+            )
+            if quality_gain <= -SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION and rank_score <= SPLIT_NON_IMPROVING_MIN_RANK_SCORE:
                 perf["split_non_improving_rejections"] += 1
                 continue
             candidates.append(
@@ -963,6 +1875,8 @@ def _generate_split_candidates(
                     left_ids=left_ids,
                     right_ids=right_ids,
                     boundary=boundary,
+                    direction_deg=direction_deg,
+                    threshold=threshold,
                     rank_score=rank_score,
                 )
             )
@@ -1023,8 +1937,134 @@ def _generate_split_candidates_for_context(
         caches.region_bearing_core_cache,
         caches.heading_candidates_cache,
         caches.polygon_cache,
+        caches.basic_rejection_summary,
+        caches.basic_split_rejection_summary,
+        context.basic_line_length_scale,
         perf,
     )
+
+
+def _generate_relaxed_root_fallback_candidates(
+    baseline_region: EvaluatedRegion,
+    baseline_plan: PartitionPlan,
+    root_cell_ids: tuple[int, ...],
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+) -> list[RelaxedFallbackCandidate]:
+    parent_area = max(1.0, baseline_region.objective.area_m2)
+    seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+    retained: dict[tuple[tuple[tuple[int, ...], int], ...], RelaxedFallbackCandidate] = {}
+    directions = _cut_direction_candidates(
+        baseline_region,
+        root_cell_ids,
+        context.feature_lookup,
+        context.cell_lookup,
+        context.feature_field,
+    )
+    for direction_deg in directions:
+        projected = _projection_values(root_cell_ids, context.cell_lookup, direction_deg)
+        for quantile in SPLIT_QUANTILES:
+            split = _split_cell_ids_by_projection_values(projected, quantile)
+            if split is None:
+                continue
+            left_ids, right_ids, threshold = split
+            left_area = sum(context.cell_lookup[cell_id].area_m2 for cell_id in left_ids)
+            right_area = sum(context.cell_lookup[cell_id].area_m2 for cell_id in right_ids)
+            if min(left_area, right_area) / parent_area < MIN_CHILD_AREA_FRACTION:
+                continue
+            signature = (left_ids, right_ids) if left_ids < right_ids else (right_ids, left_ids)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            if len(_connected_components_for_subset(left_ids, context.neighbors)) != 1:
+                continue
+            if len(_connected_components_for_subset(right_ids, context.neighbors)) != 1:
+                continue
+            boundary = _boundary_stats_for_split(set(left_ids), set(right_ids), context.grid, context.feature_lookup)
+            if boundary.shared_boundary_m <= context.grid.grid_step_m * 0.8:
+                continue
+            boundary_alignment = _boundary_alignment(boundary)
+            left_region = _build_region_for_context(left_ids, boundary_alignment, context, caches, perf)
+            right_region = _build_region_for_context(right_ids, boundary_alignment, context, caches, perf)
+            if left_region is None or right_region is None:
+                continue
+
+            split_candidate = SplitCandidate(
+                left_ids=left_ids,
+                right_ids=right_ids,
+                boundary=boundary,
+                direction_deg=direction_deg,
+                threshold=threshold,
+                rank_score=0.0,
+            )
+            left_plan = _plan_from_regions((left_region,), 0.0, 0.0)
+            right_plan = _plan_from_regions((right_region,), 0.0, 0.0)
+            candidate_plan = _combine_plans(left_plan, right_plan, boundary, split_candidate)
+            exact_plan = _reevaluate_plan_with_exact_geometry(candidate_plan, context, caches, perf)
+            if exact_plan is None or exact_plan.region_count <= 1:
+                continue
+            quality_gain = baseline_plan.quality_cost - exact_plan.quality_cost
+            if quality_gain <= DOMINANCE_EPS:
+                continue
+
+            soft_values: list[float] = []
+            hard_rejected = False
+            for region in exact_plan.regions:
+                diagnostics = _region_gate_diagnostics(
+                    region,
+                    context.root_area_m2,
+                    practical=False,
+                    line_length_scale=context.basic_line_length_scale,
+                )
+                hard_failures, soft_failures = _relaxed_region_failure_sets(diagnostics, practical=False)
+                if hard_failures:
+                    hard_rejected = True
+                    break
+                soft_values.extend(float(margin) for margin in soft_failures.values())
+            if hard_rejected:
+                continue
+
+            plan_soft_values = _relaxed_plan_soft_failure_values(
+                exact_plan,
+                context.root_area_m2,
+                line_length_scale=context.practical_line_length_scale,
+            )
+            if any(math.isinf(value) for value in plan_soft_values):
+                continue
+            soft_values.extend(plan_soft_values)
+            soft_total_margin = float(sum(soft_values))
+            soft_max_margin = float(max(soft_values, default=0.0))
+            fallback_score = _score_relaxed_fallback_candidate(
+                exact_plan,
+                baseline_plan,
+                soft_total_margin=soft_total_margin,
+                soft_max_margin=soft_max_margin,
+            )
+            plan_signature = _plan_signature(exact_plan)
+            existing = retained.get(plan_signature)
+            candidate = RelaxedFallbackCandidate(
+                plan=exact_plan,
+                direction_deg=direction_deg,
+                threshold=threshold,
+                soft_total_margin=soft_total_margin,
+                soft_max_margin=soft_max_margin,
+                fallback_score=fallback_score,
+            )
+            if existing is None or candidate.fallback_score < existing.fallback_score - DOMINANCE_EPS:
+                retained[plan_signature] = candidate
+
+    candidates = sorted(
+        retained.values(),
+        key=lambda candidate: (
+            candidate.fallback_score,
+            candidate.soft_total_margin,
+            candidate.soft_max_margin,
+            candidate.plan.quality_cost,
+            candidate.plan.mission_time_sec,
+        ),
+    )
+    return candidates[:MAX_RELAXED_FALLBACK_CANDIDATES]
 
 
 def _solve_region_recursive(
@@ -1033,6 +2073,8 @@ def _solve_region_recursive(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    *,
+    allow_nested_lambda_fanout: bool = False,
 ) -> list[PartitionPlan]:
     perf["solve_region_calls"] += 1
     key = (cell_ids, depth)
@@ -1054,29 +2096,90 @@ def _solve_region_recursive(
 
     candidates = [baseline_plan]
     split_gen_started_at = time.perf_counter()
-    for split in _generate_split_candidates_for_context(
+    split_candidates = _generate_split_candidates_for_context(
         baseline_region,
         baseline_plan,
         cell_ids,
         context,
         caches,
         perf,
-    ):
-        left_frontier = _solve_region_recursive(split.left_ids, depth - 1, context, caches, perf) or []
-        right_frontier = _solve_region_recursive(split.right_ids, depth - 1, context, caches, perf) or []
-        if not left_frontier or not right_frontier:
-            continue
-        for left_plan in left_frontier:
-            for right_plan in right_frontier:
-                combined = _combine_plans(left_plan, right_plan, split.boundary)
-                if combined.region_count > MAX_REGIONS:
-                    perf["combine_region_limit_rejections"] += 1
+    )
+    if allow_nested_lambda_fanout and _should_use_nested_lambda_fanout(cell_ids, depth, split_candidates):
+        try:
+            candidates.extend(
+                _solve_split_candidates_via_nested_lambda(
+                    split_candidates,
+                    depth,
+                    context,
+                    perf,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            perf["nested_parallel_failures"] += 1
+            logger.warning(
+                "[terrain-split-backend] nested lambda fan-out failed cells=%d depth=%d; falling back to serial",
+                len(cell_ids),
+                depth,
+                exc_info=exc,
+            )
+            for split in split_candidates:
+                left_frontier = _solve_region_recursive(
+                    split.left_ids,
+                    depth - 1,
+                    context,
+                    caches,
+                    perf,
+                    allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+                ) or []
+                right_frontier = _solve_region_recursive(
+                    split.right_ids,
+                    depth - 1,
+                    context,
+                    caches,
+                    perf,
+                    allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+                ) or []
+                if not left_frontier or not right_frontier:
                     continue
-                candidates.append(combined)
-                perf["combined_plan_candidates"] += 1
+                for left_plan in left_frontier:
+                    for right_plan in right_frontier:
+                        combined = _combine_plans(left_plan, right_plan, split.boundary, split)
+                        if combined.region_count > MAX_REGIONS:
+                            perf["combine_region_limit_rejections"] += 1
+                            continue
+                        candidates.append(combined)
+                        perf["combined_plan_candidates"] += 1
+    else:
+        for split in split_candidates:
+            left_frontier = _solve_region_recursive(
+                split.left_ids,
+                depth - 1,
+                context,
+                caches,
+                perf,
+                allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+            ) or []
+            right_frontier = _solve_region_recursive(
+                split.right_ids,
+                depth - 1,
+                context,
+                caches,
+                perf,
+                allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+            ) or []
+            if not left_frontier or not right_frontier:
+                continue
+            for left_plan in left_frontier:
+                for right_plan in right_frontier:
+                    combined = _combine_plans(left_plan, right_plan, split.boundary, split)
+                    if combined.region_count > MAX_REGIONS:
+                        perf["combine_region_limit_rejections"] += 1
+                        continue
+                    candidates.append(combined)
+                    perf["combined_plan_candidates"] += 1
     perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
 
-    frontier = _pareto_frontier(candidates, context.root_area_m2)
+    frontier = _pareto_frontier(candidates, context.root_area_m2, context.practical_line_length_scale)
     perf["frontier_plan_count"] += len(frontier)
     caches.frontier_cache[key] = frontier
     return frontier
@@ -1095,20 +2198,46 @@ def _solve_root_split_branch_with_context(
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
     caches = _make_solver_caches()
     perf = _make_perf()
-    left_frontier = _solve_region_recursive(task.left_ids, task.depth, context, caches, perf) or []
-    right_frontier = _solve_region_recursive(task.right_ids, task.depth, context, caches, perf) or []
+    left_frontier = _solve_region_recursive(
+        task.left_ids,
+        task.depth,
+        context,
+        caches,
+        perf,
+        allow_nested_lambda_fanout=True,
+    ) or []
+    right_frontier = _solve_region_recursive(
+        task.right_ids,
+        task.depth,
+        context,
+        caches,
+        perf,
+        allow_nested_lambda_fanout=True,
+    ) or []
     if not left_frontier or not right_frontier:
         return [], dict(perf)
     combined_candidates: list[PartitionPlan] = []
     for left_plan in left_frontier:
         for right_plan in right_frontier:
-            combined = _combine_plans(left_plan, right_plan, task.boundary)
+            combined = _combine_plans(
+                left_plan,
+                right_plan,
+                task.boundary,
+                SplitCandidate(
+                    left_ids=task.left_ids,
+                    right_ids=task.right_ids,
+                    boundary=task.boundary,
+                    direction_deg=task.direction_deg,
+                    threshold=task.threshold,
+                    rank_score=0.0,
+                ),
+            )
             if combined.region_count > MAX_REGIONS:
                 perf["combine_region_limit_rejections"] += 1
                 continue
             combined_candidates.append(combined)
             perf["combined_plan_candidates"] += 1
-    branch_frontier = _pareto_frontier(combined_candidates, context.root_area_m2)
+    branch_frontier = _pareto_frontier(combined_candidates, context.root_area_m2, context.practical_line_length_scale)
     perf["frontier_plan_count"] += len(branch_frontier)
     return branch_frontier, dict(perf)
 
@@ -1125,7 +2254,14 @@ def _solve_subtree_task_with_context(
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
     caches = _make_solver_caches()
     perf = _make_perf()
-    frontier = _solve_region_recursive(task.cell_ids, task.depth, context, caches, perf) or []
+    frontier = _solve_region_recursive(
+        task.cell_ids,
+        task.depth,
+        context,
+        caches,
+        perf,
+        allow_nested_lambda_fanout=True,
+    ) or []
     return frontier, dict(perf)
 
 
@@ -1238,6 +2374,8 @@ def _serialize_solver_context(context: SolverContext) -> dict[str, Any]:
         "grid": _serialize_grid(context.grid),
         "featureField": _serialize_feature_field(context.feature_field),
         "params": context.params.model_dump(mode="json"),
+        "basicLineLengthScale": context.basic_line_length_scale,
+        "practicalLineLengthScale": context.practical_line_length_scale,
     }
 
 
@@ -1252,6 +2390,8 @@ def _deserialize_solver_context(payload: dict[str, Any]) -> SolverContext:
         feature_lookup=_feature_lookup(feature_field),
         cell_lookup=_cell_lookup(grid),
         neighbors=_neighbor_lookup(grid),
+        basic_line_length_scale=float(payload.get("basicLineLengthScale", DEFAULT_BASIC_LINE_LENGTH_SCALE)),
+        practical_line_length_scale=float(payload.get("practicalLineLengthScale", DEFAULT_PRACTICAL_LINE_LENGTH_SCALE)),
     )
 
 
@@ -1274,6 +2414,8 @@ def _serialize_root_split_task(task: RootSplitTask) -> dict[str, Any]:
         "leftIds": list(task.left_ids),
         "rightIds": list(task.right_ids),
         "boundary": _serialize_boundary(task.boundary),
+        "directionDeg": task.direction_deg,
+        "threshold": task.threshold,
         "depth": task.depth,
     }
 
@@ -1283,6 +2425,8 @@ def _deserialize_root_split_task(payload: dict[str, Any]) -> RootSplitTask:
         left_ids=tuple(payload["leftIds"]),
         right_ids=tuple(payload["rightIds"]),
         boundary=_deserialize_boundary(payload["boundary"]),
+        direction_deg=payload.get("directionDeg", 0.0),
+        threshold=payload.get("threshold", 0.0),
         depth=payload["depth"],
     )
 
@@ -1365,6 +2509,32 @@ def _serialize_evaluated_region(region: EvaluatedRegion) -> dict[str, Any]:
     }
 
 
+def _serialize_geometry_tree(node: PartitionLeafGeometry | PartitionSplitGeometry) -> dict[str, Any]:
+    if isinstance(node, PartitionLeafGeometry):
+        return {
+            "type": "leaf",
+            "cellIds": list(node.cell_ids),
+        }
+    return {
+        "type": "split",
+        "directionDeg": node.direction_deg,
+        "threshold": node.threshold,
+        "left": _serialize_geometry_tree(node.left),
+        "right": _serialize_geometry_tree(node.right),
+    }
+
+
+def _deserialize_geometry_tree(payload: dict[str, Any]) -> PartitionLeafGeometry | PartitionSplitGeometry:
+    if payload["type"] == "leaf":
+        return PartitionLeafGeometry(cell_ids=tuple(payload["cellIds"]))
+    return PartitionSplitGeometry(
+        direction_deg=payload["directionDeg"],
+        threshold=payload["threshold"],
+        left=_deserialize_geometry_tree(payload["left"]),
+        right=_deserialize_geometry_tree(payload["right"]),
+    )
+
+
 def _deserialize_evaluated_region(payload: dict[str, Any]) -> EvaluatedRegion:
     ring = [tuple(coord) for coord in payload["ring"]]
     return EvaluatedRegion(
@@ -1388,6 +2558,7 @@ def _serialize_partition_plan(plan: PartitionPlan) -> dict[str, Any]:
         "largestRegionFraction": plan.largest_region_fraction,
         "meanConvexity": plan.mean_convexity,
         "regionCount": plan.region_count,
+        "geometryTree": _serialize_geometry_tree(plan.geometry_tree) if plan.geometry_tree is not None else None,
     }
 
 
@@ -1402,6 +2573,7 @@ def _deserialize_partition_plan(payload: dict[str, Any]) -> PartitionPlan:
         largest_region_fraction=payload["largestRegionFraction"],
         mean_convexity=payload["meanConvexity"],
         region_count=payload["regionCount"],
+        geometry_tree=_deserialize_geometry_tree(payload["geometryTree"]) if payload.get("geometryTree") is not None else None,
     )
 
 
@@ -1425,21 +2597,44 @@ def solve_subtree_task_event(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _invoke_root_split_branch_lambda(
-    function_name: str,
-    context: SolverContext,
-    task: RootSplitTask,
-) -> tuple[list[PartitionPlan], dict[str, float]]:
+def _lambda_client(max_pool_connections: int, read_timeout_sec: int) -> Any:
+    global _LAMBDA_CLIENT, _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS, _LAMBDA_CLIENT_READ_TIMEOUT_SEC
+    required_pool_connections = max(8, int(max_pool_connections))
+    required_read_timeout_sec = max(1, int(read_timeout_sec))
+    if (
+        _LAMBDA_CLIENT is not None
+        and _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS >= required_pool_connections
+        and _LAMBDA_CLIENT_READ_TIMEOUT_SEC == required_read_timeout_sec
+    ):
+        return _LAMBDA_CLIENT
     try:
         import boto3
+        from botocore.config import Config
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("boto3 is required for Lambda root fan-out mode.") from exc
 
-    client = boto3.client("lambda")
+    _LAMBDA_CLIENT = boto3.client(
+        "lambda",
+        config=Config(
+            max_pool_connections=required_pool_connections,
+            read_timeout=required_read_timeout_sec,
+        ),
+    )
+    _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS = required_pool_connections
+    _LAMBDA_CLIENT_READ_TIMEOUT_SEC = required_read_timeout_sec
+    return _LAMBDA_CLIENT
+
+
+def _invoke_root_split_branch_lambda(
+    function_name: str,
+    serialized_context: dict[str, Any],
+    task: RootSplitTask,
+    client: Any,
+) -> tuple[list[PartitionPlan], dict[str, float]]:
     payload = {
         "terrainSplitterInternal": "root-split",
         "payload": {
-            "context": _serialize_solver_context(context),
+            "context": serialized_context,
             "task": _serialize_root_split_task(task),
         },
     }
@@ -1461,19 +2656,14 @@ def _invoke_root_split_branch_lambda(
 
 def _invoke_subtree_lambda(
     function_name: str,
-    context: SolverContext,
+    serialized_context: dict[str, Any],
     task: SubtreeSolveTask,
+    client: Any,
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
-    try:
-        import boto3
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("boto3 is required for Lambda subtree fan-out mode.") from exc
-
-    client = boto3.client("lambda")
     payload = {
         "terrainSplitterInternal": "subtree",
         "payload": {
-            "context": _serialize_solver_context(context),
+            "context": serialized_context,
             "task": _serialize_subtree_task(task),
         },
     }
@@ -1503,9 +2693,12 @@ def _solve_root_splits_via_lambda(
         raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME is required for Lambda root fan-out mode.")
     perf = _make_perf()
     plans: list[PartitionPlan] = []
+    serialized_context = _serialize_solver_context(context)
+    read_timeout_sec = _resolve_lambda_invoke_read_timeout_sec(None)
+    client = _lambda_client(max_workers, read_timeout_sec)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(_invoke_root_split_branch_lambda, function_name, context, task)
+            executor.submit(_invoke_root_split_branch_lambda, function_name, serialized_context, task, client)
             for task in tasks
         ]
         for future in futures:
@@ -1525,9 +2718,12 @@ def _solve_subtrees_via_lambda(
         raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME is required for Lambda subtree fan-out mode.")
     perf = _make_perf()
     subtree_results: dict[int, dict[str, list[PartitionPlan]]] = defaultdict(dict)
+    serialized_context = _serialize_solver_context(context)
+    read_timeout_sec = _resolve_lambda_invoke_read_timeout_sec(None)
+    client = _lambda_client(max_workers, read_timeout_sec)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            (index, side, executor.submit(_invoke_subtree_lambda, function_name, context, task))
+            (index, side, executor.submit(_invoke_subtree_lambda, function_name, serialized_context, task, client))
             for index, side, task in tasks
         ]
         for index, side, future in futures:
@@ -1535,6 +2731,77 @@ def _solve_subtrees_via_lambda(
             subtree_results[index][side] = frontier
             _merge_perf(perf, subtree_perf)
     return subtree_results, perf
+
+
+def _should_use_nested_lambda_fanout(
+    cell_ids: tuple[int, ...],
+    depth: int,
+    split_candidates: list[SplitCandidate],
+) -> bool:
+    if depth < DEFAULT_NESTED_LAMBDA_MIN_DEPTH:
+        return False
+    if len(cell_ids) < _resolve_nested_lambda_min_cells(None):
+        return False
+    if len(split_candidates) < 2:
+        return False
+    if _resolve_root_parallel_mode(None) != "lambda":
+        return False
+    if _resolve_root_parallel_granularity(None) != "subtree":
+        return False
+    if _resolve_root_parallel_workers(None) <= 1:
+        return False
+    if _resolve_nested_lambda_max_inflight(None) <= 1:
+        return False
+    if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return False
+    return True
+
+
+def _solve_split_candidates_via_nested_lambda(
+    split_candidates: list[SplitCandidate],
+    depth: int,
+    context: SolverContext,
+    perf: dict[str, float],
+) -> list[PartitionPlan]:
+    subtree_tasks: list[tuple[int, str, SubtreeSolveTask]] = []
+    for index, split in enumerate(split_candidates):
+        subtree_tasks.append((index, "left", SubtreeSolveTask(cell_ids=split.left_ids, depth=depth - 1)))
+        subtree_tasks.append((index, "right", SubtreeSolveTask(cell_ids=split.right_ids, depth=depth - 1)))
+    requested_workers = _resolve_root_parallel_workers(None)
+    nested_max_inflight = _resolve_nested_lambda_max_inflight(None)
+    subtree_workers = _resolve_lambda_parallel_invocations(
+        len(subtree_tasks),
+        min(max(requested_workers, len(split_candidates)), len(subtree_tasks)),
+        nested_max_inflight,
+    )
+    perf["nested_parallel_invocations"] += 1
+    perf["nested_parallel_split_count"] += len(split_candidates)
+    perf["nested_parallel_subtree_tasks"] += len(subtree_tasks)
+    perf["nested_parallel_workers_used_max"] = max(perf["nested_parallel_workers_used_max"], subtree_workers)
+    nested_started_at = time.perf_counter()
+    subtree_results, lambda_perf = _solve_subtrees_via_lambda(
+        subtree_tasks,
+        context,
+        subtree_workers,
+    )
+    perf["nested_parallel_ms"] += (time.perf_counter() - nested_started_at) * 1000.0
+    _merge_perf(perf, lambda_perf)
+
+    candidates: list[PartitionPlan] = []
+    for index, split in enumerate(split_candidates):
+        left_frontier = subtree_results.get(index, {}).get("left", [])
+        right_frontier = subtree_results.get(index, {}).get("right", [])
+        if not left_frontier or not right_frontier:
+            continue
+        for left_plan in left_frontier:
+            for right_plan in right_frontier:
+                combined = _combine_plans(left_plan, right_plan, split.boundary, split)
+                if combined.region_count > MAX_REGIONS:
+                    perf["combine_region_limit_rejections"] += 1
+                    continue
+                candidates.append(combined)
+                perf["combined_plan_candidates"] += 1
+    return candidates
 
 
 def solve_partition_hierarchy(
@@ -1548,7 +2815,15 @@ def solve_partition_hierarchy(
     root_parallel_workers: int | None = None,
     root_parallel_mode: Literal["process", "lambda"] | None = None,
     root_parallel_granularity: Literal["branch", "subtree"] | None = None,
+    root_parallel_max_inflight: int | None = None,
+    line_length_scale: float | None = None,
+    debug_output: dict[str, Any] | None = None,
 ) -> list[PartitionSolutionPreviewModel]:
+    practical_line_length_scale = (
+        DEFAULT_PRACTICAL_LINE_LENGTH_SCALE if line_length_scale is None else float(line_length_scale)
+    )
+    basic_line_length_scale = DEFAULT_BASIC_LINE_LENGTH_SCALE
+
     solve_started_at = time.perf_counter()
     if not grid.cells:
         return []
@@ -1567,6 +2842,8 @@ def solve_partition_hierarchy(
         feature_lookup=feature_lookup,
         cell_lookup=cell_lookup,
         neighbors=neighbors,
+        basic_line_length_scale=basic_line_length_scale,
+        practical_line_length_scale=practical_line_length_scale,
     )
     max_depth = DEFAULT_DEPTH_SMALL if len(grid.cells) <= 140 else DEFAULT_DEPTH_LARGE
 
@@ -1574,6 +2851,7 @@ def solve_partition_hierarchy(
     requested_workers = _resolve_root_parallel_workers(root_parallel_workers)
     parallel_mode = _resolve_root_parallel_mode(root_parallel_mode)
     parallel_granularity = _resolve_root_parallel_granularity(root_parallel_granularity)
+    lambda_max_inflight = _resolve_root_parallel_max_inflight(root_parallel_max_inflight)
     all_plans: list[PartitionPlan]
     if requested_workers <= 1:
         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
@@ -1602,6 +2880,8 @@ def solve_partition_hierarchy(
                     perf["root_parallel_requested_workers"] = requested_workers
                     perf["root_parallel_workers_used"] = usable_workers
                     perf["root_parallel_split_count"] = len(root_splits)
+                    if lambda_max_inflight is not None:
+                        perf["root_parallel_max_inflight"] = lambda_max_inflight
                     branch_started_at = time.perf_counter()
                     branch_candidates: list[PartitionPlan] = []
                     tasks = [
@@ -1609,6 +2889,8 @@ def solve_partition_hierarchy(
                             left_ids=split.left_ids,
                             right_ids=split.right_ids,
                             boundary=split.boundary,
+                            direction_deg=split.direction_deg,
+                            threshold=split.threshold,
                             depth=max_depth - 1,
                         )
                         for split in root_splits
@@ -1620,7 +2902,11 @@ def solve_partition_hierarchy(
                                 for index, split in enumerate(root_splits):
                                     subtree_tasks.append((index, "left", SubtreeSolveTask(cell_ids=split.left_ids, depth=max_depth - 1)))
                                     subtree_tasks.append((index, "right", SubtreeSolveTask(cell_ids=split.right_ids, depth=max_depth - 1)))
-                                subtree_workers = min(max(requested_workers, len(tasks)), len(subtree_tasks))
+                                subtree_workers = _resolve_lambda_parallel_invocations(
+                                    len(subtree_tasks),
+                                    min(max(requested_workers, len(tasks)), len(subtree_tasks)),
+                                    lambda_max_inflight,
+                                )
                                 perf["root_parallel_subtree_tasks"] = len(subtree_tasks)
                                 perf["root_parallel_workers_used"] = subtree_workers
                                 subtree_results, lambda_perf = _solve_subtrees_via_lambda(
@@ -1636,14 +2922,20 @@ def solve_partition_hierarchy(
                                         continue
                                     for left_plan in left_frontier:
                                         for right_plan in right_frontier:
-                                            combined = _combine_plans(left_plan, right_plan, split.boundary)
+                                            combined = _combine_plans(left_plan, right_plan, split.boundary, split)
                                             if combined.region_count > MAX_REGIONS:
                                                 perf["combine_region_limit_rejections"] += 1
                                                 continue
                                             branch_candidates.append(combined)
                                             perf["combined_plan_candidates"] += 1
                             else:
-                                lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, usable_workers)
+                                branch_workers = _resolve_lambda_parallel_invocations(
+                                    len(tasks),
+                                    usable_workers,
+                                    lambda_max_inflight,
+                                )
+                                perf["root_parallel_workers_used"] = branch_workers
+                                lambda_plans, lambda_perf = _solve_root_splits_via_lambda(tasks, context, branch_workers)
                                 branch_candidates.extend(lambda_plans)
                                 _merge_perf(perf, lambda_perf)
                         else:
@@ -1675,7 +2967,7 @@ def solve_partition_hierarchy(
                                         continue
                                     for left_plan in left_frontier:
                                         for right_plan in right_frontier:
-                                            combined = _combine_plans(left_plan, right_plan, split.boundary)
+                                            combined = _combine_plans(left_plan, right_plan, split.boundary, split)
                                             if combined.region_count > MAX_REGIONS:
                                                 perf["combine_region_limit_rejections"] += 1
                                                 continue
@@ -1702,7 +2994,11 @@ def solve_partition_hierarchy(
                         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
                     else:
                         perf["root_parallel_ms"] += (time.perf_counter() - branch_started_at) * 1000.0
-                        all_plans = _pareto_frontier([baseline_plan] + branch_candidates, root_area_m2)
+                        all_plans = _pareto_frontier(
+                            [baseline_plan] + branch_candidates,
+                            root_area_m2,
+                            practical_line_length_scale,
+                        )
                         perf["frontier_plan_count"] += len(all_plans)
     if not all_plans:
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
@@ -1731,6 +3027,24 @@ def solve_partition_hierarchy(
             int(perf["split_attempts"]),
             int(perf["split_candidates_kept"]),
         )
+        _populate_solver_debug_output(
+            debug_output,
+            request_id=request_id,
+            polygon_id=polygon_id,
+            grid=grid,
+            requested_tradeoff=requested_tradeoff,
+            max_depth=max_depth,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            caches=caches,
+            perf=perf,
+            all_plans=[],
+            practical_plans=[],
+            returned_plans=[],
+            returned_previews=[],
+            practical_plan_rejection_summary={},
+            practical_region_rejection_summary={},
+        )
         return []
 
     baseline = min(
@@ -1738,11 +3052,159 @@ def solve_partition_hierarchy(
         key=lambda plan: (plan.quality_cost, plan.mission_time_sec),
         default=None,
     )
-    practical = [plan for plan in all_plans if _plan_is_practical(plan, root_area_m2)]
+    exact_all_plans: list[PartitionPlan] = []
+    for plan in all_plans:
+        exact_plan = _reevaluate_plan_with_exact_geometry(plan, context, caches, perf)
+        if exact_plan is not None:
+            exact_all_plans.append(exact_plan)
+    if exact_all_plans:
+        all_plans = _pareto_frontier(exact_all_plans, root_area_m2, practical_line_length_scale)
+        baseline = min(
+            (plan for plan in all_plans if plan.region_count == 1),
+            key=lambda plan: (plan.quality_cost, plan.mission_time_sec),
+            default=None,
+        )
+
+    practical_plan_rejection_summary: dict[str, Any] = {}
+    practical_region_rejection_summary: dict[str, Any] = {}
+    for plan in all_plans:
+        if plan.region_count <= 1:
+            continue
+        plan_diag = _plan_gate_diagnostics(plan, root_area_m2, line_length_scale=practical_line_length_scale)
+        plan_failures, region_failures = _plan_gate_failure_margins(plan_diag)
+        if plan_failures:
+            _record_plan_failure_summary(
+                practical_plan_rejection_summary,
+                practical_region_rejection_summary,
+                plan,
+                plan_diag,
+                plan_failures,
+                region_failures,
+            )
+    practical = [plan for plan in all_plans if _plan_is_practical(plan, root_area_m2, practical_line_length_scale)]
     if not practical:
+        relaxed_fallback: list[RelaxedFallbackCandidate] = []
+        if baseline is not None:
+            relaxed_fallback = _generate_relaxed_root_fallback_candidates(
+                baseline.regions[0],
+                baseline,
+                root_cell_ids,
+                context,
+                caches,
+                perf,
+            )
+        if relaxed_fallback:
+            logger.info(
+                "[terrain-split-backend][%s] relaxed fallback accepted polygonId=%s lineLengthScale=%.2f candidateCount=%d bestScore=%.4f bestSoftTotal=%.4f bestSoftMax=%.4f bestDirectionDeg=%.4f bestThreshold=%.4f",
+                request_id or "<none>",
+                polygon_id or "<none>",
+                practical_line_length_scale,
+                len(relaxed_fallback),
+                relaxed_fallback[0].fallback_score,
+                relaxed_fallback[0].soft_total_margin,
+                relaxed_fallback[0].soft_max_margin,
+                relaxed_fallback[0].direction_deg,
+                relaxed_fallback[0].threshold,
+            )
+            practical_filtered = [candidate.plan for candidate in relaxed_fallback[:1]]
+            time_min = min(plan.mission_time_sec for plan in practical_filtered)
+            time_max = max(plan.mission_time_sec for plan in practical_filtered)
+            previews: list[PartitionSolutionPreviewModel] = []
+            for index, plan in enumerate(practical_filtered):
+                preview_polygons = [region.polygon for region in plan.regions]
+                simplify_tolerance_m = clamp(
+                    grid.grid_step_m * OUTPUT_RING_SIMPLIFY_FACTOR,
+                    OUTPUT_RING_SIMPLIFY_MIN_M,
+                    OUTPUT_RING_SIMPLIFY_MAX_M,
+                )
+                simplified_polygons = simplify_polygon_coverage(
+                    [polygon for polygon in preview_polygons if polygon is not None],
+                    simplify_tolerance_m,
+                    simplify_boundary=True,
+                )
+                simplified_rings = [polygon_to_lnglat_ring(polygon) for polygon in simplified_polygons]
+                boundary_break_alignment = _plan_boundary_alignment(plan)
+                if time_max - time_min <= 1e-6:
+                    tradeoff = requested_tradeoff if requested_tradeoff is not None else 0.5
+                else:
+                    tradeoff = clamp((plan.mission_time_sec - time_min) / (time_max - time_min), 0.0, 1.0)
+                previews.append(
+                    PartitionSolutionPreviewModel(
+                        signature=hash_signature(
+                            {
+                                "regions": [
+                                    {
+                                        "ring": ring,
+                                        "bearingDeg": round(region.objective.bearing_deg, 4),
+                                        "areaM2": round(region.objective.area_m2, 3),
+                                    }
+                                    for region, ring in zip(plan.regions, simplified_rings)
+                                ]
+                            }
+                        ),
+                        tradeoff=float(tradeoff),
+                        regionCount=plan.region_count,
+                        totalMissionTimeSec=plan.mission_time_sec,
+                        normalizedQualityCost=plan.quality_cost,
+                        weightedMeanMismatchDeg=plan.weighted_mean_mismatch_deg,
+                        hierarchyLevel=index + 1,
+                        largestRegionFraction=plan.largest_region_fraction,
+                        meanConvexity=plan.mean_convexity,
+                        boundaryBreakAlignment=boundary_break_alignment,
+                        isFirstPracticalSplit=False,
+                        regions=[
+                            RegionPreview(
+                                areaM2=region.objective.area_m2,
+                                bearingDeg=region.objective.bearing_deg,
+                                atomCount=len(region.cell_ids),
+                                ring=ring,
+                                convexity=region.objective.convexity,
+                                compactness=region.objective.compactness,
+                                baseAltitudeAGL=params.altitudeAGL,
+                            )
+                            for region, ring in zip(plan.regions, simplified_rings)
+                        ],
+                    )
+                )
+            _populate_solver_debug_output(
+                debug_output,
+                request_id=request_id,
+                polygon_id=polygon_id,
+                grid=grid,
+                requested_tradeoff=requested_tradeoff,
+                max_depth=max_depth,
+                basic_line_length_scale=basic_line_length_scale,
+                practical_line_length_scale=practical_line_length_scale,
+                caches=caches,
+                perf=perf,
+                all_plans=all_plans,
+                practical_plans=practical_filtered,
+                returned_plans=practical_filtered,
+                returned_previews=previews,
+                practical_plan_rejection_summary=practical_plan_rejection_summary,
+                practical_region_rejection_summary=practical_region_rejection_summary,
+                relaxed_fallback=relaxed_fallback,
+            )
+            return previews
+        rejection_payload = _rejection_debug_payload(
+            caches=caches,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            practical_plan_rejection_summary=practical_plan_rejection_summary,
+            practical_region_rejection_summary=practical_region_rejection_summary,
+        )
+        logger.info(
+            "[terrain-split-backend][%s] rejection diagnostics polygonId=%s details=%s",
+            request_id or "<none>",
+            polygon_id or "<none>",
+            json.dumps(
+                rejection_payload,
+                sort_keys=True,
+            ),
+        )
         total_ms = (time.perf_counter() - solve_started_at) * 1000.0
         logger.info(
-            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d",
+            "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=0 rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f nestedParallelInvocations=%d nestedParallelWorkersMax=%d nestedParallelTasks=%d nestedParallelMs=%.1f nestedParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionStaticHits=%d regionStaticMisses=%d regionBearingHits=%d regionBearingMisses=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f exactRegionObjectiveCalls=%d exactRegionObjectiveMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
             request_id or "<none>",
             polygon_id or "<none>",
             len(grid.cells),
@@ -1756,6 +3218,11 @@ def solve_partition_hierarchy(
             int(perf["root_parallel_split_count"]),
             int(perf["root_parallel_subtree_tasks"]),
             perf["root_parallel_ms"],
+            int(perf["nested_parallel_invocations"]),
+            int(perf["nested_parallel_workers_used_max"]),
+            int(perf["nested_parallel_subtree_tasks"]),
+            perf["nested_parallel_ms"],
+            int(perf["nested_parallel_failures"]),
             int(perf["solve_region_calls"]),
             int(perf["solve_region_cache_hits"]),
             int(perf["region_cache_hits"]),
@@ -1771,6 +3238,8 @@ def solve_partition_hierarchy(
             int(perf["objective_calls"]),
             perf["objective_ms"],
             perf["region_bearing_core_ms"],
+            int(perf["exact_region_objective_calls"]),
+            perf["exact_region_objective_ms"],
             perf["node_cost_ms"],
             perf["line_lift_ms"],
             perf["flight_time_ms"],
@@ -1779,15 +3248,64 @@ def solve_partition_hierarchy(
             int(perf["split_attempts"]),
             int(perf["split_candidates_kept"]),
             int(perf["split_candidates_returned"]),
+            int(perf["split_small_child_rejections"]),
+            int(perf["split_duplicate_rejections"]),
+            int(perf["split_disconnected_rejections"]),
+            int(perf["split_boundary_rejections"]),
+            int(perf["split_region_build_rejections"]),
+            int(perf["split_basic_validity_rejections"]),
+            int(perf["split_non_improving_rejections"]),
+            int(perf["combined_plan_candidates"]),
+            int(perf["frontier_plan_count"]),
+        )
+        _populate_solver_debug_output(
+            debug_output,
+            request_id=request_id,
+            polygon_id=polygon_id,
+            grid=grid,
+            requested_tradeoff=requested_tradeoff,
+            max_depth=max_depth,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            caches=caches,
+            perf=perf,
+            all_plans=all_plans,
+            practical_plans=[],
+            returned_plans=[],
+            returned_previews=[],
+            practical_plan_rejection_summary=practical_plan_rejection_summary,
+            practical_region_rejection_summary=practical_region_rejection_summary,
         )
         return []
 
     comparison_pool = practical[:]
     if baseline is not None:
         comparison_pool.append(baseline)
-    filtered = _pareto_frontier(comparison_pool, root_area_m2)
-    practical_filtered = [plan for plan in filtered if plan.region_count > 1 and _plan_is_practical(plan, root_area_m2)]
+    filtered = _pareto_frontier(comparison_pool, root_area_m2, practical_line_length_scale)
+    practical_filtered = [
+        plan
+        for plan in filtered
+        if plan.region_count > 1 and _plan_is_practical(plan, root_area_m2, practical_line_length_scale)
+    ]
     if not practical_filtered:
+        _populate_solver_debug_output(
+            debug_output,
+            request_id=request_id,
+            polygon_id=polygon_id,
+            grid=grid,
+            requested_tradeoff=requested_tradeoff,
+            max_depth=max_depth,
+            basic_line_length_scale=basic_line_length_scale,
+            practical_line_length_scale=practical_line_length_scale,
+            caches=caches,
+            perf=perf,
+            all_plans=all_plans,
+            practical_plans=practical,
+            returned_plans=[],
+            returned_previews=[],
+            practical_plan_rejection_summary=practical_plan_rejection_summary,
+            practical_region_rejection_summary=practical_region_rejection_summary,
+        )
         return []
 
     best_two_region = min(
@@ -1805,13 +3323,14 @@ def solve_partition_hierarchy(
 
     previews: list[PartitionSolutionPreviewModel] = []
     for index, plan in enumerate(practical_filtered):
+        preview_polygons = [region.polygon for region in plan.regions]
         simplify_tolerance_m = clamp(
             grid.grid_step_m * OUTPUT_RING_SIMPLIFY_FACTOR,
             OUTPUT_RING_SIMPLIFY_MIN_M,
             OUTPUT_RING_SIMPLIFY_MAX_M,
         )
         simplified_polygons = simplify_polygon_coverage(
-            [region.polygon for region in plan.regions],
+            [polygon for polygon in preview_polygons if polygon is not None],
             simplify_tolerance_m,
             simplify_boundary=True,
         )
@@ -1863,7 +3382,22 @@ def solve_partition_hierarchy(
     region_static_attempts = perf["region_static_hits"] + perf["region_static_misses"]
     region_bearing_attempts = perf["region_bearing_hits"] + perf["region_bearing_misses"]
     logger.info(
-        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f rootParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
+        "[terrain-split-backend][%s] rejection diagnostics polygonId=%s details=%s",
+        request_id or "<none>",
+        polygon_id or "<none>",
+        json.dumps(
+            _rejection_debug_payload(
+                caches=caches,
+                basic_line_length_scale=basic_line_length_scale,
+                practical_line_length_scale=practical_line_length_scale,
+                practical_plan_rejection_summary=practical_plan_rejection_summary,
+                practical_region_rejection_summary=practical_region_rejection_summary,
+            ),
+            sort_keys=True,
+        ),
+    )
+    logger.info(
+        "[terrain-split-backend][%s] solver finished polygonId=%s cells=%d maxDepth=%d totalMs=%.1f allPlans=%d practicalPlans=%d returnedSolutions=%d rootParallelMode=%s rootParallelGranularity=%s rootParallelRequested=%d rootParallelUsed=%d rootParallelSplits=%d rootParallelSubtreeTasks=%d rootParallelMs=%.1f rootParallelFailures=%d nestedParallelInvocations=%d nestedParallelWorkersMax=%d nestedParallelTasks=%d nestedParallelMs=%.1f nestedParallelFailures=%d solveRegionCalls=%d cacheHits=%d regionCacheHits=%d regionCacheMisses=%d regionCacheHitRate=%.3f regionStaticHits=%d regionStaticMisses=%d regionStaticHitRate=%.3f regionStaticNullHits=%d regionBearingHits=%d regionBearingMisses=%d regionBearingHitRate=%.3f regionBearingRewraps=%d buildRegionCalls=%d buildRegionMs=%.1f regionStaticBuildMs=%.1f polygonMs=%.1f polygonFailures=%d objectiveCalls=%d objectiveMs=%.1f regionBearingCoreMs=%.1f exactRegionObjectiveCalls=%d exactRegionObjectiveMs=%.1f nodeCostMs=%.1f lineLiftMs=%.1f flightTimeMs=%.1f shapeMetricMs=%.1f splitGenMs=%.1f splitDirections=%d splitAttempts=%d kept=%d returned=%d smallChildRejects=%d duplicateRejects=%d disconnectedRejects=%d boundaryRejects=%d regionBuildRejects=%d validityRejects=%d nonImprovingRejects=%d combinedCandidates=%d frontierStates=%d",
         request_id or "<none>",
         polygon_id or "<none>",
         len(grid.cells),
@@ -1880,6 +3414,11 @@ def solve_partition_hierarchy(
         int(perf["root_parallel_subtree_tasks"]),
         perf["root_parallel_ms"],
         int(perf["root_parallel_failures"]),
+        int(perf["nested_parallel_invocations"]),
+        int(perf["nested_parallel_workers_used_max"]),
+        int(perf["nested_parallel_subtree_tasks"]),
+        perf["nested_parallel_ms"],
+        int(perf["nested_parallel_failures"]),
         int(perf["solve_region_calls"]),
         int(perf["solve_region_cache_hits"]),
         int(perf["region_cache_hits"]),
@@ -1901,6 +3440,8 @@ def solve_partition_hierarchy(
         int(perf["objective_calls"]),
         perf["objective_ms"],
         perf["region_bearing_core_ms"],
+        int(perf["exact_region_objective_calls"]),
+        perf["exact_region_objective_ms"],
         perf["node_cost_ms"],
         perf["line_lift_ms"],
         perf["flight_time_ms"],
@@ -1919,5 +3460,23 @@ def solve_partition_hierarchy(
         int(perf["split_non_improving_rejections"]),
         int(perf["combined_plan_candidates"]),
         int(perf["frontier_plan_count"]),
+    )
+    _populate_solver_debug_output(
+        debug_output,
+        request_id=request_id,
+        polygon_id=polygon_id,
+        grid=grid,
+        requested_tradeoff=requested_tradeoff,
+        max_depth=max_depth,
+        basic_line_length_scale=basic_line_length_scale,
+        practical_line_length_scale=practical_line_length_scale,
+        caches=caches,
+        perf=perf,
+        all_plans=all_plans,
+        practical_plans=practical,
+        returned_plans=practical_filtered,
+        returned_previews=previews,
+        practical_plan_rejection_summary=practical_plan_rejection_summary,
+        practical_region_rejection_summary=practical_region_rejection_summary,
     )
     return previews

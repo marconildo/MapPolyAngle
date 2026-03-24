@@ -182,4 +182,3 @@ function runForAltitude(ALT){
 function run(){ [70,100,120].forEach(runForAltitude); }
 
 run();
-

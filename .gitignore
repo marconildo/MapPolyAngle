@@ -14,8 +14,12 @@ __pycache__/
 *.egg-info/
 backend/terrain_splitter/.cache/
 backend/terrain_splitter/.debug/
+backend/terrain_splitter/.dsm/
+backend/terrain_splitter/.dsm-upload-staging/
 backend/terrain_splitter/.aws-sam/
+backend/terrain_splitter/exact-runtime/
 .aws-sam/
+/.terrain-splitter-runtime/
 
 # Local planning / status notes
 /PLAN.md
@@ -29,3 +33,5 @@ backend/terrain_splitter/.aws-sam/
 /terrain_partition_current_state.md
 /terrain_partition_tradeoff_design.md
 /wingtra_lidar_plan.md
+/BorSerbia.laz
+/BorSerbia.las

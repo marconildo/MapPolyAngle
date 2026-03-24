@@ -18,4 +18,4 @@ export interface PolygonAnalysisResult {
 }
 
 /** Per‑polygon flight planning parameters set by the user. */
-export interface PolygonParams extends FlightParams {}
+export type PolygonParams = FlightParams;

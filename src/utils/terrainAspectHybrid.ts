@@ -22,7 +22,7 @@ export interface TerrainTile {
   width: number;
   height: number;
   data: Uint8ClampedArray | Float32Array;
-  format: 'terrain-rgb' | 'dem';
+  format?: 'terrain-rgb' | 'dem';
 }
 
 export interface Options {
@@ -83,9 +83,9 @@ export function dominantContourDirectionPlaneFit(
   }
 
   if (samples.length < 6) {
-    return { 
-      aspectDeg: NaN, 
-      contourDirDeg: NaN, 
+    return {
+      aspectDeg: NaN,
+      contourDirDeg: NaN,
       samples: samples.length,
       fitQuality: 'poor',
       maxElevation: maxZ === -Infinity ? undefined : maxZ
@@ -95,9 +95,9 @@ export function dominantContourDirectionPlaneFit(
   // --- 2. Robust least-squares plane fit -----------------------------
   const planeResult = fitPlaneHybrid(samples);
   if (!planeResult.ok) {
-    return { 
-      aspectDeg: NaN, 
-      contourDirDeg: NaN, 
+    return {
+      aspectDeg: NaN,
+      contourDirDeg: NaN,
       samples: samples.length,
       fitQuality: 'poor',
       maxElevation: maxZ === -Infinity ? undefined : maxZ
@@ -155,13 +155,13 @@ interface PlaneResult {
 
 function fitPlaneHybrid(pts: { x: number; y: number; z: number }[]): PlaneResult {
   const n = pts.length;
-  
+
   // Center data for numerical stability (ChatGPT's key insight)
   let mx = 0, my = 0, mz = 0;
-  for (const p of pts) { 
-    mx += p.x; 
-    my += p.y; 
-    mz += p.z; 
+  for (const p of pts) {
+    mx += p.x;
+    my += p.y;
+    mz += p.z;
   }
   mx /= n; my /= n; mz /= n;
 
@@ -171,7 +171,7 @@ function fitPlaneHybrid(pts: { x: number; y: number; z: number }[]): PlaneResult
   for (let iter = 0; iter < 3; ++iter) {
     // Accumulate weighted normal equations: [Sxx Sxy][a] = [Sxz]
     //                                       [Sxy Syy][b]   [Syz]
-    let Sxx = 0, Sxy = 0, Syy = 0, Sxz = 0, Syz = 0, Sw = 0;
+    let Sxx = 0, Sxy = 0, Syy = 0, Sxz = 0, Syz = 0;
 
     for (const p of pts) {
       const x = p.x - mx;
@@ -180,7 +180,7 @@ function fitPlaneHybrid(pts: { x: number; y: number; z: number }[]): PlaneResult
 
       const residual = z - (a * x + b * y);
       const absResidual = Math.abs(residual);
-      
+
       // Huber weights: full weight below threshold, 1/|r| above
       const threshold = 5; // 5 meters - reasonable for terrain data
       const weight = absResidual < threshold ? 1 : threshold / absResidual;
@@ -190,7 +190,6 @@ function fitPlaneHybrid(pts: { x: number; y: number; z: number }[]): PlaneResult
       Syy += weight * y * y;
       Sxz += weight * x * z;
       Syz += weight * y * z;
-      Sw += weight;
     }
 
     // Solve 2×2 system (much more efficient than 3×3)
@@ -226,7 +225,7 @@ function calculateFitQuality(
   for (const p of points) {
     const predicted = a * (p.x - mx) + b * (p.y - my) + c;
     const residual = p.z - predicted;
-    
+
     ssRes += residual * residual;
     ssTot += (p.z - mz) * (p.z - mz);
   }
@@ -238,9 +237,9 @@ function calculateFitQuality(
 }
 
 function assessFitQuality(
-  rSquared: number, 
-  rmse: number, 
-  slopeMagnitude: number, 
+  rSquared: number,
+  rmse: number,
+  slopeMagnitude: number,
   samples: number
 ): 'excellent' | 'good' | 'fair' | 'poor' {
   // Quality assessment based on multiple factors
@@ -261,10 +260,10 @@ const EARTH_RADIUS = 6378137; // WGS84 semi-major axis
 function lngLatToMercatorMeters(lng: number, lat: number): [number, number] {
   const λ = degToRad(lng);
   const φ = degToRad(lat);
-  
+
   // Clamp latitude to avoid projection singularities
   const clampedφ = Math.max(-85.0511 * Math.PI / 180, Math.min(85.0511 * Math.PI / 180, φ));
-  
+
   return [
     EARTH_RADIUS * λ,
     EARTH_RADIUS * Math.log(Math.tan(Math.PI / 4 + clampedφ / 2)),
@@ -273,8 +272,8 @@ function lngLatToMercatorMeters(lng: number, lat: number): [number, number] {
 
 class WebMercatorProjector {
   private readonly z2: number;
-  constructor(private readonly z: number) { 
-    this.z2 = 2 ** z; 
+  constructor(private readonly z: number) {
+    this.z2 = 2 ** z;
   }
 
   pixelToLngLat(tx: number, ty: number, px: number, py: number, width: number): LngLat {
@@ -291,25 +290,25 @@ class WebMercatorProjector {
     // Convert lng/lat to normalized tile coordinates (0-1)
     const normX = (lng + 180) / 360;
     const normY = (1 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) / Math.PI) / 2;
-    
+
     // Convert to pixel coordinates within the specific tile
     const totalPixelsX = this.z2 * width;
     const totalPixelsY = this.z2 * width;
-    
+
     const globalPixelX = normX * totalPixelsX;
     const globalPixelY = normY * totalPixelsY;
-    
+
     // Check if this coordinate falls within the given tile
     const tileStartX = tileX * width;
     const tileStartY = tileY * width;
     const tileEndX = tileStartX + width;
     const tileEndY = tileStartY + width;
-    
-    if (globalPixelX >= tileStartX && globalPixelX < tileEndX && 
+
+    if (globalPixelX >= tileStartX && globalPixelX < tileEndX &&
         globalPixelY >= tileStartY && globalPixelY < tileEndY) {
       return [globalPixelX - tileStartX, globalPixelY - tileStartY];
     }
-    
+
     return null; // Point not in this tile
   }
 }
@@ -318,7 +317,7 @@ function getElevation(tile: TerrainTile, px: number, py: number): number {
   if (px < 0 || py < 0 || px >= tile.width || py >= tile.height) {
     return NaN;
   }
-  
+
   const idx = py * tile.width + px;
   if (tile.format === 'dem') {
     return (tile.data as Float32Array)[idx];
@@ -350,7 +349,7 @@ export function queryElevationAtPoint(lng: number, lat: number, tiles: TerrainTi
   for (const tile of tiles) {
     const proj = new WebMercatorProjector(tile.z);
     const pixelCoords = proj.lngLatToPixel(lng, lat, tile.x, tile.y, tile.width);
-    
+
     if (pixelCoords) {
       const [px, py] = pixelCoords;
       const elevation = getElevation(tile, Math.floor(px), Math.floor(py));
@@ -359,32 +358,32 @@ export function queryElevationAtPoint(lng: number, lat: number, tiles: TerrainTi
       }
     }
   }
-  
+
   return NaN; // No elevation data found for this point
 }
 
 // Query maximum elevation along a line segment with sampling
 export function queryMaxElevationAlongLine(
-  startLng: number, 
-  startLat: number, 
-  endLng: number, 
-  endLat: number, 
-  tiles: TerrainTile[], 
+  startLng: number,
+  startLat: number,
+  endLng: number,
+  endLat: number,
+  tiles: TerrainTile[],
   sampleCount: number = 10
 ): number {
   let maxElevation = -Infinity;
-  
+
   for (let i = 0; i <= sampleCount; i++) {
     const t = i / sampleCount;
     const lng = startLng + t * (endLng - startLng);
     const lat = startLat + t * (endLat - startLat);
-    
+
     const elevation = queryElevationAtPoint(lng, lat, tiles);
     if (Number.isFinite(elevation)) {
       maxElevation = Math.max(maxElevation, elevation);
     }
   }
-  
+
   return maxElevation === -Infinity ? NaN : maxElevation;
 }
 
@@ -400,15 +399,15 @@ export function destination(start: [number, number], bearing: number, distance: 
   const φ1 = degToRad(start[1]);
   const λ1 = degToRad(start[0]);
   const brng = degToRad(bearing);
-  
+
   const R = 6371000; // Earth's radius in meters
   const δ = distance / R; // angular distance in radians
-  
+
   const φ2 = Math.asin(
-    Math.sin(φ1) * Math.cos(δ) + 
+    Math.sin(φ1) * Math.cos(δ) +
     Math.cos(φ1) * Math.sin(δ) * Math.cos(brng)
   );
-  
+
   const λ2 = λ1 + Math.atan2(
     Math.sin(brng) * Math.sin(δ) * Math.cos(φ1),
     Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2)

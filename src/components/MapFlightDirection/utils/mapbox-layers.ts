@@ -6,9 +6,12 @@
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
-import { Map as MapboxMap } from 'mapbox-gl';
-import { getPolygonBounds, haversineDistance } from './geometry';
+import type { Map as MapboxMap } from 'mapbox-gl';
+import { haversineDistance } from '@/flight/geometry';
+import { generateFlightLinesForPolygon } from '@/flight/flightLines';
 import { destination as geoDestination } from '@/utils/terrainAspectHybrid';
+
+export { generateFlightLinesForPolygon } from '@/flight/flightLines';
 
 function getLineColor(quality?: string) {
   switch (quality) {
@@ -34,6 +37,15 @@ const PROCESSING_PERIMETER_SOURCE_ID = 'terrain-processing-perimeter-source';
 const PROCESSING_PERIMETER_GLOW_LAYER_ID = 'terrain-processing-perimeter-glow';
 const PROCESSING_PERIMETER_CORE_LAYER_ID = 'terrain-processing-perimeter-core';
 const PROCESSING_PERIMETER_PULSE_LAYER_ID = 'terrain-processing-perimeter-pulse';
+const DSM_FOOTPRINT_SOURCE_ID = 'uploaded-dsm-footprint-source';
+const DSM_FOOTPRINT_FILL_LAYER_ID = 'uploaded-dsm-footprint-fill';
+const DSM_FOOTPRINT_LINE_LAYER_ID = 'uploaded-dsm-footprint-line';
+const IMAGERY_OVERLAY_SOURCE_ID = 'imagery-overlay-source';
+const IMAGERY_OVERLAY_LAYER_ID = 'imagery-overlay-layer';
+const SELECTED_POLYGON_SOURCE_ID = 'selected-polygon-highlight-source';
+const SELECTED_POLYGON_FILL_LAYER_ID = 'selected-polygon-highlight-fill';
+const SELECTED_POLYGON_OUTER_LAYER_ID = 'selected-polygon-highlight-outer';
+const SELECTED_POLYGON_INNER_LAYER_ID = 'selected-polygon-highlight-inner';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -125,9 +137,9 @@ function ensureProcessingPerimeterLayers(map: MapboxMap) {
       },
       paint: {
         'line-color': '#60a5fa',
-        'line-width': 14,
-        'line-opacity': 0.28,
-        'line-blur': 4.8,
+        'line-width': 18,
+        'line-opacity': 0.32,
+        'line-blur': 6.2,
       },
     });
   }
@@ -143,8 +155,8 @@ function ensureProcessingPerimeterLayers(map: MapboxMap) {
       },
       paint: {
         'line-color': '#bfdbfe',
-        'line-width': 2.5,
-        'line-opacity': 0.8,
+        'line-width': 3.25,
+        'line-opacity': 0.86,
       },
     });
   }
@@ -159,9 +171,9 @@ function ensureProcessingPerimeterLayers(map: MapboxMap) {
         'line-cap': 'round',
       },
       paint: {
-        'line-width': 8.5,
+        'line-width': 11.5,
         'line-opacity': 1,
-        'line-blur': 0.5,
+        'line-blur': 0.9,
         'line-gradient': buildProcessingPulseGradient(0),
       },
     });
@@ -205,79 +217,209 @@ export function animateProcessingPerimeter(map: MapboxMap, timestampMs: number) 
   const phase = (timestampMs * 0.00018) % 1;
 
   if (map.getLayer(PROCESSING_PERIMETER_GLOW_LAYER_ID)) {
-    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-opacity', 0.22 + pulse * 0.2);
-    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-width', 12 + pulse * 5);
+    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-opacity', 0.26 + pulse * 0.22);
+    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-width', 16 + pulse * 7);
   }
   if (map.getLayer(PROCESSING_PERIMETER_CORE_LAYER_ID)) {
-    map.setPaintProperty(PROCESSING_PERIMETER_CORE_LAYER_ID, 'line-opacity', 0.62 + pulse * 0.18);
+    map.setPaintProperty(PROCESSING_PERIMETER_CORE_LAYER_ID, 'line-opacity', 0.68 + pulse * 0.16);
   }
   if (map.getLayer(PROCESSING_PERIMETER_PULSE_LAYER_ID)) {
+    map.setPaintProperty(PROCESSING_PERIMETER_PULSE_LAYER_ID, 'line-width', 10.5 + pulse * 3.2);
     map.setPaintProperty(PROCESSING_PERIMETER_PULSE_LAYER_ID, 'line-gradient', buildProcessingPulseGradient(phase));
   }
 }
 
-export function generateFlightLinesForPolygon(
-  ring: number[][],
-  bearingDeg: number,
-  lineSpacingM: number,
-): { flightLines: number[][][]; lineSpacing: number; bounds: ReturnType<typeof getPolygonBounds> } {
-  const bounds = getPolygonBounds(ring);
-  const lineSpacing = lineSpacingM;
-  const flightLines: number[][][] = [];
+export function setDsmFootprintPolygon(
+  map: MapboxMap,
+  dsmId: string,
+  ring: [number, number][],
+) {
+  const closedRing = ensureClosedRing(ring);
+  if (closedRing.length < 4) return;
+  const data = {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [closedRing],
+        },
+        properties: {
+          dsmId,
+        },
+      },
+    ],
+  } as const;
 
-  const centerLat = (bounds.minLat + bounds.maxLat) / 2;
-  const centerLng = (bounds.minLng + bounds.maxLng) / 2;
-  const diagonal = haversineDistance([bounds.minLng, bounds.minLat], [bounds.maxLng, bounds.maxLat]);
-
-  const numLines = Math.ceil(diagonal / lineSpacing);
-  const perpBearing = (bearingDeg + 90) % 360;
-
-  // Create a polygon check function
-  const pointInPolygon = (lng: number, lat: number): boolean => {
-    let inside = false;
-    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-      const [xi, yi] = ring[i];
-      const [xj, yj] = ring[j];
-      const intersect = ((yi > lat) !== (yj > lat)) &&
-        (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
-      if (intersect) inside = !inside;
-    }
-    return inside;
-  };
-
-  for (let i = -numLines; i <= numLines; i++) {
-    const distance = i * lineSpacing;
-    const [centerLineLng, centerLineLat] = geoDestination([centerLng, centerLat], perpBearing, distance);
-
-    // Create a longer line and then clip it to the polygon
-    const extendDistance = diagonal * 0.6; // Extend beyond polygon bounds
-    const p1 = geoDestination([centerLineLng, centerLineLat], bearingDeg, extendDistance);
-    const p2 = geoDestination([centerLineLng, centerLineLat], (bearingDeg + 180) % 360, extendDistance);
-
-    // Sample points along the line and find entry/exit points of polygon
-    const linePoints: [number, number][] = [];
-    const samples = 50;
-    
-    for (let s = 0; s <= samples; s++) {
-      const t = s / samples;
-      const lng = p2[0] + t * (p1[0] - p2[0]);
-      const lat = p2[1] + t * (p1[1] - p2[1]);
-      
-      if (pointInPolygon(lng, lat)) {
-        linePoints.push([lng, lat]);
-      }
-    }
-
-    // Only add lines that have points inside the polygon
-    if (linePoints.length > 0) {
-      // Find the start and end of the continuous segment inside the polygon
-      const startPoint = linePoints[0];
-      const endPoint = linePoints[linePoints.length - 1];
-      flightLines.push([startPoint, endPoint]);
-    }
+  if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) {
+    (map.getSource(DSM_FOOTPRINT_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(DSM_FOOTPRINT_SOURCE_ID, {
+      type: 'geojson',
+      data,
+    } as any);
   }
 
-  return { flightLines, lineSpacing, bounds };
+  const beforeId = getDrawLayerAnchor(map);
+  if (!map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) {
+    map.addLayer({
+      id: DSM_FOOTPRINT_FILL_LAYER_ID,
+      type: 'fill',
+      source: DSM_FOOTPRINT_SOURCE_ID,
+      paint: {
+        'fill-color': '#0ea5e9',
+        'fill-opacity': 0.08,
+      },
+    }, beforeId);
+  }
+  if (!map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) {
+    map.addLayer({
+      id: DSM_FOOTPRINT_LINE_LAYER_ID,
+      type: 'line',
+      source: DSM_FOOTPRINT_SOURCE_ID,
+      paint: {
+        'line-color': '#0284c7',
+        'line-width': 2,
+        'line-dasharray': [2, 2],
+        'line-opacity': 0.9,
+      },
+    }, beforeId);
+  }
+}
+
+export function clearDsmFootprintPolygon(map: MapboxMap) {
+  try { if (map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_LINE_LAYER_ID); } catch {}
+  try { if (map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_FILL_LAYER_ID); } catch {}
+  try { if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) map.removeSource(DSM_FOOTPRINT_SOURCE_ID); } catch {}
+}
+
+export function setSelectedPolygonHighlight(
+  map: MapboxMap,
+  polygon: { polygonId: string; ring: [number, number][] } | null,
+) {
+  if (!polygon) {
+    try { if (map.getLayer(SELECTED_POLYGON_INNER_LAYER_ID)) map.removeLayer(SELECTED_POLYGON_INNER_LAYER_ID); } catch {}
+    try { if (map.getLayer(SELECTED_POLYGON_OUTER_LAYER_ID)) map.removeLayer(SELECTED_POLYGON_OUTER_LAYER_ID); } catch {}
+    try { if (map.getLayer(SELECTED_POLYGON_FILL_LAYER_ID)) map.removeLayer(SELECTED_POLYGON_FILL_LAYER_ID); } catch {}
+    try { if (map.getSource(SELECTED_POLYGON_SOURCE_ID)) map.removeSource(SELECTED_POLYGON_SOURCE_ID); } catch {}
+    return;
+  }
+
+  const closedRing = ensureClosedRing(polygon.ring);
+  if (closedRing.length < 4) {
+    setSelectedPolygonHighlight(map, null);
+    return;
+  }
+
+  const data = {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [closedRing],
+        },
+        properties: {
+          polygonId: polygon.polygonId,
+        },
+      },
+    ],
+  } as const;
+
+  if (map.getSource(SELECTED_POLYGON_SOURCE_ID)) {
+    (map.getSource(SELECTED_POLYGON_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(SELECTED_POLYGON_SOURCE_ID, {
+      type: 'geojson',
+      data,
+    } as any);
+  }
+
+  if (!map.getLayer(SELECTED_POLYGON_FILL_LAYER_ID)) {
+    map.addLayer({
+      id: SELECTED_POLYGON_FILL_LAYER_ID,
+      type: 'fill',
+      source: SELECTED_POLYGON_SOURCE_ID,
+      paint: {
+        'fill-color': '#f59e0b',
+        'fill-opacity': 0.06,
+      },
+    });
+  }
+
+  if (!map.getLayer(SELECTED_POLYGON_OUTER_LAYER_ID)) {
+    map.addLayer({
+      id: SELECTED_POLYGON_OUTER_LAYER_ID,
+      type: 'line',
+      source: SELECTED_POLYGON_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#ffffff',
+        'line-width': 7,
+        'line-opacity': 0.96,
+        'line-blur': 1.25,
+      },
+    });
+  }
+
+  if (!map.getLayer(SELECTED_POLYGON_INNER_LAYER_ID)) {
+    map.addLayer({
+      id: SELECTED_POLYGON_INNER_LAYER_ID,
+      type: 'line',
+      source: SELECTED_POLYGON_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#f59e0b',
+        'line-width': 3,
+        'line-opacity': 1,
+      },
+    });
+  }
+}
+
+export function setImageryOverlayOnMap(
+  map: MapboxMap,
+  overlay: {
+    url: string;
+    coordinates: [[number, number], [number, number], [number, number], [number, number]];
+  } | null,
+) {
+  try {
+    if (!map.getStyle()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+
+  try { if (map.getLayer(IMAGERY_OVERLAY_LAYER_ID)) map.removeLayer(IMAGERY_OVERLAY_LAYER_ID); } catch {}
+  try { if (map.getSource(IMAGERY_OVERLAY_SOURCE_ID)) map.removeSource(IMAGERY_OVERLAY_SOURCE_ID); } catch {}
+
+  if (!overlay) return;
+
+  map.addSource(IMAGERY_OVERLAY_SOURCE_ID, {
+    type: 'image',
+    url: overlay.url,
+    coordinates: overlay.coordinates,
+  } as any);
+
+  map.addLayer({
+    id: IMAGERY_OVERLAY_LAYER_ID,
+    type: 'raster',
+    source: IMAGERY_OVERLAY_SOURCE_ID,
+    paint: {
+      'raster-opacity': 0.92,
+      'raster-resampling': 'linear',
+    },
+  }, getDrawLayerAnchor(map));
 }
 
 export function addFlightLinesForPolygon(
@@ -287,8 +429,8 @@ export function addFlightLinesForPolygon(
   bearingDeg: number,
   lineSpacingM: number,
   quality?: string
-): { flightLines: number[][][]; lineSpacing: number } {
-  const { flightLines, lineSpacing, bounds } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
+): { flightLines: number[][][]; sweepIndices: number[]; lineSpacing: number } {
+  const { flightLines, sweepIndices, lineSpacing, bounds } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
 
   const sourceId = `flight-lines-source-${polygonId}`;
   const layerId = `flight-lines-layer-${polygonId}`;
@@ -339,19 +481,21 @@ export function addFlightLinesForPolygon(
   if (flightLines.length === 0) {
     try {
       const b = bounds;
+      const centerLng = (b.minLng + b.maxLng) / 2;
+      const centerLat = (b.minLat + b.maxLat) / 2;
       console.warn(
         `[flight-lines] No segments inside polygon for ${polygonId}. Debug: bearing=${bearingDeg.toFixed(2)}, spacing=${lineSpacing.toFixed(2)}m, center=(${centerLng.toFixed(5)},${centerLat.toFixed(5)}), bbox=lng[${b.minLng.toFixed(5)},${b.maxLng.toFixed(5)}], lat[${b.minLat.toFixed(5)},${b.maxLat.toFixed(5)}]`
       );
     } catch {}
   }
 
-  return { flightLines, lineSpacing };
+  return { flightLines, sweepIndices, lineSpacing };
 }
 
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
   const layerId = `flight-lines-layer-${polygonId}`;
   const sourceId = `flight-lines-source-${polygonId}`;
-  
+
   try { if (map.getLayer(layerId)) map.removeLayer(layerId); } catch {}
   try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
 }
@@ -365,7 +509,7 @@ function sampleTriggerPoints(line: [number, number][], spacingM: number): [numbe
   const [A, B] = line as [[number, number], [number, number]];
   const total = haversineDistance(A, B);
   if (total === 0) return [A];
-  
+
   // Calculate bearing from A to B
   const dLng = B[0] - A[0];
   const dLat = B[1] - A[1];
@@ -450,7 +594,7 @@ export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string)
   const sourceId = `flight-triggers-source-${polygonId}`;
   const circleLayerId = `flight-triggers-layer-${polygonId}`;
   const labelLayerId = `flight-triggers-label-${polygonId}`;
-  
+
   try { if (map.getLayer(circleLayerId)) map.removeLayer(circleLayerId); } catch {}
   try { if (map.getLayer(labelLayerId)) map.removeLayer(labelLayerId); } catch {}
   try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
@@ -462,14 +606,14 @@ export function removeTriggerPointsForPolygon(map: MapboxMap, polygonId: string)
 export function clearAllFlightLines(map: MapboxMap) {
   const layers = map.getStyle().layers || [];
   const sources = map.getStyle().sources || {};
-  
+
   // Remove all flight line layers
   for (const layer of layers) {
     if (layer.id.startsWith('flight-lines-layer-')) {
       try { map.removeLayer(layer.id); } catch {}
     }
   }
-  
+
   // Remove all flight line sources
   for (const sourceId of Object.keys(sources)) {
     if (sourceId.startsWith('flight-lines-source-')) {
@@ -484,14 +628,14 @@ export function clearAllFlightLines(map: MapboxMap) {
 export function clearAllTriggerPoints(map: MapboxMap) {
   const layers = map.getStyle().layers || [];
   const sources = map.getStyle().sources || {};
-  
+
   // Remove all trigger point layers
   for (const layer of layers) {
     if (layer.id.startsWith('flight-triggers-')) {
       try { map.removeLayer(layer.id); } catch {}
     }
   }
-  
+
   // Remove all trigger point sources
   for (const sourceId of Object.keys(sources)) {
     if (sourceId.startsWith('flight-triggers-source-')) {

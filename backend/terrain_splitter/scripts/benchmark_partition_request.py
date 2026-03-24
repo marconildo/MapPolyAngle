@@ -8,7 +8,6 @@ from typing import Any
 
 import httpx
 
-
 DEFAULT_FLIGHTPLAN = Path(__file__).resolve().parents[1] / "escrow_convex_hull.flightplan"
 
 

@@ -8,6 +8,7 @@ export type CameraModel = {
   h_px: number;
   cx_px?: number;   // default: w/2
   cy_px?: number;   // default: h/2
+  names?: string[];
 };
 
 export type PoseMeters = {
@@ -72,6 +73,17 @@ export type TileResult = {
   density?: Float32Array;
   maxDensity?: number;
   densityStats?: DensityStats;
+};
+
+export type OverlayTileResult = {
+  z: number;
+  x: number;
+  y: number;
+  size: number;
+  maxOverlap?: number;
+  overlap?: Uint16Array;
+  gsdMin?: Float32Array;
+  density?: Float32Array;
 };
 
 export type LidarStripMeters = {

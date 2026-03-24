@@ -62,8 +62,8 @@ export const RGB61_24MM: CameraModel = {
  * Calculate the forward spacing between photos based on overlap percentage.
  */
 export function forwardSpacing(
-  camera: CameraModel, 
-  altitudeAGL: number, 
+  camera: CameraModel,
+  altitudeAGL: number,
   frontOverlapPct: number
 ): number {
   // Ground sample distance (GSD)
@@ -97,8 +97,8 @@ export function forwardSpacingRotated(
  * Calculate the spacing between flight lines based on side overlap percentage.
  */
 export function lineSpacing(
-  camera: CameraModel, 
-  altitudeAGL: number, 
+  camera: CameraModel,
+  altitudeAGL: number,
   sideOverlapPct: number
 ): number {
   // Ground sample distance (GSD)

@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
-from shapely.ops import unary_union
 from shapely.geometry import Polygon
+from shapely.ops import unary_union
 
 from .geometry import polygon_to_lnglat_ring
 from .grid import GridData

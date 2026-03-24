@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import Polygon, box
 
 from .geometry import mercator_to_lnglat, normalize_ring, ring_to_polygon_mercator
 from .mapbox_tiles import TerrainDEM, choose_grid_step_m

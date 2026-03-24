@@ -3,7 +3,6 @@ const WORLD = Math.PI * R * 2;
 
 export function lngLatToMeters(lng: number, lat: number): [number, number] {
   const λ = (lng * Math.PI) / 180;
-  const φ = (lat * Math.PI) / 180;
   const clamped = Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI/180;
   return [R * λ, R * Math.log(Math.tan(Math.PI / 4 + clamped / 2))];
 }

@@ -77,7 +77,7 @@ export function dominantContourDirection(
 
   const bearings: number[] = [];
   const gradientMagnitudes: number[] = []; // Track gradient strength
-  
+
   for (const tile of tiles) {
     const proj = new WebMercatorProjector(tile.z);
 
@@ -97,7 +97,7 @@ export function dominantContourDirection(
         const dzdy = ((elev[0] + 2*elev[1] + elev[2]) - (elev[6] + 2*elev[7] + elev[8])) / (8*res); // FIXED: flipped sign
 
         if (!Number.isFinite(dzdx) || !Number.isFinite(dzdy)) continue;
-        
+
         // Calculate gradient magnitude for filtering
         const gradMag = Math.sqrt(dzdx * dzdx + dzdy * dzdy);
         if (gradMag < 1e-6) continue; // Skip nearly flat areas (adjust threshold as needed)
@@ -168,13 +168,13 @@ function neighbourhood9(tile: TerrainTile, px: number, py: number): number[] | n
 // Add circular dispersion calculation for reliability assessment
 function calculateCircularDispersion(angles: number[]): number {
   if (angles.length === 0) return 1;
-  
+
   let sx = 0, sy = 0;
   for (const a of angles) {
     sx += Math.cos(a);
     sy += Math.sin(a);
   }
-  
+
   const R = Math.sqrt(sx * sx + sy * sy) / angles.length;
   return 1 - R; // 0 = perfect agreement, 1 = completely random
 }
@@ -182,9 +182,9 @@ function calculateCircularDispersion(angles: number[]): number {
 /** Circular mean of angles in radians. */
 function circularMean(arr: number[]): number {
   let sx = 0, sy = 0;
-  for (const a of arr) { 
-    sx += Math.cos(a); 
-    sy += Math.sin(a); 
+  for (const a of arr) {
+    sx += Math.cos(a);
+    sy += Math.sin(a);
   }
   return (Math.atan2(sy, sx) + 2*Math.PI) % (2*Math.PI);
 }
