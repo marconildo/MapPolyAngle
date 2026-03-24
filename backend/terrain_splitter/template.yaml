@@ -41,6 +41,14 @@ Parameters:
     Type: Number
     Default: 8
     Description: Maximum number of nested Lambda subtree self-invocations allowed in flight per worker.
+  ExactPostprocessTopK:
+    Type: Number
+    Default: 5
+    Description: Maximum number of surrogate-ranked candidate solutions promoted into exact reranking.
+  ExactCandidateMaxInflight:
+    Type: Number
+    Default: 5
+    Description: Maximum number of exact candidate rerank Lambda invocations allowed in flight per autosplit request.
 
 Globals:
   Function:
@@ -67,6 +75,8 @@ Globals:
         TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC: !Ref LambdaInvokeReadTimeoutSec
         TERRAIN_SPLITTER_NESTED_LAMBDA_MIN_CELLS: !Ref NestedLambdaMinCells
         TERRAIN_SPLITTER_NESTED_LAMBDA_MAX_INFLIGHT: !Ref NestedLambdaMaxInflight
+        TERRAIN_SPLITTER_EXACT_TOP_K: !Ref ExactPostprocessTopK
+        TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT: !Ref ExactCandidateMaxInflight
         TERRAIN_SPLITTER_EXACT_LAMBDA_FUNCTION_NAME: !Sub "${AWS::StackName}-terrain-splitter-exact"
         PYTHONPATH: /var/task
 

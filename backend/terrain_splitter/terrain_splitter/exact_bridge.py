@@ -12,8 +12,45 @@ from typing import Any, TextIO
 logger = logging.getLogger("uvicorn.error")
 
 
+def _resolve_lambda_invoke_read_timeout_sec() -> int:
+    raw = os.environ.get("TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC")
+    if raw is None or raw.strip() == "":
+        return 300
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_LAMBDA_INVOKE_READ_TIMEOUT_SEC=%r; falling back to 300s",
+            raw,
+        )
+        return 300
+
+
+def _resolve_exact_candidate_max_inflight() -> int:
+    raw = os.environ.get("TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT")
+    if raw is None or raw.strip() == "":
+        return 5
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT=%r; falling back to 5",
+            raw,
+        )
+        return 5
+
+
 class ExactRuntimeBridge:
+    def supports_candidate_fanout(self) -> bool:
+        return False
+
+    def candidate_max_inflight(self) -> int:
+        return 1
+
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def evaluate_solution(self, request: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
     def rerank_solutions(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -98,6 +135,9 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request({"operation": "optimize-bearing", **request})
 
+    def evaluate_solution(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request({"operation": "evaluate-solution", **request})
+
     def rerank_solutions(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request({"operation": "rerank-solutions", **request})
 
@@ -115,9 +155,20 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
 class LambdaExactRuntimeBridge(ExactRuntimeBridge):
     def __init__(self, function_name: str) -> None:
         import boto3
+        from botocore.config import Config
 
         self._function_name = function_name
-        self._client = boto3.client("lambda")
+        self._candidate_max_inflight = _resolve_exact_candidate_max_inflight()
+        self._client = boto3.client(
+            "lambda",
+            config=Config(read_timeout=_resolve_lambda_invoke_read_timeout_sec()),
+        )
+
+    def supports_candidate_fanout(self) -> bool:
+        return True
+
+    def candidate_max_inflight(self) -> int:
+        return self._candidate_max_inflight
 
     def _invoke(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._client.invoke(
@@ -136,6 +187,9 @@ class LambdaExactRuntimeBridge(ExactRuntimeBridge):
 
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._invoke({"operation": "optimize-bearing", **request})
+
+    def evaluate_solution(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._invoke({"operation": "evaluate-solution", **request})
 
     def rerank_solutions(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._invoke({"operation": "rerank-solutions", **request})

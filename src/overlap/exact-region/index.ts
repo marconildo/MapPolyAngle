@@ -110,6 +110,12 @@ export interface ExactPartitionRerankResult {
   previewsBySignature: Record<string, ExactPartitionPreview>;
 }
 
+export interface ExactPartitionSolutionEvaluation {
+  solution: TerrainPartitionSolutionPreview;
+  preview: ExactPartitionPreview;
+  score: number;
+}
+
 function tileKey(tileRef: ExactTileRef) {
   return `${tileRef.z}/${tileRef.x}/${tileRef.y}`;
 }
@@ -978,6 +984,55 @@ function withExactSummary(
   } as TerrainPartitionSolutionPreview;
 }
 
+export async function evaluatePartitionSolutionCandidateExact(
+  runtime: ExactRegionRuntime,
+  args: ExactRegionCommonArgs & {
+    polygonId: string;
+    solution: TerrainPartitionSolutionPreview;
+    fastestMissionTimeSec: number;
+    rankingSource?: "backend-exact" | "frontend-exact";
+  },
+): Promise<ExactPartitionSolutionEvaluation> {
+  const rankingSource = args.rankingSource ?? "frontend-exact";
+  const solution = args.solution;
+  const refinedRegions = [];
+  for (let regionIndex = 0; regionIndex < solution.regions.length; regionIndex++) {
+    const region = solution.regions[regionIndex];
+    const local = await optimizeBearingExact(runtime, {
+      ...args,
+      scopeId: `${args.polygonId}::${regionIndex}`,
+      ring: region.ring as [number, number][],
+      params: args.params,
+      seedBearingDeg: region.bearingDeg,
+      mode: "local",
+      halfWindowDeg: 30,
+    });
+    const best = local.best;
+    refinedRegions.push({
+      ...region,
+      bearingDeg: best?.bearingDeg ?? region.bearingDeg,
+      exactScore: best?.exactCost ?? null,
+      exactSeedBearingDeg: local.seedBearingDeg,
+    });
+  }
+  const refinedSolution: TerrainPartitionSolutionPreview = {
+    ...solution,
+    regions: refinedRegions,
+  };
+  const preview = await evaluatePartitionSolutionExact(runtime, {
+    ...args,
+    solution: refinedSolution,
+  });
+  const score = isLidarParams(args.params)
+    ? scoreLidarPartitionPreview(args.params, refinedSolution, preview, args.fastestMissionTimeSec).score
+    : scoreCameraPartitionPreview(args.params, refinedSolution, preview, args.fastestMissionTimeSec).score;
+  return {
+    solution: withExactSummary(args.params, refinedSolution, preview, rankingSource, score),
+    preview,
+    score,
+  };
+}
+
 export async function rerankPartitionSolutionsExact(
   runtime: ExactRegionRuntime,
   args: ExactRegionCommonArgs & {
@@ -998,42 +1053,15 @@ export async function rerankPartitionSolutionsExact(
   let bestScore = Number.POSITIVE_INFINITY;
 
   for (let index = 0; index < args.solutions.length; index++) {
-    const solution = args.solutions[index];
-    const refinedRegions = [];
-    for (let regionIndex = 0; regionIndex < solution.regions.length; regionIndex++) {
-      const region = solution.regions[regionIndex];
-      const local = await optimizeBearingExact(runtime, {
-        ...args,
-        scopeId: `${args.polygonId}::${regionIndex}`,
-        ring: region.ring as [number, number][],
-        params: args.params,
-        seedBearingDeg: region.bearingDeg,
-        mode: "local",
-        halfWindowDeg: 30,
-      });
-      const best = local.best;
-      refinedRegions.push({
-        ...region,
-        bearingDeg: best?.bearingDeg ?? region.bearingDeg,
-        exactScore: best?.exactCost ?? null,
-        exactSeedBearingDeg: local.seedBearingDeg,
-      });
-    }
-    const refinedSolution: TerrainPartitionSolutionPreview = {
-      ...solution,
-      regions: refinedRegions,
-    };
-    const preview = await evaluatePartitionSolutionExact(runtime, {
+    const evaluated = await evaluatePartitionSolutionCandidateExact(runtime, {
       ...args,
-      solution: refinedSolution,
+      solution: args.solutions[index],
+      fastestMissionTimeSec,
     });
-    previewsBySignature[solution.signature] = preview;
-    const score = isLidarParams(args.params)
-      ? scoreLidarPartitionPreview(args.params, refinedSolution, preview, fastestMissionTimeSec).score
-      : scoreCameraPartitionPreview(args.params, refinedSolution, preview, fastestMissionTimeSec).score;
-    preparedSolutions[index] = withExactSummary(args.params, refinedSolution, preview, rankingSource, score);
-    if (score < bestScore - 1e-9) {
-      bestScore = score;
+    previewsBySignature[args.solutions[index].signature] = evaluated.preview;
+    preparedSolutions[index] = evaluated.solution;
+    if (evaluated.score < bestScore - 1e-9) {
+      bestScore = evaluated.score;
       bestIndex = index;
     }
   }

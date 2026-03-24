@@ -10,6 +10,8 @@ function summarizeRequest(envelope: ExactRuntimeEnvelope) {
       return `operation=terrain-batch tiles=${request.tiles.length}`;
     case "evaluate-region":
       return `operation=evaluate-region scopeId=${request.scopeId ?? "exact-region"} bearingDeg=${request.bearingDeg}`;
+    case "evaluate-solution":
+      return `operation=evaluate-solution polygonId=${request.polygonId} signature=${request.solution.signature}`;
     case "optimize-bearing":
       return `operation=optimize-bearing scopeId=${request.scopeId ?? request.polygonId ?? "optimize-bearing"} mode=${request.mode ?? "global"} seedBearingDeg=${request.seedBearingDeg}`;
     case "rerank-solutions":

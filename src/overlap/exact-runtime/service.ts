@@ -5,6 +5,7 @@ import { PNG } from "pngjs";
 import { evaluateCameraTileExact, evaluateLidarTileExact } from "@/overlap/exact-core";
 import {
   evaluateRegionBearingExact,
+  evaluatePartitionSolutionCandidateExact,
   optimizeBearingExact,
   rerankPartitionSolutionsExact,
   type ExactRegionRuntime,
@@ -18,6 +19,7 @@ import type { PaddedDemTileRGBA, TileRGBA } from "@/overlap/types";
 import type {
   ExactRuntimeRequest,
   ExactRuntimeResponse,
+  ExactRuntimePartitionPreviewPayload,
   ExactRuntimeTerrainBatchRequest,
   ExactRuntimeTerrainBatchResponse,
   ExactRuntimeTilePayload,
@@ -122,6 +124,24 @@ function decodeDemTile(payload: ExactRuntimeTilePayload, fallbackTile: TileRGBA)
     size: payload.demSize ?? decoded.width,
     padTiles: payload.demPadTiles ?? 0,
     data: new Uint8ClampedArray(decoded.data),
+  };
+}
+
+function toPreviewPayload(preview: {
+  metricKind: ExactRuntimePartitionPreviewPayload["metricKind"];
+  stats: ExactRuntimePartitionPreviewPayload["stats"];
+  regionStats: ExactRuntimePartitionPreviewPayload["regionStats"];
+  regionCount: number;
+  sampleCount: number;
+  sampleLabel: string;
+}): ExactRuntimePartitionPreviewPayload {
+  return {
+    metricKind: preview.metricKind,
+    stats: preview.stats,
+    regionStats: preview.regionStats,
+    regionCount: preview.regionCount,
+    sampleCount: preview.sampleCount,
+    sampleLabel: preview.sampleLabel,
   };
 }
 
@@ -319,6 +339,30 @@ export async function handleExactRuntimeRequest(request: ExactRuntimeRequest): P
     };
   }
 
+  if (request.operation === "evaluate-solution") {
+    const result = await evaluatePartitionSolutionCandidateExact(runtime, {
+      scopeId: request.polygonId,
+      polygonId: request.polygonId,
+      ring: request.ring,
+      params: request.params,
+      altitudeMode: request.altitudeMode,
+      minClearanceM: request.minClearanceM,
+      turnExtendM: request.turnExtendM,
+      exactOptimizeZoom: request.exactOptimizeZoom,
+      timeWeight: request.timeWeight,
+      clipInnerBufferM: request.clipInnerBufferM,
+      minOverlapForGsd: request.minOverlapForGsd,
+      solution: request.solution,
+      fastestMissionTimeSec: request.fastestMissionTimeSec,
+      rankingSource: request.rankingSource ?? "backend-exact",
+    });
+    return {
+      operation: "evaluate-solution",
+      solution: result.solution,
+      preview: toPreviewPayload(result.preview),
+    };
+  }
+
   if (request.operation === "optimize-bearing") {
     const result = await optimizeBearingExact(runtime, {
       scopeId: request.scopeId ?? request.polygonId ?? "optimize-bearing",
@@ -372,14 +416,7 @@ export async function handleExactRuntimeRequest(request: ExactRuntimeRequest): P
     previewsBySignature: Object.fromEntries(
       Object.entries(reranked.previewsBySignature).map(([signature, preview]) => [
         signature,
-        {
-          metricKind: preview.metricKind,
-          stats: preview.stats,
-          regionStats: preview.regionStats,
-          regionCount: preview.regionCount,
-          sampleCount: preview.sampleCount,
-          sampleLabel: preview.sampleLabel,
-        },
+        toPreviewPayload(preview),
       ]),
     ),
   };

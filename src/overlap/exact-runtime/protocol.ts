@@ -7,6 +7,7 @@ import type { TerrainSourceSelection } from "@/terrain/types";
 export type ExactRuntimeOperation =
   | "terrain-batch"
   | "evaluate-region"
+  | "evaluate-solution"
   | "optimize-bearing"
   | "rerank-solutions";
 
@@ -68,6 +69,14 @@ export type ExactRuntimeOptimizeBearingRequest = ExactRuntimeCommonRequest & {
   halfWindowDeg?: number;
 };
 
+export type ExactRuntimeEvaluateSolutionRequest = ExactRuntimeCommonRequest & {
+  operation: "evaluate-solution";
+  polygonId: string;
+  solution: TerrainPartitionSolutionPreview;
+  fastestMissionTimeSec: number;
+  rankingSource?: "backend-exact" | "frontend-exact";
+};
+
 export type ExactRuntimeRerankSolutionsRequest = ExactRuntimeCommonRequest & {
   operation: "rerank-solutions";
   polygonId: string;
@@ -78,6 +87,7 @@ export type ExactRuntimeRerankSolutionsRequest = ExactRuntimeCommonRequest & {
 export type ExactRuntimeRequest =
   | ExactRuntimeTerrainBatchRequest
   | ExactRuntimeEvaluateRegionRequest
+  | ExactRuntimeEvaluateSolutionRequest
   | ExactRuntimeOptimizeBearingRequest
   | ExactRuntimeRerankSolutionsRequest;
 
@@ -106,23 +116,32 @@ export type ExactRuntimeOptimizeBearingResponse = {
   metricKind: ExactMetricKind | null;
 };
 
+export type ExactRuntimePartitionPreviewPayload = {
+  metricKind: ExactMetricKind;
+  stats: GSDStats;
+  regionStats: GSDStats[];
+  regionCount: number;
+  sampleCount: number;
+  sampleLabel: string;
+};
+
+export type ExactRuntimeEvaluateSolutionResponse = {
+  operation: "evaluate-solution";
+  solution: TerrainPartitionSolutionPreview;
+  preview: ExactRuntimePartitionPreviewPayload;
+};
+
 export type ExactRuntimeRerankSolutionsResponse = {
   operation: "rerank-solutions";
   bestIndex: number;
   solutions: TerrainPartitionSolutionPreview[];
-  previewsBySignature: Record<string, {
-    metricKind: ExactMetricKind;
-    stats: GSDStats;
-    regionStats: GSDStats[];
-    regionCount: number;
-    sampleCount: number;
-    sampleLabel: string;
-  }>;
+  previewsBySignature: Record<string, ExactRuntimePartitionPreviewPayload>;
 };
 
 export type ExactRuntimeResponse =
   | ExactRuntimeTerrainBatchResponse
   | ExactRuntimeEvaluateRegionResponse
+  | ExactRuntimeEvaluateSolutionResponse
   | ExactRuntimeOptimizeBearingResponse
   | ExactRuntimeRerankSolutionsResponse;
 

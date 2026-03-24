@@ -377,15 +377,54 @@ def _override_app_dsm_state(*, dsm_dir: Path, store, staging_dir: Path):
 
 
 class _FakeExactBridge:
-    def __init__(self, optimize_response: dict | None = None, rerank_response: dict | None = None):
+    def __init__(
+        self,
+        optimize_response: dict | None = None,
+        rerank_response: dict | None = None,
+        *,
+        evaluate_solution_responses: dict[str, dict] | None = None,
+        evaluate_solution_errors: dict[str, Exception] | None = None,
+        supports_candidate_fanout: bool = False,
+        candidate_max_inflight: int = 1,
+    ):
         self.optimize_response = optimize_response or {}
         self.rerank_response = rerank_response or {}
+        self.evaluate_solution_responses = evaluate_solution_responses or {}
+        self.evaluate_solution_errors = evaluate_solution_errors or {}
+        self._supports_candidate_fanout = supports_candidate_fanout
+        self._candidate_max_inflight = candidate_max_inflight
         self.optimize_requests: list[dict] = []
+        self.evaluate_solution_requests: list[dict] = []
         self.rerank_requests: list[dict] = []
+
+    def supports_candidate_fanout(self) -> bool:
+        return self._supports_candidate_fanout
+
+    def candidate_max_inflight(self) -> int:
+        return self._candidate_max_inflight
 
     def optimize_bearing(self, request: dict) -> dict:
         self.optimize_requests.append(request)
         return self.optimize_response
+
+    def evaluate_solution(self, request: dict) -> dict:
+        self.evaluate_solution_requests.append(request)
+        signature = request["solution"]["signature"]
+        if signature in self.evaluate_solution_errors:
+            raise self.evaluate_solution_errors[signature]
+        if signature in self.evaluate_solution_responses:
+            return self.evaluate_solution_responses[signature]
+        return {
+            "solution": request["solution"],
+            "preview": {
+                "metricKind": "gsd",
+                "stats": {"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0},
+                "regionStats": [{"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0}],
+                "regionCount": 1,
+                "sampleCount": 1,
+                "sampleLabel": "Images",
+            },
+        }
 
     def rerank_solutions(self, request: dict) -> dict:
         self.rerank_requests.append(request)
@@ -2054,6 +2093,315 @@ def test_partition_solve_exact_rerank_matches_local_exact_runtime(monkeypatch) -
             bridge.close()
             app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
             app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_endpoint_uses_lambda_exact_candidate_fanout(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4)), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.4,
+                "regionCount": 1,
+                "totalMissionTimeSec": 125.0,
+                "normalizedQualityCost": 0.3,
+                "weightedMeanMismatchDeg": 3.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.8,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 35.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    preview_payload = {
+        "metricKind": "gsd",
+        "stats": {"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0},
+        "regionStats": [{"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0}],
+        "regionCount": 1,
+        "sampleCount": 1,
+        "sampleLabel": "Images",
+    }
+    bridge = _FakeExactBridge(
+        evaluate_solution_responses={
+            "surrogate-a": {
+                "solution": {
+                    **surrogate_solutions[0].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 9.2,
+                    "exactQualityCost": 1.1,
+                    "exactMissionTimeSec": 125.0,
+                    "exactMetricKind": "gsd",
+                    "regions": [
+                        {
+                            **surrogate_solutions[0].regions[0].model_dump(mode="json"),
+                            "bearingDeg": 90.0,
+                            "exactScore": 3.2,
+                            "exactSeedBearingDeg": 35.0,
+                        }
+                    ],
+                },
+                "preview": preview_payload,
+            },
+            "surrogate-b": {
+                "solution": {
+                    **surrogate_solutions[1].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 4.5,
+                    "exactQualityCost": 0.7,
+                    "exactMissionTimeSec": 130.0,
+                    "exactMetricKind": "gsd",
+                    "regions": [
+                        {
+                            **surrogate_solutions[1].regions[0].model_dump(mode="json"),
+                            "bearingDeg": 12.0,
+                            "exactScore": 2.0,
+                            "exactSeedBearingDeg": 40.0,
+                        }
+                    ],
+                },
+                "preview": preview_payload,
+            },
+        },
+        supports_candidate_fanout=True,
+        candidate_max_inflight=3,
+    )
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    app_module.EXACT_POSTPROCESS_TOP_K = 2
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 110, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert [solution["signature"] for solution in payload["solutions"]] == ["surrogate-b", "surrogate-a"]
+        assert [solution["rankingSource"] for solution in payload["solutions"]] == ["backend-exact", "backend-exact"]
+        assert bridge.rerank_requests == []
+        assert [request["solution"]["signature"] for request in bridge.evaluate_solution_requests] == ["surrogate-a", "surrogate-b"]
+    finally:
+        app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_endpoint_fanout_failure_falls_back_to_surrogate(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4)), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.4,
+                "regionCount": 1,
+                "totalMissionTimeSec": 125.0,
+                "normalizedQualityCost": 0.3,
+                "weightedMeanMismatchDeg": 3.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.8,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 35.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    bridge = _FakeExactBridge(
+        evaluate_solution_errors={"surrogate-b": RuntimeError("boom")},
+        supports_candidate_fanout=True,
+        candidate_max_inflight=3,
+    )
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    app_module.EXACT_POSTPROCESS_TOP_K = 2
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 110, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert [solution["signature"] for solution in payload["solutions"]] == ["surrogate-a", "surrogate-b"]
+        assert [solution["rankingSource"] for solution in payload["solutions"]] == [None, None]
+        assert bridge.rerank_requests == []
+        assert len(bridge.evaluate_solution_requests) == 2
+    finally:
+        app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_partition_solve_endpoint_fanout_preserves_surrogate_order_on_tie(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4)), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.4,
+                "regionCount": 1,
+                "totalMissionTimeSec": 125.0,
+                "normalizedQualityCost": 0.3,
+                "weightedMeanMismatchDeg": 3.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.8,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 35.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    preview_payload = {
+        "metricKind": "gsd",
+        "stats": {"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0},
+        "regionStats": [{"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0}],
+        "regionCount": 1,
+        "sampleCount": 1,
+        "sampleLabel": "Images",
+    }
+    bridge = _FakeExactBridge(
+        evaluate_solution_responses={
+            "surrogate-a": {
+                "solution": {
+                    **surrogate_solutions[0].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 5.0,
+                    "exactQualityCost": 0.5,
+                    "exactMissionTimeSec": 125.0,
+                    "exactMetricKind": "gsd",
+                },
+                "preview": preview_payload,
+            },
+            "surrogate-b": {
+                "solution": {
+                    **surrogate_solutions[1].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 5.0,
+                    "exactQualityCost": 0.5,
+                    "exactMissionTimeSec": 130.0,
+                    "exactMetricKind": "gsd",
+                },
+                "preview": preview_payload,
+            },
+        },
+        supports_candidate_fanout=True,
+        candidate_max_inflight=3,
+    )
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    app_module.EXACT_POSTPROCESS_TOP_K = 2
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 110, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert [solution["signature"] for solution in payload["solutions"]] == ["surrogate-a", "surrogate-b"]
+    finally:
+        app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
 
 
 def test_partition_solve_endpoint_matches_between_sharded_and_legacy_dsm(monkeypatch, tmp_path: Path) -> None:

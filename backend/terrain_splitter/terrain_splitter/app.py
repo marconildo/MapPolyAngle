@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import base64
+import math
 import logging
 import os
 import shutil
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
@@ -132,7 +134,7 @@ DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
 DSM_UPLOAD_STAGING_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_UPLOAD_STAGING_DIR", ".dsm-upload-staging")
 DSM_DATASET_STORE = create_dsm_dataset_store(DSM_DIR)
 EXACT_RUNTIME_BRIDGE = create_exact_runtime_bridge()
-EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_K", "3")))
+EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_K", "5")))
 ENABLE_INTERNAL_TERRAIN_BATCH_HTTP = _should_enable_internal_http()
 logger = logging.getLogger("uvicorn.error")
 
@@ -469,26 +471,138 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                     len(solutions),
                     len(exact_candidates),
                 )
-                # Exact-enabled responses intentionally replace the surrogate tail with the
-                # exact-reranked shortlist instead of appending discarded surrogate options.
-                exact_response = EXACT_RUNTIME_BRIDGE.rerank_solutions(
-                    {
-                        "polygonId": request.polygonId or request_id,
-                        "payloadKind": request.payloadKind,
-                        "terrainSource": request.terrainSource.model_dump(mode="json"),
-                        "params": request.params.model_dump(mode="json"),
-                        "ring": request.ring,
-                        "altitudeMode": request.altitudeMode,
-                        "minClearanceM": request.minClearanceM,
-                        "turnExtendM": request.turnExtendM,
-                        "solutions": [solution.model_dump(mode="json") for solution in exact_candidates],
-                        "rankingSource": "backend-exact",
-                    }
-                )
-                exact_solutions = [
-                    PartitionSolutionPreviewModel.model_validate(solution_payload)
-                    for solution_payload in exact_response.get("solutions", [])
-                ]
+                polygon_id = request.polygonId or request_id
+                terrain_source_payload = request.terrainSource.model_dump(mode="json")
+                params_payload = request.params.model_dump(mode="json")
+                if EXACT_RUNTIME_BRIDGE.supports_candidate_fanout() and len(exact_candidates) > 1:
+                    max_inflight = min(
+                        len(exact_candidates),
+                        EXACT_POSTPROCESS_TOP_K,
+                        EXACT_RUNTIME_BRIDGE.candidate_max_inflight(),
+                    )
+                    fastest_mission_time_sec = min(
+                        solution.totalMissionTimeSec for solution in exact_candidates
+                    )
+                    candidate_specs = [
+                        (index, solution.model_dump(mode="json"))
+                        for index, solution in enumerate(exact_candidates)
+                    ]
+                    logger.warning(
+                        "[terrain-split-autosplit][%s] exact-rerank fanout start polygonId=%s candidateCount=%d maxInflight=%d candidates=%s",
+                        request_id,
+                        polygon_id,
+                        len(candidate_specs),
+                        max_inflight,
+                        [f"{index}:{payload['signature']}" for index, payload in candidate_specs],
+                    )
+
+                    def _evaluate_exact_candidate(original_index: int, solution_payload: dict[str, Any]) -> tuple[int, dict[str, Any], float]:
+                        candidate_started_at = time.perf_counter()
+                        response_payload = EXACT_RUNTIME_BRIDGE.evaluate_solution(
+                            {
+                                "polygonId": polygon_id,
+                                "payloadKind": request.payloadKind,
+                                "terrainSource": terrain_source_payload,
+                                "params": params_payload,
+                                "ring": request.ring,
+                                "altitudeMode": request.altitudeMode,
+                                "minClearanceM": request.minClearanceM,
+                                "turnExtendM": request.turnExtendM,
+                                "solution": solution_payload,
+                                "fastestMissionTimeSec": fastest_mission_time_sec,
+                                "rankingSource": "backend-exact",
+                            }
+                        )
+                        return original_index, response_payload, (time.perf_counter() - candidate_started_at) * 1000.0
+
+                    candidate_results: list[tuple[int, PartitionSolutionPreviewModel, float]] = []
+                    candidate_errors: list[tuple[int, str, Exception]] = []
+                    with ThreadPoolExecutor(max_workers=max_inflight) as executor:
+                        future_to_candidate = {
+                            executor.submit(_evaluate_exact_candidate, original_index, solution_payload): (
+                                original_index,
+                                solution_payload["signature"],
+                            )
+                            for original_index, solution_payload in candidate_specs
+                        }
+                        for future in as_completed(future_to_candidate):
+                            original_index, signature = future_to_candidate[future]
+                            try:
+                                resolved_index, response_payload, elapsed_ms = future.result()
+                                solution_payload = response_payload.get("solution")
+                                if not isinstance(solution_payload, dict):
+                                    raise RuntimeError("Exact runtime Lambda evaluate-solution returned no solution payload.")
+                                exact_solution = PartitionSolutionPreviewModel.model_validate(solution_payload)
+                                candidate_results.append((resolved_index, exact_solution, elapsed_ms))
+                                logger.warning(
+                                    "[terrain-split-autosplit][%s] exact-rerank fanout candidate success polygonId=%s candidateIndex=%d signature=%s elapsedMs=%.1f exactScore=%s",
+                                    request_id,
+                                    polygon_id,
+                                    resolved_index,
+                                    signature,
+                                    elapsed_ms,
+                                    exact_solution.exactScore,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                candidate_errors.append((original_index, signature, exc))
+                                logger.warning(
+                                    "[terrain-split-autosplit][%s] exact-rerank fanout candidate failed polygonId=%s candidateIndex=%d signature=%s error=%s",
+                                    request_id,
+                                    polygon_id,
+                                    original_index,
+                                    signature,
+                                    exc,
+                                )
+                    if candidate_errors or len(candidate_results) != len(candidate_specs):
+                        raise RuntimeError(
+                            "exact candidate fanout failed for "
+                            + ", ".join(
+                                f"{index}:{signature}:{error}" for index, signature, error in candidate_errors
+                            )
+                        )
+                    exact_solutions = [
+                        solution
+                        for _, solution, _ in sorted(
+                            candidate_results,
+                            key=lambda item: (
+                                item[1].exactScore
+                                if item[1].exactScore is not None and math.isfinite(item[1].exactScore)
+                                else math.inf,
+                                item[0],
+                            ),
+                        )
+                    ]
+                    logger.warning(
+                        "[terrain-split-autosplit][%s] exact-rerank fanout finish polygonId=%s returnedSolutions=%d candidateDurationsMs=%s",
+                        request_id,
+                        polygon_id,
+                        len(exact_solutions),
+                        {
+                            solution.signature: round(elapsed_ms, 1)
+                            for _, solution, elapsed_ms in sorted(candidate_results, key=lambda item: item[0])
+                        },
+                    )
+                else:
+                    # Exact-enabled responses intentionally replace the surrogate tail with the
+                    # exact-reranked shortlist instead of appending discarded surrogate options.
+                    exact_response = EXACT_RUNTIME_BRIDGE.rerank_solutions(
+                        {
+                            "polygonId": polygon_id,
+                            "payloadKind": request.payloadKind,
+                            "terrainSource": terrain_source_payload,
+                            "params": params_payload,
+                            "ring": request.ring,
+                            "altitudeMode": request.altitudeMode,
+                            "minClearanceM": request.minClearanceM,
+                            "turnExtendM": request.turnExtendM,
+                            "solutions": [solution.model_dump(mode="json") for solution in exact_candidates],
+                            "rankingSource": "backend-exact",
+                        }
+                    )
+                    exact_solutions = [
+                        PartitionSolutionPreviewModel.model_validate(solution_payload)
+                        for solution_payload in exact_response.get("solutions", [])
+                    ]
                 if exact_solutions:
                     solutions = exact_solutions
                 logger.warning(

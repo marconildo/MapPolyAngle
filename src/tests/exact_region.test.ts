@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { evaluateCameraTileExact, evaluateLidarTileExact } from "../overlap/exact-core/index.ts";
 import {
   evaluateRegionBearingExact,
+  evaluatePartitionSolutionCandidateExact,
   optimizeBearingExact,
   rerankPartitionSolutionsExact,
   type ExactRegionRuntime,
@@ -310,6 +311,46 @@ async function main() {
   approxEqual(reranked.previewsBySignature.bad.stats.mean, 0.012881537813662582);
   assert.ok(reranked.previewsBySignature.good);
   assert.ok(reranked.previewsBySignature.bad);
+
+  const candidateSolutions = [
+    makeSolution("good", goodSeed, baseArgs.ring),
+    makeSolution("bad", badSeed, baseArgs.ring),
+  ];
+  const fastestMissionTimeSec = Math.min(...candidateSolutions.map((solution) => solution.totalMissionTimeSec));
+  const individuallyEvaluated = await Promise.all(
+    candidateSolutions.map((solution) =>
+      evaluatePartitionSolutionCandidateExact(runtime, {
+        ...baseArgs,
+        scopeId: "partition",
+        polygonId: "partition",
+        params: makeCameraParams(),
+        solution,
+        fastestMissionTimeSec,
+        rankingSource: "frontend-exact",
+      })
+    ),
+  );
+  const individuallySorted = individuallyEvaluated
+    .map((result, index) => ({ ...result, originalIndex: index }))
+    .sort((left, right) => {
+      const leftScore = Number.isFinite(left.solution.exactScore ?? Number.NaN)
+        ? left.solution.exactScore!
+        : Number.POSITIVE_INFINITY;
+      const rightScore = Number.isFinite(right.solution.exactScore ?? Number.NaN)
+        ? right.solution.exactScore!
+        : Number.POSITIVE_INFINITY;
+      return leftScore - rightScore || left.originalIndex - right.originalIndex;
+    });
+  assert.deepEqual(
+    individuallySorted.map((item) => item.solution.signature),
+    reranked.solutions.map((solution) => solution.signature),
+  );
+  individuallySorted.forEach((item, index) => {
+    const rerankedSolution = reranked.solutions[index];
+    approxEqual(item.solution.exactScore ?? Number.NaN, rerankedSolution.exactScore ?? Number.NaN);
+    approxEqual(item.solution.exactQualityCost ?? Number.NaN, rerankedSolution.exactQualityCost ?? Number.NaN);
+    approxEqual(item.solution.regions[0].bearingDeg, rerankedSolution.regions[0].bearingDeg);
+  });
 
   console.log("exact_region tests passed");
 }

@@ -194,6 +194,43 @@ async function main() {
         assert.equal(optimizeResponse.operation, "optimize-bearing");
         assert.ok(optimizeResponse.best);
         assert.equal(optimizeResponse.best?.metricKind, "gsd");
+
+        const evaluateSolutionResponse = await handleExactRuntimeRequest({
+          operation: "evaluate-solution",
+          ...commonRequest,
+          polygonId: "poly-1",
+          fastestMissionTimeSec: 120,
+          rankingSource: "backend-exact",
+          solution: {
+            signature: "candidate-a",
+            tradeoff: 0.5,
+            regionCount: 1,
+            totalMissionTimeSec: 120,
+            normalizedQualityCost: 0.2,
+            weightedMeanMismatchDeg: 0,
+            hierarchyLevel: 0,
+            largestRegionFraction: 1,
+            meanConvexity: 1,
+            boundaryBreakAlignment: 1,
+            isFirstPracticalSplit: true,
+            regions: [
+              {
+                areaM2: 10,
+                bearingDeg: 90,
+                atomCount: 2,
+                ring: commonRequest.ring,
+                convexity: 1,
+                compactness: 1,
+              },
+            ],
+          },
+        });
+        assert.equal(evaluateSolutionResponse.operation, "evaluate-solution");
+        assert.equal(evaluateSolutionResponse.solution.signature, "candidate-a");
+        assert.equal(evaluateSolutionResponse.solution.rankingSource, "backend-exact");
+        assert.ok(Number.isFinite(evaluateSolutionResponse.solution.exactScore ?? Number.NaN));
+        assert.equal(evaluateSolutionResponse.preview.metricKind, "gsd");
+        assert.ok(evaluateSolutionResponse.preview.sampleCount > 0);
       },
     );
 
