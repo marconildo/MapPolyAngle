@@ -42,6 +42,10 @@ const DSM_FOOTPRINT_FILL_LAYER_ID = 'uploaded-dsm-footprint-fill';
 const DSM_FOOTPRINT_LINE_LAYER_ID = 'uploaded-dsm-footprint-line';
 const IMAGERY_OVERLAY_SOURCE_ID = 'imagery-overlay-source';
 const IMAGERY_OVERLAY_LAYER_ID = 'imagery-overlay-layer';
+const SELECTED_POLYGON_SOURCE_ID = 'selected-polygon-highlight-source';
+const SELECTED_POLYGON_FILL_LAYER_ID = 'selected-polygon-highlight-fill';
+const SELECTED_POLYGON_OUTER_LAYER_ID = 'selected-polygon-highlight-outer';
+const SELECTED_POLYGON_INNER_LAYER_ID = 'selected-polygon-highlight-inner';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -133,9 +137,9 @@ function ensureProcessingPerimeterLayers(map: MapboxMap) {
       },
       paint: {
         'line-color': '#60a5fa',
-        'line-width': 14,
-        'line-opacity': 0.28,
-        'line-blur': 4.8,
+        'line-width': 18,
+        'line-opacity': 0.32,
+        'line-blur': 6.2,
       },
     });
   }
@@ -151,8 +155,8 @@ function ensureProcessingPerimeterLayers(map: MapboxMap) {
       },
       paint: {
         'line-color': '#bfdbfe',
-        'line-width': 2.5,
-        'line-opacity': 0.8,
+        'line-width': 3.25,
+        'line-opacity': 0.86,
       },
     });
   }
@@ -167,9 +171,9 @@ function ensureProcessingPerimeterLayers(map: MapboxMap) {
         'line-cap': 'round',
       },
       paint: {
-        'line-width': 8.5,
+        'line-width': 11.5,
         'line-opacity': 1,
-        'line-blur': 0.5,
+        'line-blur': 0.9,
         'line-gradient': buildProcessingPulseGradient(0),
       },
     });
@@ -213,13 +217,14 @@ export function animateProcessingPerimeter(map: MapboxMap, timestampMs: number) 
   const phase = (timestampMs * 0.00018) % 1;
 
   if (map.getLayer(PROCESSING_PERIMETER_GLOW_LAYER_ID)) {
-    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-opacity', 0.22 + pulse * 0.2);
-    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-width', 12 + pulse * 5);
+    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-opacity', 0.26 + pulse * 0.22);
+    map.setPaintProperty(PROCESSING_PERIMETER_GLOW_LAYER_ID, 'line-width', 16 + pulse * 7);
   }
   if (map.getLayer(PROCESSING_PERIMETER_CORE_LAYER_ID)) {
-    map.setPaintProperty(PROCESSING_PERIMETER_CORE_LAYER_ID, 'line-opacity', 0.62 + pulse * 0.18);
+    map.setPaintProperty(PROCESSING_PERIMETER_CORE_LAYER_ID, 'line-opacity', 0.68 + pulse * 0.16);
   }
   if (map.getLayer(PROCESSING_PERIMETER_PULSE_LAYER_ID)) {
+    map.setPaintProperty(PROCESSING_PERIMETER_PULSE_LAYER_ID, 'line-width', 10.5 + pulse * 3.2);
     map.setPaintProperty(PROCESSING_PERIMETER_PULSE_LAYER_ID, 'line-gradient', buildProcessingPulseGradient(phase));
   }
 }
@@ -287,6 +292,97 @@ export function clearDsmFootprintPolygon(map: MapboxMap) {
   try { if (map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_LINE_LAYER_ID); } catch {}
   try { if (map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_FILL_LAYER_ID); } catch {}
   try { if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) map.removeSource(DSM_FOOTPRINT_SOURCE_ID); } catch {}
+}
+
+export function setSelectedPolygonHighlight(
+  map: MapboxMap,
+  polygon: { polygonId: string; ring: [number, number][] } | null,
+) {
+  if (!polygon) {
+    try { if (map.getLayer(SELECTED_POLYGON_INNER_LAYER_ID)) map.removeLayer(SELECTED_POLYGON_INNER_LAYER_ID); } catch {}
+    try { if (map.getLayer(SELECTED_POLYGON_OUTER_LAYER_ID)) map.removeLayer(SELECTED_POLYGON_OUTER_LAYER_ID); } catch {}
+    try { if (map.getLayer(SELECTED_POLYGON_FILL_LAYER_ID)) map.removeLayer(SELECTED_POLYGON_FILL_LAYER_ID); } catch {}
+    try { if (map.getSource(SELECTED_POLYGON_SOURCE_ID)) map.removeSource(SELECTED_POLYGON_SOURCE_ID); } catch {}
+    return;
+  }
+
+  const closedRing = ensureClosedRing(polygon.ring);
+  if (closedRing.length < 4) {
+    setSelectedPolygonHighlight(map, null);
+    return;
+  }
+
+  const data = {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [closedRing],
+        },
+        properties: {
+          polygonId: polygon.polygonId,
+        },
+      },
+    ],
+  } as const;
+
+  if (map.getSource(SELECTED_POLYGON_SOURCE_ID)) {
+    (map.getSource(SELECTED_POLYGON_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(SELECTED_POLYGON_SOURCE_ID, {
+      type: 'geojson',
+      data,
+    } as any);
+  }
+
+  if (!map.getLayer(SELECTED_POLYGON_FILL_LAYER_ID)) {
+    map.addLayer({
+      id: SELECTED_POLYGON_FILL_LAYER_ID,
+      type: 'fill',
+      source: SELECTED_POLYGON_SOURCE_ID,
+      paint: {
+        'fill-color': '#f59e0b',
+        'fill-opacity': 0.06,
+      },
+    });
+  }
+
+  if (!map.getLayer(SELECTED_POLYGON_OUTER_LAYER_ID)) {
+    map.addLayer({
+      id: SELECTED_POLYGON_OUTER_LAYER_ID,
+      type: 'line',
+      source: SELECTED_POLYGON_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#ffffff',
+        'line-width': 7,
+        'line-opacity': 0.96,
+        'line-blur': 1.25,
+      },
+    });
+  }
+
+  if (!map.getLayer(SELECTED_POLYGON_INNER_LAYER_ID)) {
+    map.addLayer({
+      id: SELECTED_POLYGON_INNER_LAYER_ID,
+      type: 'line',
+      source: SELECTED_POLYGON_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#f59e0b',
+        'line-width': 3,
+        'line-opacity': 1,
+      },
+    });
+  }
 }
 
 export function setImageryOverlayOnMap(

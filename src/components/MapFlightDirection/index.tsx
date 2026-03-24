@@ -21,6 +21,7 @@ import {
   clearAllTriggerPoints,
   setProcessingPerimeterPolygons,
   generateFlightLinesForPolygon,
+  setSelectedPolygonHighlight,
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from './utils/geometry';
@@ -402,6 +403,7 @@ interface Props {
   onFlightLinesUpdated?: (changed: string | '__all__') => void;
   onClearGSD?: () => void;
   onPolygonSelected?: (polygonId: string | null) => void;
+  selectedPolygonId?: string | null;
 }
 
 export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>(
@@ -422,6 +424,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       onFlightLinesUpdated,
       onClearGSD,
       onPolygonSelected,
+      selectedPolygonId = null,
     },
     ref
   ) => {
@@ -434,6 +437,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const onTerrainSourceReadyRef = useRef(onTerrainSourceReady);
     const terrainSourceApplySeqRef = useRef(0);
     const flightLinesVisibleRef = useRef(true);
+    const selectedPolygonIdRef = useRef<string | null>(selectedPolygonId);
+    const vertexClickCandidateRef = useRef<{
+      parentId: string;
+      coordPath: string;
+      point: { x: number; y: number };
+      timestampMs: number;
+    } | null>(null);
 
     // File inputs
     const kmlInputRef = useRef<HTMLInputElement>(null);
@@ -1414,6 +1424,42 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       } catch {}
     }, []);
 
+    const getClickedVertex = useCallback((map: MapboxMap, point: { x: number; y: number }) => {
+      const features = map.queryRenderedFeatures(point as any);
+      const vertex = features.find((feature: any) => {
+        const meta = feature?.properties?.meta;
+        const parent = feature?.properties?.parent;
+        const coordPath = feature?.properties?.coord_path;
+        return meta === 'vertex' && parent != null && coordPath != null;
+      });
+      if (!vertex) return null;
+      const parentId = String(vertex.properties?.parent ?? '');
+      const coordPath = String(vertex.properties?.coord_path ?? '');
+      if (!parentId || !coordPath) return null;
+      return { parentId, coordPath };
+    }, []);
+
+    const syncSelectedPolygonHighlight = useCallback(() => {
+      const map = mapRef.current;
+      const draw = drawRef.current as any;
+      if (!map) return;
+      const polygonId = selectedPolygonIdRef.current;
+      if (!polygonId) {
+        setSelectedPolygonHighlight(map, null);
+        return;
+      }
+      const feature = draw?.get?.(polygonId);
+      const ring =
+        feature?.geometry?.type === 'Polygon'
+          ? (feature.geometry.coordinates?.[0] as [number, number][] | undefined)
+          : undefined;
+      if (!ring || ring.length < 4) {
+        setSelectedPolygonHighlight(map, null);
+        return;
+      }
+      setSelectedPolygonHighlight(map, { polygonId, ring });
+    }, []);
+
     // ---------- Mapbox Draw handlers ----------
     const handleDrawCreate = useCallback((e: any) => {
       if (suspendAutoAnalysisRef.current) return;
@@ -1428,7 +1474,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           analyzePolygon(feature.id, feature);
         }
       });
-    }, [analyzePolygon, onPolygonSelected, onRequestParams, scheduleGuardedTimeout]);
+      syncSelectedPolygonHighlight();
+    }, [analyzePolygon, onPolygonSelected, onRequestParams, scheduleGuardedTimeout, syncSelectedPolygonHighlight]);
 
     const handleDrawUpdate = useCallback((e: any) => {
       if (suspendAutoAnalysisRef.current) return;
@@ -1438,7 +1485,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           analyzePolygon(feature.id, feature);
         }
       });
-    }, [analyzePolygon]);
+      syncSelectedPolygonHighlight();
+    }, [analyzePolygon, syncSelectedPolygonHighlight]);
 
     const handleDrawDelete = useCallback((e: any) => {
       e.features.forEach((feature: any) => {
@@ -1456,7 +1504,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           cleanupPolygonState(polygonId);
         }
       });
-    }, [cleanupPolygonState]);
+      syncSelectedPolygonHighlight();
+    }, [cleanupPolygonState, syncSelectedPolygonHighlight]);
 
     // ---------- Map init ----------
     const onMapLoad = useCallback(
@@ -1473,9 +1522,62 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         map.on('draw.update', syncProcessingPerimeterOverlay);
         map.on('draw.delete', syncProcessingPerimeterOverlay);
         syncProcessingPerimeterOverlay();
+        syncSelectedPolygonHighlight();
         if (processingPolygonIdsRef.current.size > 0) {
           startProcessingPerimeterAnimation();
         }
+        map.on('mousedown', (e: any) => {
+          try {
+            const drawMode = (drawRef.current as any)?.getMode?.();
+            if (drawMode !== 'direct_select') {
+              vertexClickCandidateRef.current = null;
+              return;
+            }
+            const hit = getClickedVertex(map, e.point);
+            if (!hit) {
+              vertexClickCandidateRef.current = null;
+              return;
+            }
+            vertexClickCandidateRef.current = {
+              ...hit,
+              point: { x: e.point.x, y: e.point.y },
+              timestampMs: Date.now(),
+            };
+          } catch {
+            vertexClickCandidateRef.current = null;
+          }
+        });
+        map.on('mouseup', (e: any) => {
+          try {
+            const candidate = vertexClickCandidateRef.current;
+            vertexClickCandidateRef.current = null;
+            const drawMode = (drawRef.current as any)?.getMode?.();
+            if (!candidate || drawMode !== 'direct_select') return;
+
+            const dx = e.point.x - candidate.point.x;
+            const dy = e.point.y - candidate.point.y;
+            const elapsedMs = Date.now() - candidate.timestampMs;
+            if ((dx * dx) + (dy * dy) > 16 || elapsedMs > 450) return;
+
+            const hit = getClickedVertex(map, e.point);
+            if (!hit || hit.parentId !== candidate.parentId || hit.coordPath !== candidate.coordPath) return;
+
+            const draw = drawRef.current as any;
+            const feature = draw?.get?.(candidate.parentId);
+            const ring =
+              feature?.geometry?.type === 'Polygon'
+                ? (feature.geometry.coordinates?.[0] as [number, number][] | undefined)
+                : undefined;
+            if (!ring || ring.length <= 4) return;
+
+            scheduleGuardedTimeout(() => {
+              try {
+                draw?.trash?.();
+              } catch {}
+              syncSelectedPolygonHighlight();
+            }, 0);
+          } catch {}
+        });
         // Open params dialog when user selects an existing polygon
         map.on('draw.selectionchange', (e: any) => {
           try {
@@ -1507,7 +1609,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } catch {}
         });
       },
-      [applyTerrainSourceToMap, clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onPolygonSelected, scheduleGuardedTimeout, syncFlightLinesVisibility]
+      [applyTerrainSourceToMap, clearDrawSelectionForPan, getClickedVertex, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onPolygonSelected, scheduleGuardedTimeout, syncFlightLinesVisibility, syncSelectedPolygonHighlight]
     );
 
     useEffect(() => {
@@ -1516,6 +1618,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         applyTerrainSourceToMap(mapRef.current, terrainDemUrlTemplate, terrainSource);
       }
     }, [applyTerrainSourceToMap, terrainDemUrlTemplate, terrainSource]);
+
+    useEffect(() => {
+      selectedPolygonIdRef.current = selectedPolygonId;
+      syncSelectedPolygonHighlight();
+    }, [selectedPolygonId, syncSelectedPolygonHighlight]);
 
     useMapInitialization({
       mapboxToken,

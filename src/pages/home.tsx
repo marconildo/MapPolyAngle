@@ -974,6 +974,7 @@ export default function Home() {
             onFlightLinesUpdated={handleFlightLinesUpdated}
             onClearGSD={() => clearGSDRef.current?.()}
             onPolygonSelected={setSelectedPolygonId}
+            selectedPolygonId={selectedPolygonId}
           />
         </Suspense>
       </div>
