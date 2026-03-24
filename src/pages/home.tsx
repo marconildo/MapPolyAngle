@@ -310,7 +310,6 @@ export default function Home() {
     });
   }, []);
 
-  // MapFlightDirection now calls us to request params per polygon
   const handleRequestParams = useCallback((polygonId: string) => {
     setParamsDialog({ open: true, polygonId });
   }, []);

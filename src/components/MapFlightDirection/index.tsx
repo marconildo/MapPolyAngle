@@ -433,6 +433,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const terrainSourceRef = useRef<TerrainSourceSelection>(terrainSource);
     const onTerrainSourceReadyRef = useRef(onTerrainSourceReady);
     const terrainSourceApplySeqRef = useRef(0);
+    const flightLinesVisibleRef = useRef(true);
 
     // File inputs
     const kmlInputRef = useRef<HTMLInputElement>(null);
@@ -557,6 +558,42 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         });
         onTerrainSourceReadyRef.current?.(nextTerrainSource);
       })();
+    }, []);
+
+    const syncFlightLinesVisibility = useCallback((visible: boolean) => {
+      flightLinesVisibleRef.current = visible;
+
+      const map = mapRef.current;
+      if (map) {
+        const layers = map.getStyle()?.layers ?? [];
+        for (const layer of layers) {
+          if (
+            layer.id.startsWith('flight-lines-layer-') ||
+            layer.id.startsWith('flight-triggers-layer-') ||
+            layer.id.startsWith('flight-triggers-label-')
+          ) {
+            try {
+              map.setLayoutProperty(layer.id, 'visibility', visible ? 'visible' : 'none');
+            } catch {}
+          }
+        }
+      }
+
+      const overlay = deckOverlayRef.current;
+      if (!overlay) return;
+      setDeckLayers((currentLayers) => {
+        const nextLayers = currentLayers.map((layer: any) => {
+          const id = String(layer?.id ?? '');
+          const isFlightLayer =
+            id.startsWith('drone-path-') ||
+            id.startsWith('drone-centerline-') ||
+            id.startsWith('trigger-points-');
+          if (!isFlightLayer) return layer;
+          return typeof layer?.clone === 'function' ? layer.clone({ visible }) : layer;
+        });
+        overlay.setProps({ layers: nextLayers });
+        return nextLayers;
+      });
     }, []);
 
     const syncProcessingPerimeterOverlay = useCallback(() => {
@@ -705,6 +742,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       nextFlightLines.set(polygonId, { ...fl, altitudeAGL: safeParams.altitudeAGL });
       polygonFlightLinesRef.current = nextFlightLines;
       setPolygonFlightLines(nextFlightLines);
+      syncFlightLinesVisibility(flightLinesVisibleRef.current);
 
       if (!opts?.skipEvent && !suppressFlightLineEventsRef.current) {
         onFlightLinesUpdated?.(polygonId);
@@ -737,30 +775,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         } else {
           remove3DTriggerPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
         }
+        syncFlightLinesVisibility(flightLinesVisibleRef.current);
       }
 
       if (opts?.skipQueue) return;
 
       setPendingParamPolygons(prev => {
         const rest = prev.filter(id => id !== polygonId);
-        if (!bulkApplyRef.current && rest.length > 0) {
-          const nextId = rest[0];
-          const nextRes = polygonResultsRef.current.get(nextId);
-          if (nextRes) {
-            scheduleGuardedTimeout(() => onRequestParams?.(nextId, nextRes.polygon.coordinates), 0);
-          } else {
-            const draw = drawRef.current as any;
-            scheduleGuardedTimeout(() => {
-              const f = draw?.get?.(nextId);
-              if (f?.geometry?.type === 'Polygon') onRequestParams?.(nextId, f.geometry.coordinates[0]);
-            }, 0);
-          }
-        } else if (rest.length === 0) {
+        if (rest.length === 0) {
           bulkPresetParamsRef.current = null;
         }
         return rest;
       });
-    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, scheduleGuardedTimeout, turnExtendM]);
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, syncFlightLinesVisibility, turnExtendM]);
 
     const applyPolygonParamsBatch = useCallback((updates: Array<{ polygonId: string; params: PolygonParams }>) => {
       const latestByPolygon = new Map<string, PolygonParams>();
@@ -994,8 +1021,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         );
         update3DPathLayer(overlay, pid, path3d, setDeckLayers);
       });
-    }, [altitudeMode, minClearanceM, turnExtendM]);
-
+      syncFlightLinesVisibility(flightLinesVisibleRef.current);
+    }, [altitudeMode, minClearanceM, syncFlightLinesVisibility, turnExtendM]);
     // ---------- helpers ----------
     const fitMapToRings = useCallback((rings: [number, number][][]) => {
       if (!mapRef.current || rings.length === 0) return;
@@ -1074,12 +1101,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           }
           setPendingParamPolygons(prev => {
             if (bulkApplyRef.current || prev.includes(result.polygonId) || bulkPresetParamsRef.current) return prev;
-            const next = [...prev, result.polygonId];
-            if (next.length === 1) {
-              // defer to avoid render phase state update warning
-              scheduleGuardedTimeout(() => onRequestParams?.(result.polygonId, result.polygon.coordinates), 0);
-            }
-            return next;
+            return [...prev, result.polygonId];
           });
           return;
         }
@@ -1111,6 +1133,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         nextFlightLines.set(result.polygonId, { ...lines, altitudeAGL: safeParams.altitudeAGL });
         polygonFlightLinesRef.current = nextFlightLines;
         setPolygonFlightLines(nextFlightLines);
+        syncFlightLinesVisibility(flightLinesVisibleRef.current);
 
         if (!suppressFlightLineEventsRef.current) {
           if (pendingGeometryRefreshRef.current.delete(result.polygonId)) {
@@ -1148,6 +1171,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } else {
             remove3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, setDeckLayers);
           }
+          syncFlightLinesVisibility(flightLinesVisibleRef.current);
         }
 
         if (pendingOptimizeRef.current.has(result.polygonId)) {
@@ -1161,7 +1185,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           );
         }
       },
-      [debouncedAnalysisComplete, onFlightLinesUpdated, onRequestParams, altitudeMode, minClearanceM, runOptimizedBearingSearch, scheduleGuardedTimeout, withProcessingPolygon]
+      [debouncedAnalysisComplete, onFlightLinesUpdated, altitudeMode, minClearanceM, runOptimizedBearingSearch, scheduleGuardedTimeout, withProcessingPolygon]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -1395,10 +1419,16 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       if (suspendAutoAnalysisRef.current) return;
       e.features.forEach((feature: any) => {
         if (feature.geometry.type === 'Polygon') {
+          const polygonId = String(feature.id ?? '');
+          const ring = feature.geometry.coordinates?.[0] as [number, number][] | undefined;
+          if (polygonId && ring && ring.length >= 4) {
+            scheduleGuardedTimeout(() => onPolygonSelected?.(polygonId), 0);
+            scheduleGuardedTimeout(() => onRequestParams?.(polygonId, ring), 0);
+          }
           analyzePolygon(feature.id, feature);
         }
       });
-    }, [analyzePolygon]);
+    }, [analyzePolygon, onPolygonSelected, onRequestParams, scheduleGuardedTimeout]);
 
     const handleDrawUpdate = useCallback((e: any) => {
       if (suspendAutoAnalysisRef.current) return;
@@ -1435,6 +1465,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         drawRef.current = draw;
         deckOverlayRef.current = overlay;
         applyTerrainSourceToMap(map, terrainDemSourceTemplateRef.current, terrainSourceRef.current);
+        syncFlightLinesVisibility(flightLinesVisibleRef.current);
         map.on('draw.create', handleDrawCreate);
         map.on('draw.update', handleDrawUpdate);
         map.on('draw.delete', handleDrawDelete);
@@ -1467,7 +1498,6 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               // Defer to avoid selection-change re-entrancy
               scheduleGuardedTimeout(() => onPolygonSelected?.(pid), 0);
               if (!shouldSuppressDialog) {
-                scheduleGuardedTimeout(() => onRequestParams?.(pid, ring), 0);
                 // Keep normal polygon clicks lightweight: once the app has recorded the
                 // selection, clear Draw's internal feature selection so left-drag pans
                 // the map again instead of staying in feature-move mode.
@@ -1477,7 +1507,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } catch {}
         });
       },
-      [applyTerrainSourceToMap, clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onRequestParams, onPolygonSelected, scheduleGuardedTimeout]
+      [applyTerrainSourceToMap, clearDrawSelectionForPan, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onPolygonSelected, scheduleGuardedTimeout, syncFlightLinesVisibility]
     );
 
     useEffect(() => {
@@ -2628,6 +2658,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           applyTerrainSourceToMap(mapRef.current, tileUrlTemplate, terrainSourceRef.current);
         }
       },
+      setFlightLinesVisible: (visible: boolean) => {
+        syncFlightLinesVisibility(visible);
+      },
       getPolygons: (): [number,number][][] => {
         const draw = drawRef.current;
         if (!draw) return [];
@@ -2739,6 +2772,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
       optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons, resetAllDrawingsState,
+      syncFlightLinesVisibility,
       lastImportedFlightplan
     ]);
 

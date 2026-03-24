@@ -65,6 +65,7 @@ export interface MapFlightDirectionAPI {
   getPolygonTiles(): Map<string, any[]>; // Keep as any[] for now to match current implementation
   refreshTerrainForAllPolygons(): void;
   setTerrainDemSource(tileUrlTemplate: string | null): void;
+  setFlightLinesVisible(visible: boolean): void;
 
   // Flight planning
   applyPolygonParams(polygonId: string, params: FlightParams): void;

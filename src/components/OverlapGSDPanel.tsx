@@ -242,6 +242,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const [opacity] = useState(0.85);
   const [showOverlap] = useState(false); // Changed default to false
   const [showGsd, setShowGsd] = useState(true);
+  const [showFlightLines, setShowFlightLines] = useState(true);
   const [running, setRunning] = useState(false);
   const [autoGenerate, setAutoGenerate] = useState(true);
   const [showFlightParameters, setShowFlightParameters] = useState(false);
@@ -289,6 +290,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const deferredComputeTimeoutRef = useRef<number | null>(null);
   const computeSeqRef = useRef(0); // increment to invalidate in-flight computations
   const runningRef = useRef(false);
+  const showGsdRef = useRef(showGsd);
+  const showOverlapRef = useRef(showOverlap);
   const pendingComputeRef = useRef<{ polygonId?: string; suppressMapNotReadyToast?: boolean; generation?: number } | null>(null);
   const resetGenerationRef = useRef(0);
   const lastHandledClearAllEpochRef = useRef(clearAllEpoch);
@@ -304,6 +307,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   React.useEffect(() => {
     runningRef.current = running;
   }, [running]);
+
+  React.useEffect(() => {
+    showGsdRef.current = showGsd;
+  }, [showGsd]);
+
+  React.useEffect(() => {
+    showOverlapRef.current = showOverlap;
+  }, [showOverlap]);
+
+  React.useEffect(() => {
+    mapRef.current?.setFlightLinesVisible?.(showFlightLines);
+  }, [mapRef, showFlightLines]);
 
   const cancelGuardedTimeout = useCallback((timeoutId: number | null) => {
     if (timeoutId === null) return;
@@ -414,10 +429,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
             if (key.startsWith(`${polygonId}:`)) delete next[key];
           });
           return next;
-        });
-        toast({
-          title: 'Partition applied',
-          description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
         });
         return result;
       } else {
@@ -662,9 +673,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     const gsdRange = overlayRangeForStats(nextStats.gsd, 'gsd');
     const densityRange = overlayRangeForStats(nextStats.density, 'density');
 
+    const showOverlapNow = showOverlapRef.current;
+    const showGsdNow = showGsdRef.current;
+
     for (const result of cameraTileResultsRef.current.values()) {
-      if (showOverlap) addOrUpdateTileOverlay(map, result, { kind: "overlap", runId, opacity });
-      if (showGsd) {
+      if (showOverlapNow) addOrUpdateTileOverlay(map, result, { kind: "overlap", runId, opacity });
+      if (showGsdNow) {
         addOrUpdateTileOverlay(map, result, {
           kind: "gsd",
           runId,
@@ -676,8 +690,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     }
 
     for (const result of lidarTileResultsRef.current.values()) {
-      if (showOverlap) addOrUpdateTileOverlay(map, result, { kind: "pass", runId, opacity });
-      if (showGsd) {
+      if (showOverlapNow) addOrUpdateTileOverlay(map, result, { kind: "pass", runId, opacity });
+      if (showGsdNow) {
         addOrUpdateTileOverlay(map, result, {
           kind: "density",
           runId,
@@ -687,7 +701,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         });
       }
     }
-  }, [mapRef, opacity, overallStats, overlayRangeForStats, showGsd, showOverlap]);
+  }, [mapRef, opacity, overallStats, overlayRangeForStats]);
+
+  const handleShowAnalysisOverlayChange = useCallback((checked: boolean) => {
+    showGsdRef.current = checked;
+    setShowGsd(checked);
+    redrawAnalysisOverlays();
+  }, [redrawAnalysisOverlays]);
 
   const toOverlayTileResult = useCallback((result: TileResult): OverlayTileResult => ({
     z: result.z,
@@ -2532,7 +2552,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
   React.useEffect(() => {
     redrawAnalysisOverlays();
-  }, [redrawAnalysisOverlays]);
+  }, [redrawAnalysisOverlays, showGsd, showOverlap]);
 
   const displayParamsMap = getMergedParamsMap();
   const lidarPolygonIds = (mapRef.current?.getPolygonsWithIds?.() ?? [])
@@ -2610,10 +2630,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         <h3 className="text-sm font-medium text-gray-900">Coverage Analysis</h3>
       </div>
 
-      <div className="grid grid-cols-1 gap-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <label className="text-xs col-span-1">
-          <input type="checkbox" checked={showGsd} onChange={e=>setShowGsd(e.target.checked)} className="mr-2" />
+          <input type="checkbox" checked={showGsd} onChange={e=>handleShowAnalysisOverlayChange(e.target.checked)} className="mr-2" />
           <span className="font-medium">Show analysis overlay</span>
+        </label>
+        <label className="text-xs col-span-1">
+          <input type="checkbox" checked={showFlightLines} onChange={e=>setShowFlightLines(e.target.checked)} className="mr-2" />
+          <span className="font-medium">Show flight lines</span>
         </label>
       </div>
 
@@ -2656,190 +2680,198 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                   }
                 }}
                 className={`mt-2 transition-shadow border-l-4 ${isSelected ? 'border-l-blue-500 shadow-lg ring-1 ring-blue-400' : 'border-l-transparent hover:shadow-md'}`}
-                onClick={() => {
-                  setSelection(polygonId);
-                  highlightPolygon(polygonId);
-                }}
               >
-                <CardContent className="p-3 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm font-medium text-gray-900">{displayName}</div>
-                    <Badge variant="outline" className="text-[10px] uppercase tracking-wide">{directionSource}</Badge>
-                  </div>
+                <CardContent className={`p-3 ${isSelected ? 'space-y-3' : ''}`}>
+                  <button
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 text-left"
+                    onClick={() => {
+                      if (isSelected) {
+                        setSelection(null);
+                        return;
+                      }
+                      setSelection(polygonId);
+                      highlightPolygon(polygonId);
+                    }}
+                  >
+                    <div className="min-w-0 text-sm font-medium text-gray-900">{displayName}</div>
+                    <div className={`grid shrink-0 items-center gap-x-1.5 ${isSelected ? 'grid-cols-[max-content_3.75rem_max-content]' : 'grid-cols-[max-content_3.75rem]'}`}>
+                      <span className="text-[11px] font-medium text-blue-900 justify-self-end">Flight Direction</span>
+                      <span className="w-[3.75rem] text-right font-mono tabular-nums text-sm font-bold text-blue-700">{directionDeg}°</span>
+                      {isSelected && (
+                        <Badge variant="outline" className="text-[10px] uppercase tracking-wide">{directionSource}</Badge>
+                      )}
+                    </div>
+                  </button>
 
-                  <div className="bg-blue-50 rounded-lg p-2 flex items-center justify-between">
-                    <span className="text-sm font-medium text-blue-900">Flight Direction</span>
-                    <span className="font-mono text-lg font-bold text-blue-700">{directionDeg}°</span>
-                  </div>
+                  {isSelected && (
+                    <>
+                      <div className="flex flex-wrap gap-2">
+                        {!isPoseArea && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-1.5 text-[11px]"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelection(polygonId);
+                              onEditPolygonParams?.(polygonId);
+                            }}
+                            title="Edit payload settings for this area"
+                          >
+                            Edit Payload
+                          </Button>
+                        )}
 
-                  <div className="flex flex-wrap gap-2">
-                    {!isPoseArea && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-6 px-1.5 text-[11px]"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelection(polygonId);
-                          onEditPolygonParams?.(polygonId);
-                        }}
-                        title="Edit payload settings for this area"
-                      >
-                        Edit Payload
-                      </Button>
-                    )}
+                        {!isPoseArea && (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="h-6 px-1.5 text-[11px] border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelection(polygonId);
+                              highlightPolygon(polygonId);
+                              mapRef.current?.editPolygonBoundary?.(polygonId);
+                            }}
+                            title="Edit area boundary on the map"
+                          >
+                            Edit Area
+                          </Button>
+                        )}
 
-                    {!isPoseArea && (
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        className="h-6 px-1.5 text-[11px] border border-input bg-background hover:bg-accent hover:text-accent-foreground"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelection(polygonId);
-                          highlightPolygon(polygonId);
-                          mapRef.current?.editPolygonBoundary?.(polygonId);
-                        }}
-                        title="Edit area boundary on the map"
-                      >
-                        Edit Area
-                      </Button>
-                    )}
-
-                    {!isPoseArea && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-6 px-1.5 text-[11px]"
-                        disabled={!!splittingPolygonIds[polygonId]}
-                        onClick={async (e) => {
-                          e.stopPropagation();
-                          setSelection(polygonId);
-                          setSplittingPolygonIds((prev) => ({ ...prev, [polygonId]: true }));
-                          const splitRunId = `${polygonId}:${++splitPerfSeqRef.current}`;
-                          const startedAt = splitPerfNow();
-                          splitPerfLog(splitRunId, 'auto split button clicked', {
-                            polygonId,
-                            payloadKind: isLidarPayload(polygonId, getMergedParamsMap()) ? 'lidar' : 'camera',
-                          });
-                          suppressAutoRunUntilRef.current = Date.now() + 5000;
-                          try {
-                            let result: { replaced: boolean; createdIds: string[] } | undefined;
-                            let handledPostApply = false;
-                            const api = mapRef.current;
-                            if (api?.getTerrainPartitionSolutions) {
-                              const { solutions, defaultIndex } = await loadTerrainPartitionOptions(polygonId, {
-                                showEmptyToast: false,
-                                showErrorToast: false,
-                              }) ?? { solutions: [], defaultIndex: 0 };
-                              if (solutions.length > 0) {
-                                result = await applyTerrainPartitionOption(polygonId, defaultIndex, solutions[defaultIndex]);
-                                handledPostApply = !!result?.replaced;
-                              }
-                            }
-                            if (!result?.replaced) {
-                              result = await api?.autoSplitPolygonByTerrain?.(polygonId, { skipBackend: true });
-                            }
-                            splitPerfLog(splitRunId, 'auto split action finished', {
-                              totalMs: Math.round(splitPerfNow() - startedAt),
-                              handledPostApply,
-                              result,
-                            });
-                            if (result?.replaced && result.createdIds.length > 1) {
-                              if (!handledPostApply) {
-                                resetComputedAnalysisState();
-                                setSelection(result.createdIds[0] ?? null);
-                                rerunAnalysisForCreatedPolygons(result.createdIds);
-                                toast({
-                                  title: 'Area split',
-                                  description: `Created ${result.createdIds.length} terrain-aligned areas from this polygon.`,
+                        {!isPoseArea && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-1.5 text-[11px]"
+                            disabled={!!splittingPolygonIds[polygonId]}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              setSelection(polygonId);
+                              setSplittingPolygonIds((prev) => ({ ...prev, [polygonId]: true }));
+                              const splitRunId = `${polygonId}:${++splitPerfSeqRef.current}`;
+                              const startedAt = splitPerfNow();
+                              splitPerfLog(splitRunId, 'auto split button clicked', {
+                                polygonId,
+                                payloadKind: isLidarPayload(polygonId, getMergedParamsMap()) ? 'lidar' : 'camera',
+                              });
+                              suppressAutoRunUntilRef.current = Date.now() + 5000;
+                              try {
+                                let result: { replaced: boolean; createdIds: string[] } | undefined;
+                                let handledPostApply = false;
+                                const api = mapRef.current;
+                                if (api?.getTerrainPartitionSolutions) {
+                                  const { solutions, defaultIndex } = await loadTerrainPartitionOptions(polygonId, {
+                                    showEmptyToast: false,
+                                    showErrorToast: false,
+                                  }) ?? { solutions: [], defaultIndex: 0 };
+                                  if (solutions.length > 0) {
+                                    result = await applyTerrainPartitionOption(polygonId, defaultIndex, solutions[defaultIndex]);
+                                    handledPostApply = !!result?.replaced;
+                                  }
+                                }
+                                if (!result?.replaced) {
+                                  result = await api?.autoSplitPolygonByTerrain?.(polygonId, { skipBackend: true });
+                                }
+                                splitPerfLog(splitRunId, 'auto split action finished', {
+                                  totalMs: Math.round(splitPerfNow() - startedAt),
+                                  handledPostApply,
+                                  result,
+                                });
+                                if (result?.replaced && result.createdIds.length > 1) {
+                                  if (!handledPostApply) {
+                                    resetComputedAnalysisState();
+                                    setSelection(result.createdIds[0] ?? null);
+                                    rerunAnalysisForCreatedPolygons(result.createdIds);
+                                  }
+                                } else {
+                                  toast({
+                                    variant: 'destructive',
+                                    title: 'No split created',
+                                    description: 'No useful terrain-face split was found for this area with the current rules.',
+                                  });
+                                  suppressAutoRunUntilRef.current = 0;
+                                }
+                              } finally {
+                                setSplittingPolygonIds((prev) => {
+                                  if (!prev[polygonId]) return prev;
+                                  const next = { ...prev };
+                                  delete next[polygonId];
+                                  return next;
                                 });
                               }
-                            } else {
-                              toast({
-                                variant: 'destructive',
-                                title: 'No split created',
-                                description: 'No useful terrain-face split was found for this area with the current rules.',
-                              });
-                              suppressAutoRunUntilRef.current = 0;
-                            }
-                          } finally {
-                            setSplittingPolygonIds((prev) => {
-                              if (!prev[polygonId]) return prev;
-                              const next = { ...prev };
-                              delete next[polygonId];
-                              return next;
-                            });
-                          }
-                        }}
-                        title="Auto split this area into a few terrain-aligned faces"
-                      >
-                        {!!splittingPolygonIds[polygonId] ? 'Splitting…' : 'Auto Split'}
-                      </Button>
-                    )}
+                            }}
+                            title="Auto split this area into a few terrain-aligned faces"
+                          >
+                            {!!splittingPolygonIds[polygonId] ? 'Splitting…' : 'Auto Split'}
+                          </Button>
+                        )}
 
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-6 px-1.5 text-[11px]"
-                      disabled={isPoseArea}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        mapRef.current?.optimizePolygonDirection?.(polygonId);
-                        scheduleGuardedTimeout(() => setSelection(polygonId), 0);
-                      }}
-                      title="Automatically choose the terrain-optimal direction"
-                    >
-                      Auto Direction
-                    </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 px-1.5 text-[11px]"
+                          disabled={isPoseArea}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            mapRef.current?.optimizePolygonDirection?.(polygonId);
+                            scheduleGuardedTimeout(() => setSelection(polygonId), 0);
+                          }}
+                          title="Automatically choose the terrain-optimal direction"
+                        >
+                          Auto Direction
+                        </Button>
 
-                    {!isPoseArea && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-6 px-1.5 text-[11px] ml-auto border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          mapRef.current?.clearPolygon?.(polygonId);
-                          scheduleGuardedTimeout(() => setSelection(null), 0);
-                        }}
-                        title="Delete polygon"
-                      >
-                        Delete area
-                      </Button>
-                    )}
-                  </div>
-
-                  {metricStats ? (() => {
-                    const displayStats = metricSummaryValues(metricStats);
-                    return (
-                    <div className="space-y-2">
-                      <div className="grid grid-cols-4 gap-3 text-xs">
-                        <div className="text-center">
-                          <div className={`font-medium ${metricValueColorClass(metricKind, 'min')}`}>{formatMetricValue(metricKind, displayStats.low, metricKind === 'density' ? 0 : 1)}</div>
-                          <div className="text-gray-500">{labels.min}</div>
-                        </div>
-                        <div className="text-center">
-                          <div className={`font-medium ${metricValueColorClass(metricKind, 'mean')}`}>{formatMetricValue(metricKind, displayStats.mean, metricKind === 'density' ? 1 : 2)}</div>
-                          <div className="text-gray-500">{labels.mean}</div>
-                        </div>
-                        <div className="text-center">
-                          <div className={`font-medium ${metricValueColorClass(metricKind, 'max')}`}>{formatMetricValue(metricKind, displayStats.high, metricKind === 'density' ? 0 : 1)}</div>
-                          <div className="text-gray-500">{labels.max}</div>
-                        </div>
-                        <div className="text-center">
-                          <div className="font-medium text-gray-900">{areaAcres.toFixed(2)} acres</div>
-                          <div className="text-gray-500">Area</div>
-                        </div>
+                        {!isPoseArea && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-1.5 text-[11px] ml-auto border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              mapRef.current?.clearPolygon?.(polygonId);
+                              scheduleGuardedTimeout(() => setSelection(null), 0);
+                            }}
+                            title="Delete polygon"
+                          >
+                            Delete area
+                          </Button>
+                        )}
                       </div>
-                    </div>
-                    );
-                  })() : (
-                    <div className="text-xs text-gray-500">
-                      {metricKind === 'density'
-                        ? 'Point density analysis will appear after lidar flight lines are generated.'
-                        : 'GSD analysis will appear after camera flight lines are generated.'}
-                    </div>
+
+                      {metricStats ? (() => {
+                        const displayStats = metricSummaryValues(metricStats);
+                        return (
+                        <div className="space-y-2">
+                          <div className="grid grid-cols-4 gap-3 text-xs">
+                            <div className="text-center">
+                              <div className={`font-medium ${metricValueColorClass(metricKind, 'min')}`}>{formatMetricValue(metricKind, displayStats.low, metricKind === 'density' ? 0 : 1)}</div>
+                              <div className="text-gray-500">{labels.min}</div>
+                            </div>
+                            <div className="text-center">
+                              <div className={`font-medium ${metricValueColorClass(metricKind, 'mean')}`}>{formatMetricValue(metricKind, displayStats.mean, metricKind === 'density' ? 1 : 2)}</div>
+                              <div className="text-gray-500">{labels.mean}</div>
+                            </div>
+                            <div className="text-center">
+                              <div className={`font-medium ${metricValueColorClass(metricKind, 'max')}`}>{formatMetricValue(metricKind, displayStats.high, metricKind === 'density' ? 0 : 1)}</div>
+                              <div className="text-gray-500">{labels.max}</div>
+                            </div>
+                            <div className="text-center">
+                              <div className="font-medium text-gray-900">{areaAcres.toFixed(2)} acres</div>
+                              <div className="text-gray-500">Area</div>
+                            </div>
+                          </div>
+                        </div>
+                        );
+                      })() : (
+                        <div className="text-xs text-gray-500">
+                          {metricKind === 'density'
+                            ? 'Point density analysis will appear after lidar flight lines are generated.'
+                            : 'GSD analysis will appear after camera flight lines are generated.'}
+                        </div>
+                      )}
+                    </>
                   )}
                 </CardContent>
               </Card>
