@@ -1,4 +1,4 @@
-import { DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, SONY_RX1R2, forwardSpacingRotated, lineSpacingRotated } from "@/domain/camera";
+import { DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, forwardSpacingRotated, lineSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
 import type { FlightParams, TerrainTile } from "@/domain/types";
 import { build3DFlightPath, calculateOptimalTerrainZoom, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
@@ -13,6 +13,8 @@ import type { TerrainPartitionSolutionPreview } from "@/terrain-partition/types"
 
 const CAMERA_REGISTRY: Record<string, typeof SONY_RX1R2> = {
   SONY_RX1R2,
+  SONY_RX1R3,
+  SONY_A6100_20MM,
   DJI_ZENMUSE_P1_24MM,
   ILX_LR1_INSPECT_85MM,
   MAP61_17MM,

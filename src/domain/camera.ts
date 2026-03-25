@@ -14,6 +14,26 @@ export const SONY_RX1R2: CameraModel = {
   names: [ 'RX1RII 42MP', 'RX1RII', 'RX1R2', 'SONY_RX1R2' ],
 };
 
+// Sony RX1R III / Survey61 (9504 x 6336, 35.7 x 23.8 mm sensor, 35 mm lens)
+export const SONY_RX1R3: CameraModel = {
+  f_m: 0.035,
+  sx_m: 35.7e-3 / 9504,
+  sy_m: 23.8e-3 / 6336,
+  w_px: 9504,
+  h_px: 6336,
+  names: [ 'SURVEY61', 'SURVEY61 v5', 'SUR61', 'RX1R3_v5', 'RX1R3', 'SONY_RX1R3' ],
+};
+
+// Sony A6100 / Survey24 (6000 x 4000, 23.5 x 15.6 mm sensor, 20 mm lens)
+export const SONY_A6100_20MM: CameraModel = {
+  f_m: 0.020,
+  sx_m: 23.5e-3 / 6000,
+  sy_m: 15.6e-3 / 4000,
+  w_px: 6000,
+  h_px: 4000,
+  names: [ 'SURVEY24', 'A6100_v5', 'SURVEY24 v5', 'SUR24', 'SONY_A6100_20MM' ],
+};
+
 // DJI Zenmuse P1 24mm (8192 x 5460, 4.27246 µm pixels, ~24 mm focal length)
 export const DJI_ZENMUSE_P1_24MM: CameraModel = {
   f_m: 5626.690009970837 * 4.27246e-6, // convert focal length in px to meters using pixel size => ≈0.02404 m
