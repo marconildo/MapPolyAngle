@@ -2920,7 +2920,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         <input
           ref={flightplanInputRef}
           type="file"
-          accept=".flightplan,.json,application/json"
+          accept=".flightplan"
           multiple
           onChange={handleFlightplanFileChange}
           style={{ display: 'none' }}

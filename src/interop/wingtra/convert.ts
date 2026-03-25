@@ -33,6 +33,13 @@ const payloadMatches = (candidate: string, name: string) => {
   return false;
 };
 
+function isWingtraFlightPlan(value: unknown): value is WingtraFlightPlan {
+  if (!value || typeof value !== "object") return false;
+  const maybePlan = (value as { flightPlan?: unknown }).flightPlan;
+  if (!maybePlan || typeof maybePlan !== "object") return false;
+  return Array.isArray((maybePlan as { items?: unknown }).items);
+}
+
 /**
  * Convert Wingtra "grid.angle" to "bearing° clockwise from North".
  * - If the JSON is already northCW, this is identity.
@@ -231,6 +238,13 @@ export function importWingtraFlightPlan(
   fp: WingtraFlightPlan,
   opts?: { angleConvention?: WingtraAngleConvention }
 ): ImportedWingtraPlan {
+  if (!isWingtraFlightPlan(fp)) {
+    const maybeGeotags = fp && typeof fp === "object" && Array.isArray((fp as { flights?: unknown }).flights);
+    if (maybeGeotags) {
+      throw new Error("This file looks like Wingtra geotag JSON, not a flightplan. Use Import > Wingtra Geotags (.json).");
+    }
+    throw new Error("Invalid Wingtra flightplan file.");
+  }
   const angleConv = opts?.angleConvention ?? "northCW";
   const payloadName = fp.flightPlan.payload;
   const payloadKey  = (fp.flightPlan as any).payloadUniqueString as string | undefined;

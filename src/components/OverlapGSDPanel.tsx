@@ -273,6 +273,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const poseFileRef = useRef<HTMLInputElement>(null);
   const [poseImportKind, setPoseImportKind] = useState<'auto' | 'dji' | 'wingtra'>('auto');
   const [importedPoses, setImportedPoses] = useState<PoseMeters[]>([]);
+  const lastAutoComputedImportedPosesRef = useRef<PoseMeters[] | null>(null);
+  const redrawAnalysisOverlaysRef = useRef<(() => void) | null>(null);
   const poseAreaRingRef = useRef<[number,number][]>([]);
   // Remember previous polygon rings so we can re-render tiles a moved polygon USED to cover
   const prevPolygonRingsRef = useRef<Map<string, [number, number][]>>(new Map());
@@ -587,6 +589,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
         { padding: 50, duration: 800, maxZoom: 16 },
       );
+      map.once('idle', () => {
+        redrawAnalysisOverlaysRef.current?.();
+      });
     }, 30);
   }, [mapRef, onPosesImported, scheduleGuardedTimeout]);
 
@@ -702,6 +707,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       }
     }
   }, [mapRef, opacity, overallStats, overlayRangeForStats]);
+
+  React.useEffect(() => {
+    redrawAnalysisOverlaysRef.current = () => {
+      redrawAnalysisOverlays();
+    };
+  }, [redrawAnalysisOverlays]);
 
   const handleShowAnalysisOverlayChange = useCallback((checked: boolean) => {
     showGsdRef.current = checked;
@@ -2459,17 +2470,22 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
   // Auto-compute when imported poses arrive (poses-only mode)
   React.useEffect(()=>{
-    if (!autoGenerate && importedPoses.length>0) {
-      const generation = resetGenerationRef.current;
-      const attempt = () => {
-        if (!shouldRunAsyncGeneration(generation, resetGenerationRef.current)) return;
-        const map = mapRef.current?.getMap?.();
-        if (map?.isStyleLoaded?.()) compute({ generation });
-        else scheduleGuardedTimeout(attempt, 200, generation);
-      };
-      attempt();
+    if (autoGenerate || importedPoses.length === 0) {
+      lastAutoComputedImportedPosesRef.current = null;
+      return;
     }
-  }, [autoGenerate, compute, importedPoses.length, mapRef, scheduleGuardedTimeout]);
+    if (lastAutoComputedImportedPosesRef.current === importedPoses) return;
+    lastAutoComputedImportedPosesRef.current = importedPoses;
+
+    const generation = resetGenerationRef.current;
+    const attempt = () => {
+      if (!shouldRunAsyncGeneration(generation, resetGenerationRef.current)) return;
+      const map = mapRef.current?.getMap?.();
+      if (map?.isStyleLoaded?.()) compute({ generation });
+      else scheduleGuardedTimeout(attempt, 200, generation);
+    };
+    attempt();
+  }, [autoGenerate, compute, importedPoses, mapRef, scheduleGuardedTimeout]);
 
   const formatMetricValue = useCallback((metricKind: MetricKind, value: number, precision = 1) => {
     if (metricKind === 'density') return `${value.toFixed(precision)} pts/m²`;
