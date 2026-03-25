@@ -43,11 +43,11 @@ Parameters:
     Description: Maximum number of nested Lambda subtree self-invocations allowed in flight per worker.
   ExactPostprocessTopK:
     Type: Number
-    Default: 5
+    Default: 8
     Description: Maximum number of surrogate-ranked candidate solutions promoted into exact reranking.
   ExactCandidateMaxInflight:
     Type: Number
-    Default: 5
+    Default: 8
     Description: Maximum number of exact candidate rerank Lambda invocations allowed in flight per autosplit request.
 
 Globals:

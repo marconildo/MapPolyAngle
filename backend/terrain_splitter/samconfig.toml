@@ -11,7 +11,7 @@ s3_prefix = "terrain-splitter"
 region = "us-east-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "StageName=\"prod\" AllowedOrigin=\"*\" RootParallelWorkers=\"12\" RootParallelGranularity=\"subtree\" RootParallelMaxInflight=\"16\" LambdaInvokeReadTimeoutSec=\"300\" NestedLambdaMinCells=\"64\" NestedLambdaMaxInflight=\"8\""
+parameter_overrides = "StageName=\"prod\" AllowedOrigin=\"*\" RootParallelWorkers=\"12\" RootParallelGranularity=\"subtree\" RootParallelMaxInflight=\"16\" LambdaInvokeReadTimeoutSec=\"300\" NestedLambdaMinCells=\"64\" NestedLambdaMaxInflight=\"8\" ExactPostprocessTopK=\"8\" ExactCandidateMaxInflight=\"8\""
 image_repositories = []
 
 [staging.build.parameters]
@@ -25,5 +25,5 @@ s3_prefix = "terrain-splitter-staging"
 region = "us-east-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "StageName=\"staging\" AllowedOrigin=\"*\" RootParallelWorkers=\"12\" RootParallelGranularity=\"subtree\" RootParallelMaxInflight=\"16\" LambdaInvokeReadTimeoutSec=\"300\" NestedLambdaMinCells=\"64\" NestedLambdaMaxInflight=\"8\""
+parameter_overrides = "StageName=\"staging\" AllowedOrigin=\"*\" RootParallelWorkers=\"12\" RootParallelGranularity=\"subtree\" RootParallelMaxInflight=\"16\" LambdaInvokeReadTimeoutSec=\"300\" NestedLambdaMinCells=\"64\" NestedLambdaMaxInflight=\"8\" ExactPostprocessTopK=\"8\" ExactCandidateMaxInflight=\"8\""
 image_repositories = []
