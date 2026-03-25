@@ -6,6 +6,7 @@ import {
   RGB61_24MM,
   SONY_RX1R2,
   SONY_RX1R3,
+  SONY_A6100_20MM,
   calculateGSD,
   forwardSpacingRotated,
   lineSpacingRotated,
@@ -32,6 +33,7 @@ type Ring = [number, number][];
 const CAMERA_REGISTRY: Record<string, CameraModel> = {
   SONY_RX1R2,
   SONY_RX1R3,
+  SONY_A6100_20MM,
   DJI_ZENMUSE_P1_24MM,
   ILX_LR1_INSPECT_85MM,
   MAP61_17MM,

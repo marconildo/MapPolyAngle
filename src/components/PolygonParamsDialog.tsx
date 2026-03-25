@@ -2,7 +2,7 @@ import React from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
-import { SONY_RX1R2, SONY_RX1R3, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
+import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, WINGTRA_LIDAR_XT32M2X } from "@/domain/lidar";
 import type { PolygonParams } from "@/components/MapFlightDirection/types";
 
@@ -49,6 +49,7 @@ export default function PolygonParamsDialog({
   const cameraOptions: Array<{ key:string; model:any; label:string }> = [
     { key:'SONY_RX1R2', model: SONY_RX1R2, label: SONY_RX1R2.names?.[0] || 'RX1RII 35mm' },
     { key:'SONY_RX1R3', model: SONY_RX1R3, label: SONY_RX1R3.names?.[0] || 'SURVEY61' },
+    { key:'SONY_A6100_20MM', model: SONY_A6100_20MM, label: SONY_A6100_20MM.names?.[0] || 'SURVEY24' },
     { key:'DJI_ZENMUSE_P1_24MM', model: DJI_ZENMUSE_P1_24MM, label: DJI_ZENMUSE_P1_24MM.names?.[0] || 'DJI Zenmuse P1 24mm' },
     { key:'ILX_LR1_INSPECT_85MM', model: ILX_LR1_INSPECT_85MM, label: ILX_LR1_INSPECT_85MM.names?.[0] || 'INSPECT 85mm' },
     { key:'MAP61_17MM', model: MAP61_17MM, label: MAP61_17MM.names?.[0] || 'MAP61 17mm' },

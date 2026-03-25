@@ -1,7 +1,7 @@
 // src/interop/wingtra/convert.ts
 
 import type { CameraModel, FlightParams, LidarModel, LidarReturnMode, LngLat, PayloadKind } from "@/domain/types";
-import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2, SONY_RX1R3, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, DJI_ZENMUSE_P1_24MM } from "@/domain/camera";
+import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, DJI_ZENMUSE_P1_24MM } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, WINGTRA_LIDAR_XT32M2X, lidarDeliverableDensity, lidarLineSpacing } from "@/domain/lidar";
 import type {
   ExportedArea,
@@ -71,6 +71,7 @@ export function resolveCameraFromWingtra(payloadName?: string, payloadKey?: stri
 const CAMERA_LIST: Array<{ key:string; model: CameraModel }> = [
   { key: 'SONY_RX1R2', model: SONY_RX1R2 },
   { key: 'SONY_RX1R3', model: SONY_RX1R3 },
+  { key: 'SONY_A6100_20MM', model: SONY_A6100_20MM },
   { key: 'ILX_LR1_INSPECT_85MM', model: ILX_LR1_INSPECT_85MM },
   { key: 'MAP61_17MM', model: MAP61_17MM },
   { key: 'RGB61_24MM', model: RGB61_24MM },
