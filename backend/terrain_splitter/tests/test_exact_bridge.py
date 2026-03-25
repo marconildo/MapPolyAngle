@@ -61,10 +61,33 @@ def test_lambda_exact_runtime_bridge_reports_fanout_settings(monkeypatch) -> Non
     assert bridge.candidate_max_inflight() == 7
 
 
-def test_local_exact_runtime_sidecar_bridge_keeps_serial_candidate_behavior() -> None:
+def test_local_exact_runtime_sidecar_bridge_reports_fanout_settings(monkeypatch) -> None:
+    monkeypatch.setenv("TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT", "7")
     bridge = LocalExactRuntimeSidecarBridge(Path("/tmp/repo"))
     try:
-        assert bridge.supports_candidate_fanout() is False
-        assert bridge.candidate_max_inflight() == 1
+        assert bridge.supports_candidate_fanout() is True
+        assert bridge.candidate_max_inflight() == 7
+    finally:
+        bridge.close()
+
+
+def test_local_exact_runtime_sidecar_bridge_closes_batch_states() -> None:
+    bridge = LocalExactRuntimeSidecarBridge(Path("/tmp/repo"))
+    closed: list[object] = []
+    batch_handle = bridge.begin_candidate_batch()
+    state = bridge._get_state(batch_handle=batch_handle)
+    sentinel_proc = object()
+    state.proc = sentinel_proc  # type: ignore[assignment]
+
+    def fake_close_state(candidate_state) -> None:
+        closed.append(candidate_state.proc)
+        candidate_state.proc = None
+
+    bridge._close_state = fake_close_state  # type: ignore[method-assign]
+
+    try:
+        bridge.end_candidate_batch(batch_handle)
+        assert batch_handle not in bridge._batch_states
+        assert closed == [sentinel_proc]
     finally:
         bridge.close()

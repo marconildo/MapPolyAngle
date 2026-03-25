@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -29,15 +30,15 @@ def _resolve_lambda_invoke_read_timeout_sec() -> int:
 def _resolve_exact_candidate_max_inflight() -> int:
     raw = os.environ.get("TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT")
     if raw is None or raw.strip() == "":
-        return 5
+        return 8
     try:
         return max(1, int(raw))
     except ValueError:
         logger.warning(
-            "[terrain-split-backend] invalid TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT=%r; falling back to 5",
+            "[terrain-split-backend] invalid TERRAIN_SPLITTER_EXACT_CANDIDATE_MAX_INFLIGHT=%r; falling back to 8",
             raw,
         )
-        return 5
+        return 8
 
 
 class ExactRuntimeBridge:
@@ -47,26 +48,72 @@ class ExactRuntimeBridge:
     def candidate_max_inflight(self) -> int:
         return 1
 
+    def begin_candidate_batch(self) -> Any | None:
+        return None
+
+    def end_candidate_batch(self, batch_handle: Any | None) -> None:
+        return None
+
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
-    def evaluate_solution(self, request: dict[str, Any]) -> dict[str, Any]:
+    def evaluate_solution(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
         raise NotImplementedError
 
     def rerank_solutions(self, request: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
 
+@dataclass
+class _LocalSidecarState:
+    proc: subprocess.Popen[str] | None = None
+    stderr_thread: threading.Thread | None = None
+    counter: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
     def __init__(self, repo_root: Path) -> None:
         self._repo_root = repo_root
-        self._lock = threading.Lock()
-        self._counter = 0
-        self._proc: subprocess.Popen[str] | None = None
-        self._stderr_thread: threading.Thread | None = None
+        self._candidate_max_inflight = _resolve_exact_candidate_max_inflight()
+        self._states_lock = threading.Lock()
+        self._default_state = _LocalSidecarState()
+        self._batch_states: dict[object, dict[int, _LocalSidecarState]] = {}
         atexit.register(self.close)
 
-    def _spawn(self) -> subprocess.Popen[str]:
+    def supports_candidate_fanout(self) -> bool:
+        return True
+
+    def candidate_max_inflight(self) -> int:
+        return self._candidate_max_inflight
+
+    def begin_candidate_batch(self) -> object:
+        batch_handle = object()
+        with self._states_lock:
+            self._batch_states[batch_handle] = {}
+        return batch_handle
+
+    def end_candidate_batch(self, batch_handle: Any | None) -> None:
+        if batch_handle is None:
+            return
+        with self._states_lock:
+            states = list(self._batch_states.pop(batch_handle, {}).values())
+        for state in states:
+            self._close_state(state)
+
+    def _get_state(self, *, batch_handle: Any | None = None) -> _LocalSidecarState:
+        if batch_handle is None:
+            return self._default_state
+        thread_id = threading.get_ident()
+        with self._states_lock:
+            batch_states = self._batch_states.setdefault(batch_handle, {})
+            state = batch_states.get(thread_id)
+            if state is None:
+                state = _LocalSidecarState()
+                batch_states[thread_id] = state
+        return state
+
+    def _spawn(self, state: _LocalSidecarState) -> subprocess.Popen[str]:
         env = os.environ.copy()
         env.setdefault("EXACT_RUNTIME_PROVIDER_MODE", "local-http")
         env.setdefault("EXACT_RUNTIME_INTERNAL_BASE_URL", os.environ.get("TERRAIN_SPLITTER_INTERNAL_BASE_URL", "http://127.0.0.1:8090"))
@@ -87,8 +134,8 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
             bufsize=1,
         )
         if proc.stderr is not None:
-            self._stderr_thread = threading.Thread(target=self._forward_stderr, args=(proc.stderr,), daemon=True)
-            self._stderr_thread.start()
+            state.stderr_thread = threading.Thread(target=self._forward_stderr, args=(proc.stderr,), daemon=True)
+            state.stderr_thread.start()
         return proc
 
     def _forward_stderr(self, pipe: TextIO) -> None:
@@ -100,17 +147,28 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
         except Exception as exc:  # noqa: BLE001
             logger.error("[exact-runtime-sidecar] stderr pump failed error=%s", exc)
 
-    def _ensure_proc(self) -> subprocess.Popen[str]:
-        if self._proc is None or self._proc.poll() is not None:
-            self.close()
-            self._proc = self._spawn()
-        return self._proc
+    def _close_state(self, state: _LocalSidecarState) -> None:
+        proc, state.proc = state.proc, None
+        state.stderr_thread = None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
-    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            proc = self._ensure_proc()
-            self._counter += 1
-            request_id = f"exact-{self._counter}"
+    def _ensure_proc(self, state: _LocalSidecarState) -> subprocess.Popen[str]:
+        if state.proc is None or state.proc.poll() is not None:
+            self._close_state(state)
+            state.proc = self._spawn(state)
+        return state.proc
+
+    def _request(self, payload: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
+        state = self._get_state(batch_handle=batch_handle)
+        with state.lock:
+            proc = self._ensure_proc(state)
+            state.counter += 1
+            request_id = f"exact-{threading.get_ident()}-{state.counter}"
             envelope = {"id": request_id, "request": payload}
             if proc.stdin is None or proc.stdout is None:
                 raise RuntimeError("Exact runtime sidecar pipes are not available.")
@@ -135,21 +193,20 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request({"operation": "optimize-bearing", **request})
 
-    def evaluate_solution(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._request({"operation": "evaluate-solution", **request})
+    def evaluate_solution(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
+        return self._request({"operation": "evaluate-solution", **request}, batch_handle=batch_handle)
 
     def rerank_solutions(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request({"operation": "rerank-solutions", **request})
 
     def close(self) -> None:
-        proc, self._proc = self._proc, None
-        self._stderr_thread = None
-        if proc is None:
-            return
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+        with self._states_lock:
+            batch_states = list(self._batch_states.values())
+            self._batch_states = {}
+        self._close_state(self._default_state)
+        for batch in batch_states:
+            for state in batch.values():
+                self._close_state(state)
 
 
 class LambdaExactRuntimeBridge(ExactRuntimeBridge):
@@ -188,7 +245,7 @@ class LambdaExactRuntimeBridge(ExactRuntimeBridge):
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._invoke({"operation": "optimize-bearing", **request})
 
-    def evaluate_solution(self, request: dict[str, Any]) -> dict[str, Any]:
+    def evaluate_solution(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
         return self._invoke({"operation": "evaluate-solution", **request})
 
     def rerank_solutions(self, request: dict[str, Any]) -> dict[str, Any]:

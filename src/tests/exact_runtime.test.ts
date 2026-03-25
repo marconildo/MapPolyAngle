@@ -201,6 +201,7 @@ async function main() {
           polygonId: "poly-1",
           fastestMissionTimeSec: 120,
           rankingSource: "backend-exact",
+          debugTrace: true,
           solution: {
             signature: "candidate-a",
             tradeoff: 0.5,
@@ -231,6 +232,44 @@ async function main() {
         assert.ok(Number.isFinite(evaluateSolutionResponse.solution.exactScore ?? Number.NaN));
         assert.equal(evaluateSolutionResponse.preview.metricKind, "gsd");
         assert.ok(evaluateSolutionResponse.preview.sampleCount > 0);
+        assert.ok(evaluateSolutionResponse.debugTrace);
+        assert.equal(evaluateSolutionResponse.debugTrace?.signature, "candidate-a");
+        assert.equal(evaluateSolutionResponse.debugTrace?.partitionScoreBreakdown.modelVersion, "camera-partition-v1");
+
+        const evaluateSolutionWithoutTrace = await handleExactRuntimeRequest({
+          operation: "evaluate-solution",
+          ...commonRequest,
+          polygonId: "poly-1",
+          fastestMissionTimeSec: 120,
+          rankingSource: "backend-exact",
+          solution: evaluateSolutionResponse.solution,
+        });
+        assert.equal(evaluateSolutionWithoutTrace.operation, "evaluate-solution");
+        assert.equal(evaluateSolutionWithoutTrace.debugTrace, undefined);
+
+        const rerankResponse = await handleExactRuntimeRequest({
+          operation: "rerank-solutions",
+          ...commonRequest,
+          polygonId: "poly-1",
+          rankingSource: "backend-exact",
+          debugTrace: true,
+          solutions: [
+            evaluateSolutionResponse.solution,
+            {
+              ...evaluateSolutionResponse.solution,
+              signature: "candidate-b",
+              isFirstPracticalSplit: false,
+              regions: evaluateSolutionResponse.solution.regions.map((region) => ({
+                ...region,
+                bearingDeg: 0,
+              })),
+            },
+          ],
+        });
+        assert.equal(rerankResponse.operation, "rerank-solutions");
+        assert.ok(rerankResponse.debugBySignature);
+        assert.ok(rerankResponse.debugBySignature?.["candidate-a"]);
+        assert.ok(rerankResponse.debugBySignature?.["candidate-b"]);
       },
     );
 

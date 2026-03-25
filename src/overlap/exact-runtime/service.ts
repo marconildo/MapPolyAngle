@@ -355,11 +355,13 @@ export async function handleExactRuntimeRequest(request: ExactRuntimeRequest): P
       solution: request.solution,
       fastestMissionTimeSec: request.fastestMissionTimeSec,
       rankingSource: request.rankingSource ?? "backend-exact",
+      debugTrace: request.debugTrace,
     });
     return {
       operation: "evaluate-solution",
       solution: result.solution,
       preview: toPreviewPayload(result.preview),
+      debugTrace: request.debugTrace ? result.debugTrace : undefined,
     };
   }
 
@@ -403,6 +405,7 @@ export async function handleExactRuntimeRequest(request: ExactRuntimeRequest): P
     minOverlapForGsd: request.minOverlapForGsd,
     solutions: request.solutions,
     rankingSource: request.rankingSource ?? "backend-exact",
+    debugTrace: request.debugTrace,
   });
   const sortedSolutions = [...reranked.solutions].sort((left, right) => {
     const leftScore = Number.isFinite(left.exactScore ?? Number.NaN) ? left.exactScore! : Number.POSITIVE_INFINITY;
@@ -419,5 +422,6 @@ export async function handleExactRuntimeRequest(request: ExactRuntimeRequest): P
         toPreviewPayload(preview),
       ]),
     ),
+    debugBySignature: request.debugTrace ? reranked.debugBySignature : undefined,
   };
 }

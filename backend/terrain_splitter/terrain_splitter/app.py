@@ -29,8 +29,9 @@ from .dsm_uploads import (
 )
 from .exact_bridge import create_exact_runtime_bridge
 from .features import compute_feature_field
+from .geometry import ring_to_polygon_mercator
 from .grid import build_grid
-from .mapbox_tiles import TerrainTileCache, fetch_dem_for_ring, mapbox_token
+from .mapbox_tiles import TerrainTileCache, choose_grid_step_m, fetch_dem_for_ring, mapbox_token
 from .schemas import (
     DebugArtifacts,
     DsmFinalizeUploadRequest,
@@ -134,9 +135,414 @@ DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
 DSM_UPLOAD_STAGING_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_UPLOAD_STAGING_DIR", ".dsm-upload-staging")
 DSM_DATASET_STORE = create_dsm_dataset_store(DSM_DIR)
 EXACT_RUNTIME_BRIDGE = create_exact_runtime_bridge()
-EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_K", "5")))
+EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_K", "8")))
+# Keep these aligned with the exact runtime defaults used by the TS scorer.
+EXACT_POSTPROCESS_OPTIMIZE_ZOOM = 14
+EXACT_POSTPROCESS_TIME_WEIGHT = 0.1
+EXACT_POSTPROCESS_QUALITY_WEIGHT = 1.0 - EXACT_POSTPROCESS_TIME_WEIGHT
 ENABLE_INTERNAL_TERRAIN_BATCH_HTTP = _should_enable_internal_http()
 logger = logging.getLogger("uvicorn.error")
+
+
+def _safe_artifact_component(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip())
+    return cleaned.strip("_") or "value"
+
+
+def _solution_debug_summary(
+    solution: PartitionSolutionPreviewModel,
+    *,
+    surrogate_rank: int,
+    exact_requested: bool,
+    exact_evaluated: bool,
+    not_evaluated_reason: str | None = None,
+    exact_rank: int | None = None,
+    candidate_error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "surrogateRank": surrogate_rank,
+        "signature": solution.signature,
+        "tradeoff": solution.tradeoff,
+        "regionCount": solution.regionCount,
+        "totalMissionTimeSec": solution.totalMissionTimeSec,
+        "normalizedQualityCost": solution.normalizedQualityCost,
+        "weightedMeanMismatchDeg": solution.weightedMeanMismatchDeg,
+        "hierarchyLevel": solution.hierarchyLevel,
+        "largestRegionFraction": solution.largestRegionFraction,
+        "meanConvexity": solution.meanConvexity,
+        "boundaryBreakAlignment": solution.boundaryBreakAlignment,
+        "isFirstPracticalSplit": solution.isFirstPracticalSplit,
+        "exactRequested": exact_requested,
+        "exactEvaluated": exact_evaluated,
+        "notEvaluatedReason": not_evaluated_reason,
+        "exactRank": exact_rank,
+        "exactScore": solution.exactScore,
+        "exactQualityCost": solution.exactQualityCost,
+        "exactMissionTimeSec": solution.exactMissionTimeSec,
+        "exactMetricKind": solution.exactMetricKind,
+        "candidateError": candidate_error,
+    }
+
+
+def _coerce_finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    return None
+
+
+def _ranked_ms_entries(
+    values: dict[str, Any],
+    *,
+    total_ms: float | None = None,
+    top_n: int = 8,
+    name_key: str = "name",
+    share_key: str = "shareOfTotalMs",
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for name, value in values.items():
+        numeric = _coerce_finite_float(value)
+        if numeric is None or numeric <= 0:
+            continue
+        entry: dict[str, Any] = {
+            name_key: name,
+            "ms": round(numeric, 3),
+        }
+        if total_ms is not None and total_ms > 0:
+            entry[share_key] = round(numeric / total_ms, 6)
+        entries.append(entry)
+    entries.sort(key=lambda item: item["ms"], reverse=True)
+    return entries[:top_n]
+
+
+def _build_request_phase_performance_summary(
+    *,
+    fetch_dem_ms: float,
+    build_grid_ms: float,
+    compute_features_ms: float,
+    solve_ms: float,
+    exact_postprocess_ms: float,
+    debug_artifacts_ms: float | None = None,
+    total_ms: float | None = None,
+) -> dict[str, Any]:
+    phases = {
+        "solveMs": solve_ms,
+        "exactPostprocessMs": exact_postprocess_ms,
+        "buildGridMs": build_grid_ms,
+        "fetchDemMs": fetch_dem_ms,
+        "computeFeaturesMs": compute_features_ms,
+    }
+    if debug_artifacts_ms is not None:
+        phases["debugArtifactsMs"] = debug_artifacts_ms
+    known_total_ms = sum(value for value in phases.values() if value > 0)
+    effective_total_ms = max(total_ms or 0.0, known_total_ms)
+    return {
+        "notes": "request phase timings are wall-clock and non-overlapping",
+        "knownPhaseTotalMs": round(known_total_ms, 3),
+        "totalMs": round(effective_total_ms, 3),
+        "unaccountedMs": round(max(0.0, effective_total_ms - known_total_ms), 3),
+        "topStages": _ranked_ms_entries(
+            phases,
+            total_ms=effective_total_ms,
+            top_n=6,
+            name_key="stage",
+            share_key="shareOfRequestMs",
+        ),
+    }
+
+
+def _build_solver_performance_summary(
+    solver_debug_payload: dict[str, Any] | None,
+    *,
+    solve_ms: float,
+) -> dict[str, Any] | None:
+    if not isinstance(solver_debug_payload, dict):
+        return None
+    solver_summary = solver_debug_payload.get("solverSummary")
+    if not isinstance(solver_summary, dict):
+        return None
+    performance = solver_summary.get("performance")
+    if not isinstance(performance, dict):
+        return None
+    inclusive_timings = {
+        key: value
+        for key, value in performance.items()
+        if key.endswith("_ms")
+    }
+    objective_ms = _coerce_finite_float(performance.get("objective_ms")) or 0.0
+    build_region_ms = _coerce_finite_float(performance.get("build_region_ms")) or 0.0
+    flight_time_ms = _coerce_finite_float(performance.get("flight_time_ms")) or 0.0
+    exact_geometry_total_ms = _coerce_finite_float(performance.get("exact_geometry_reeval_ms")) or 0.0
+    objective_component_timings = {
+        "flightTimeMs": _coerce_finite_float(performance.get("flight_time_ms")) or 0.0,
+        "lineLiftMs": _coerce_finite_float(performance.get("line_lift_ms")) or 0.0,
+        "nodeCostMs": _coerce_finite_float(performance.get("node_cost_ms")) or 0.0,
+        "shapeMetricMs": _coerce_finite_float(performance.get("shape_metric_ms")) or 0.0,
+    }
+    search_stage_timings = {
+        "buildRegionMs": build_region_ms,
+        "splitCandidateEnumerationMs": _coerce_finite_float(performance.get("split_candidate_enumeration_ms")) or 0.0,
+        "recursiveSubsolveMs": _coerce_finite_float(performance.get("recursive_subsolve_ms")) or 0.0,
+        "planCombineMs": _coerce_finite_float(performance.get("plan_combine_ms")) or 0.0,
+        "frontierPruneMs": _coerce_finite_float(performance.get("frontier_prune_ms")) or 0.0,
+        "exactGeometryReevalMs": exact_geometry_total_ms,
+        "legacySplitGenerationMs": _coerce_finite_float(performance.get("split_generation_ms")) or 0.0,
+    }
+    exact_geometry_timings = {
+        "regionReevalMs": _coerce_finite_float(performance.get("exact_geometry_region_reeval_ms")) or 0.0,
+        "reconstructMs": _coerce_finite_float(performance.get("exact_geometry_reconstruct_ms")) or 0.0,
+        "exactRegionObjectiveMs": _coerce_finite_float(performance.get("exact_region_objective_ms")) or 0.0,
+    }
+    return {
+        "notes": "solver performance counters are inclusive and may overlap",
+        "topInclusiveMs": _ranked_ms_entries(
+            inclusive_timings,
+            total_ms=solve_ms,
+            top_n=8,
+            name_key="metric",
+            share_key="shareOfSolveMsInclusive",
+        ),
+        "flightTimeAnalysis": {
+            "flightTimeMs": round(flight_time_ms, 3),
+            "objectiveMs": round(objective_ms, 3),
+            "buildRegionMs": round(build_region_ms, 3),
+            "solveMs": round(solve_ms, 3),
+            "shareOfObjectiveMs": round(flight_time_ms / objective_ms, 6) if objective_ms > 0 else None,
+            "shareOfBuildRegionMs": round(flight_time_ms / build_region_ms, 6) if build_region_ms > 0 else None,
+            "shareOfSolveMs": round(flight_time_ms / solve_ms, 6) if solve_ms > 0 else None,
+        },
+        "objectiveComponentBreakdown": {
+            "notes": "objective component timings are inclusive within objective evaluation",
+            "topStages": _ranked_ms_entries(
+                objective_component_timings,
+                total_ms=objective_ms if objective_ms > 0 else None,
+                top_n=6,
+                name_key="stage",
+                share_key="shareOfObjectiveMs",
+            ),
+        },
+        "searchStageBreakdown": {
+            "notes": "search-stage timings are mixed counters gathered during surrogate search; some overlap",
+            "topStages": _ranked_ms_entries(
+                search_stage_timings,
+                total_ms=solve_ms if solve_ms > 0 else None,
+                top_n=8,
+                name_key="stage",
+                share_key="shareOfSolveMs",
+            ),
+        },
+        "exactGeometryBreakdown": {
+            "notes": "exact-geometry reevaluation runs after surrogate frontier generation and before app-level exact rerank",
+            "planCount": int(_coerce_finite_float(performance.get("exact_geometry_plan_count")) or 0.0),
+            "totalMs": round(exact_geometry_total_ms, 3),
+            "topStages": _ranked_ms_entries(
+                exact_geometry_timings,
+                total_ms=exact_geometry_total_ms if exact_geometry_total_ms > 0 else None,
+                top_n=6,
+                name_key="stage",
+                share_key="shareOfExactGeometryMs",
+            ),
+        },
+        "parallel": {
+            "rootParallelMs": round(_coerce_finite_float(performance.get("root_parallel_ms")) or 0.0, 3),
+            "nestedParallelMs": round(_coerce_finite_float(performance.get("nested_parallel_ms")) or 0.0, 3),
+            "rootParallelWorkersUsed": int(_coerce_finite_float(performance.get("root_parallel_workers_used")) or 0.0),
+            "nestedParallelWorkersUsedMax": int(_coerce_finite_float(performance.get("nested_parallel_workers_used_max")) or 0.0),
+        },
+        "cacheHitRates": {
+            "regionCacheHitRate": round(
+                (_coerce_finite_float(performance.get("region_cache_hits")) or 0.0)
+                / max(
+                    1.0,
+                    (_coerce_finite_float(performance.get("region_cache_hits")) or 0.0)
+                    + (_coerce_finite_float(performance.get("region_cache_misses")) or 0.0),
+                ),
+                6,
+            ),
+            "regionStaticHitRate": round(
+                (_coerce_finite_float(performance.get("region_static_hits")) or 0.0)
+                / max(
+                    1.0,
+                    (_coerce_finite_float(performance.get("region_static_hits")) or 0.0)
+                    + (_coerce_finite_float(performance.get("region_static_misses")) or 0.0),
+                ),
+                6,
+            ),
+            "regionBearingHitRate": round(
+                (_coerce_finite_float(performance.get("region_bearing_hits")) or 0.0)
+                / max(
+                    1.0,
+                    (_coerce_finite_float(performance.get("region_bearing_hits")) or 0.0)
+                    + (_coerce_finite_float(performance.get("region_bearing_misses")) or 0.0),
+                ),
+                6,
+            ),
+        },
+        "counts": {
+            "buildRegionCalls": int(_coerce_finite_float(performance.get("build_region_calls")) or 0.0),
+            "objectiveCalls": int(_coerce_finite_float(performance.get("objective_calls")) or 0.0),
+            "splitAttempts": int(_coerce_finite_float(performance.get("split_attempts")) or 0.0),
+            "splitCandidatesReturned": int(_coerce_finite_float(performance.get("split_candidates_returned")) or 0.0),
+            "frontierPlanCount": int(_coerce_finite_float(performance.get("frontier_plan_count")) or 0.0),
+        },
+    }
+
+
+def _build_exact_candidate_performance_summary(
+    *,
+    signature: str,
+    exact_trace: dict[str, Any] | None,
+    bridge_elapsed_ms: float | None = None,
+) -> dict[str, Any]:
+    timings = exact_trace.get("timings") if isinstance(exact_trace, dict) else {}
+    runtime_total_ms = _coerce_finite_float(timings.get("totalElapsedMs")) if isinstance(timings, dict) else None
+    preview_elapsed_ms = _coerce_finite_float(timings.get("previewElapsedMs")) if isinstance(timings, dict) else None
+    raw_region_elapsed = timings.get("regionSearchElapsedMs") if isinstance(timings, dict) else None
+    region_elapsed_ms = [
+        numeric
+        for value in raw_region_elapsed or []
+        if (numeric := _coerce_finite_float(value)) is not None and numeric >= 0
+    ]
+    region_search_total_ms = sum(region_elapsed_ms)
+    runtime_overhead_ms = None
+    if runtime_total_ms is not None:
+        runtime_overhead_ms = max(0.0, runtime_total_ms - region_search_total_ms - (preview_elapsed_ms or 0.0))
+    bridge_overhead_ms = None
+    if bridge_elapsed_ms is not None and runtime_total_ms is not None:
+        bridge_overhead_ms = max(0.0, bridge_elapsed_ms - runtime_total_ms)
+    stage_durations: dict[str, float] = {}
+    if region_search_total_ms > 0:
+        stage_durations["regionSearchTotalMs"] = region_search_total_ms
+    if preview_elapsed_ms is not None and preview_elapsed_ms > 0:
+        stage_durations["previewElapsedMs"] = preview_elapsed_ms
+    if runtime_overhead_ms is not None and runtime_overhead_ms > 0:
+        stage_durations["runtimeOverheadMs"] = runtime_overhead_ms
+    if bridge_overhead_ms is not None and bridge_overhead_ms > 0:
+        stage_durations["bridgeOverheadMs"] = bridge_overhead_ms
+    candidate_total_ms = bridge_elapsed_ms or runtime_total_ms or region_search_total_ms or 0.0
+    region_hotspots = [
+        {
+            "regionIndex": index,
+            "ms": round(elapsed_ms, 3),
+            "shareOfRegionSearchMs": round(elapsed_ms / region_search_total_ms, 6) if region_search_total_ms > 0 else 0.0,
+        }
+        for index, elapsed_ms in sorted(
+            enumerate(region_elapsed_ms),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:5]
+    ]
+    return {
+        "signature": signature,
+        "bridgeElapsedMs": round(bridge_elapsed_ms, 3) if bridge_elapsed_ms is not None else None,
+        "runtimeTotalElapsedMs": round(runtime_total_ms, 3) if runtime_total_ms is not None else None,
+        "regionSearchTotalMs": round(region_search_total_ms, 3),
+        "previewElapsedMs": round(preview_elapsed_ms, 3) if preview_elapsed_ms is not None else None,
+        "runtimeOverheadMs": round(runtime_overhead_ms, 3) if runtime_overhead_ms is not None else None,
+        "bridgeOverheadMs": round(bridge_overhead_ms, 3) if bridge_overhead_ms is not None else None,
+        "stageHotspots": _ranked_ms_entries(
+            stage_durations,
+            total_ms=candidate_total_ms if candidate_total_ms > 0 else None,
+            top_n=4,
+            name_key="stage",
+            share_key="shareOfCandidateMs",
+        ),
+        "regionHotspots": region_hotspots,
+        "longestRegion": region_hotspots[0] if region_hotspots else None,
+    }
+
+
+def _build_exact_rerank_performance_summary(
+    *,
+    exact_mode: str | None,
+    exact_postprocess_ms: float,
+    exact_candidates: list[PartitionSolutionPreviewModel],
+    exact_rank_by_signature: dict[str, int],
+    exact_debug_by_signature: dict[str, dict[str, Any]],
+    exact_candidate_elapsed_ms: dict[str, float],
+) -> dict[str, Any]:
+    candidate_entries: list[dict[str, Any]] = []
+    aggregate_stage_totals = {
+        "candidateRuntimeTotalMs": 0.0,
+        "candidateRegionSearchTotalMs": 0.0,
+        "candidatePreviewTotalMs": 0.0,
+        "candidateRuntimeOverheadMs": 0.0,
+        "candidateBridgeOverheadMs": 0.0,
+    }
+    total_bridge_ms = 0.0
+    for surrogate_rank, candidate in enumerate(exact_candidates, start=1):
+        summary = _build_exact_candidate_performance_summary(
+            signature=candidate.signature,
+            exact_trace=exact_debug_by_signature.get(candidate.signature),
+            bridge_elapsed_ms=exact_candidate_elapsed_ms.get(candidate.signature),
+        )
+        bridge_elapsed_ms = _coerce_finite_float(summary.get("bridgeElapsedMs"))
+        runtime_total_ms = _coerce_finite_float(summary.get("runtimeTotalElapsedMs"))
+        region_search_total_ms = _coerce_finite_float(summary.get("regionSearchTotalMs")) or 0.0
+        preview_elapsed_ms = _coerce_finite_float(summary.get("previewElapsedMs")) or 0.0
+        runtime_overhead_ms = _coerce_finite_float(summary.get("runtimeOverheadMs")) or 0.0
+        bridge_overhead_ms = _coerce_finite_float(summary.get("bridgeOverheadMs")) or 0.0
+        if bridge_elapsed_ms is not None:
+            total_bridge_ms += bridge_elapsed_ms
+        if runtime_total_ms is not None:
+            aggregate_stage_totals["candidateRuntimeTotalMs"] += runtime_total_ms
+        aggregate_stage_totals["candidateRegionSearchTotalMs"] += region_search_total_ms
+        aggregate_stage_totals["candidatePreviewTotalMs"] += preview_elapsed_ms
+        aggregate_stage_totals["candidateRuntimeOverheadMs"] += runtime_overhead_ms
+        aggregate_stage_totals["candidateBridgeOverheadMs"] += bridge_overhead_ms
+        candidate_entries.append(
+            {
+                "signature": candidate.signature,
+                "surrogateRank": surrogate_rank,
+                "exactRank": exact_rank_by_signature.get(candidate.signature),
+                "regionCount": candidate.regionCount,
+                "bridgeElapsedMs": summary.get("bridgeElapsedMs"),
+                "runtimeTotalElapsedMs": summary.get("runtimeTotalElapsedMs"),
+                "regionSearchTotalMs": summary.get("regionSearchTotalMs"),
+                "previewElapsedMs": summary.get("previewElapsedMs"),
+            }
+        )
+    candidate_entries.sort(
+        key=lambda entry: (
+            _coerce_finite_float(entry.get("bridgeElapsedMs"))
+            or _coerce_finite_float(entry.get("runtimeTotalElapsedMs"))
+            or 0.0
+        ),
+        reverse=True,
+    )
+    summary: dict[str, Any] = {
+        "notes": "exact candidate timings are per-candidate wall-clock and overlap in fanout mode",
+        "mode": exact_mode,
+        "candidateCount": len(exact_candidates),
+        "wallClockExactPostprocessMs": round(exact_postprocess_ms, 3),
+        "sumCandidateBridgeElapsedMs": round(total_bridge_ms, 3) if total_bridge_ms > 0 else None,
+        "topCandidatesByBridgeElapsedMs": candidate_entries[:5],
+        "aggregateStageHotspots": _ranked_ms_entries(
+            aggregate_stage_totals,
+            total_ms=total_bridge_ms if total_bridge_ms > 0 else None,
+            top_n=5,
+            name_key="stage",
+            share_key="shareOfCandidateBridgeMs",
+        ),
+    }
+    if exact_mode == "fanout" and exact_postprocess_ms > 0 and total_bridge_ms > 0:
+        summary["parallelSpeedupEstimate"] = round(total_bridge_ms / exact_postprocess_ms, 3)
+    return summary
+
+
+def _format_hotspot_log_entries(entries: list[dict[str, Any]], *, label_key: str, limit: int = 3) -> str:
+    if not entries:
+        return "none"
+    formatted: list[str] = []
+    for entry in entries[:limit]:
+        label = entry.get(label_key)
+        elapsed_ms = _coerce_finite_float(entry.get("ms") if "ms" in entry else entry.get("bridgeElapsedMs"))
+        if label is None or elapsed_ms is None:
+            continue
+        formatted.append(f"{label}:{elapsed_ms:.1f}ms")
+    return ", ".join(formatted) if formatted else "none"
 
 app = FastAPI(title="Terrain Splitter Backend", version="0.1.0")
 if _env_flag("TERRAIN_SPLITTER_ENABLE_APP_CORS", True):
@@ -430,16 +836,19 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
     )
     try:
         stage_started_at = time.perf_counter()
+        # Keep DEM zoom selection aligned with the area-derived grid resolution.
+        grid_step_m = choose_grid_step_m(float(ring_to_polygon_mercator(request.ring).area))
         dem, zoom = fetch_dem_for_ring(
             request.ring,
             CACHE_DIR,
+            grid_step_m=grid_step_m,
             terrain_source=request.terrainSource,
             dsm_store=DSM_DATASET_STORE,
         )
         fetch_dem_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         stage_started_at = time.perf_counter()
-        grid = build_grid(request.ring, dem)
+        grid = build_grid(request.ring, dem, grid_step_m=grid_step_m)
         build_grid_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         stage_started_at = time.perf_counter()
@@ -461,20 +870,36 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
 
         stage_started_at = time.perf_counter()
         exact_postprocess_ms = 0.0
-        if EXACT_RUNTIME_BRIDGE is not None and len(solutions) > 1:
+        polygon_id = request.polygonId or request_id
+        terrain_source_payload = request.terrainSource.model_dump(mode="json")
+        params_payload = request.params.model_dump(mode="json")
+        surrogate_solutions = list(solutions)
+        exact_candidates = surrogate_solutions[: min(EXACT_POSTPROCESS_TOP_K, len(surrogate_solutions))]
+        exact_solutions: list[PartitionSolutionPreviewModel] = []
+        exact_debug_by_signature: dict[str, dict[str, Any]] = {}
+        exact_candidate_elapsed_ms: dict[str, float] = {}
+        exact_candidate_errors: dict[str, str] = {}
+        exact_mode: str | None = None
+        exact_status = "skipped"
+        exact_skip_reason: str | None = None
+        exact_error: str | None = None
+        solver_perf_summary = _build_solver_performance_summary(solver_debug_payload, solve_ms=solve_ms)
+        if solver_perf_summary is not None and isinstance(solver_debug_payload, dict):
+            solver_summary_payload = solver_debug_payload.get("solverSummary")
+            if isinstance(solver_summary_payload, dict):
+                solver_summary_payload["performanceHotspots"] = solver_perf_summary
+        if EXACT_RUNTIME_BRIDGE is not None and len(surrogate_solutions) > 1:
             try:
-                exact_candidates = solutions[: min(EXACT_POSTPROCESS_TOP_K, len(solutions))]
+                exact_status = "executed"
                 logger.warning(
                     "[terrain-split-autosplit][%s] exact-rerank start polygonId=%s surrogateSolutions=%d candidateSolutions=%d",
                     request_id,
                     request.polygonId or "<none>",
-                    len(solutions),
+                    len(surrogate_solutions),
                     len(exact_candidates),
                 )
-                polygon_id = request.polygonId or request_id
-                terrain_source_payload = request.terrainSource.model_dump(mode="json")
-                params_payload = request.params.model_dump(mode="json")
                 if EXACT_RUNTIME_BRIDGE.supports_candidate_fanout() and len(exact_candidates) > 1:
+                    exact_mode = "fanout"
                     max_inflight = min(
                         len(exact_candidates),
                         EXACT_POSTPROCESS_TOP_K,
@@ -495,6 +920,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                         max_inflight,
                         [f"{index}:{payload['signature']}" for index, payload in candidate_specs],
                     )
+                    batch_handle = EXACT_RUNTIME_BRIDGE.begin_candidate_batch()
 
                     def _evaluate_exact_candidate(original_index: int, solution_payload: dict[str, Any]) -> tuple[int, dict[str, Any], float]:
                         candidate_started_at = time.perf_counter()
@@ -511,48 +937,60 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                                 "solution": solution_payload,
                                 "fastestMissionTimeSec": fastest_mission_time_sec,
                                 "rankingSource": "backend-exact",
-                            }
+                                "exactOptimizeZoom": EXACT_POSTPROCESS_OPTIMIZE_ZOOM,
+                                "timeWeight": EXACT_POSTPROCESS_TIME_WEIGHT,
+                                "debugTrace": request.debug,
+                            },
+                            batch_handle=batch_handle,
                         )
                         return original_index, response_payload, (time.perf_counter() - candidate_started_at) * 1000.0
 
                     candidate_results: list[tuple[int, PartitionSolutionPreviewModel, float]] = []
                     candidate_errors: list[tuple[int, str, Exception]] = []
-                    with ThreadPoolExecutor(max_workers=max_inflight) as executor:
-                        future_to_candidate = {
-                            executor.submit(_evaluate_exact_candidate, original_index, solution_payload): (
-                                original_index,
-                                solution_payload["signature"],
-                            )
-                            for original_index, solution_payload in candidate_specs
-                        }
-                        for future in as_completed(future_to_candidate):
-                            original_index, signature = future_to_candidate[future]
-                            try:
-                                resolved_index, response_payload, elapsed_ms = future.result()
-                                solution_payload = response_payload.get("solution")
-                                if not isinstance(solution_payload, dict):
-                                    raise RuntimeError("Exact runtime Lambda evaluate-solution returned no solution payload.")
-                                exact_solution = PartitionSolutionPreviewModel.model_validate(solution_payload)
-                                candidate_results.append((resolved_index, exact_solution, elapsed_ms))
-                                logger.warning(
-                                    "[terrain-split-autosplit][%s] exact-rerank fanout candidate success polygonId=%s candidateIndex=%d signature=%s elapsedMs=%.1f exactScore=%s",
-                                    request_id,
-                                    polygon_id,
-                                    resolved_index,
-                                    signature,
-                                    elapsed_ms,
-                                    exact_solution.exactScore,
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                candidate_errors.append((original_index, signature, exc))
-                                logger.warning(
-                                    "[terrain-split-autosplit][%s] exact-rerank fanout candidate failed polygonId=%s candidateIndex=%d signature=%s error=%s",
-                                    request_id,
-                                    polygon_id,
+                    try:
+                        with ThreadPoolExecutor(max_workers=max_inflight) as executor:
+                            future_to_candidate = {
+                                executor.submit(_evaluate_exact_candidate, original_index, solution_payload): (
                                     original_index,
-                                    signature,
-                                    exc,
+                                    solution_payload["signature"],
                                 )
+                                for original_index, solution_payload in candidate_specs
+                            }
+                            for future in as_completed(future_to_candidate):
+                                original_index, signature = future_to_candidate[future]
+                                try:
+                                    resolved_index, response_payload, elapsed_ms = future.result()
+                                    solution_payload = response_payload.get("solution")
+                                    if not isinstance(solution_payload, dict):
+                                        raise RuntimeError("Exact runtime Lambda evaluate-solution returned no solution payload.")
+                                    exact_solution = PartitionSolutionPreviewModel.model_validate(solution_payload)
+                                    debug_trace = response_payload.get("debugTrace")
+                                    if isinstance(debug_trace, dict):
+                                        exact_debug_by_signature[signature] = debug_trace
+                                    exact_candidate_elapsed_ms[signature] = elapsed_ms
+                                    candidate_results.append((resolved_index, exact_solution, elapsed_ms))
+                                    logger.warning(
+                                        "[terrain-split-autosplit][%s] exact-rerank fanout candidate success polygonId=%s candidateIndex=%d signature=%s elapsedMs=%.1f exactScore=%s",
+                                        request_id,
+                                        polygon_id,
+                                        resolved_index,
+                                        signature,
+                                        elapsed_ms,
+                                        exact_solution.exactScore,
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    candidate_errors.append((original_index, signature, exc))
+                                    exact_candidate_errors[signature] = str(exc)
+                                    logger.warning(
+                                        "[terrain-split-autosplit][%s] exact-rerank fanout candidate failed polygonId=%s candidateIndex=%d signature=%s error=%s",
+                                        request_id,
+                                        polygon_id,
+                                        original_index,
+                                        signature,
+                                        exc,
+                                    )
+                    finally:
+                        EXACT_RUNTIME_BRIDGE.end_candidate_batch(batch_handle)
                     if candidate_errors or len(candidate_results) != len(candidate_specs):
                         raise RuntimeError(
                             "exact candidate fanout failed for "
@@ -583,6 +1021,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                         },
                     )
                 else:
+                    exact_mode = "single-runtime-rerank"
                     # Exact-enabled responses intentionally replace the surrogate tail with the
                     # exact-reranked shortlist instead of appending discarded surrogate options.
                     exact_response = EXACT_RUNTIME_BRIDGE.rerank_solutions(
@@ -597,12 +1036,24 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                             "turnExtendM": request.turnExtendM,
                             "solutions": [solution.model_dump(mode="json") for solution in exact_candidates],
                             "rankingSource": "backend-exact",
+                            "exactOptimizeZoom": EXACT_POSTPROCESS_OPTIMIZE_ZOOM,
+                            "timeWeight": EXACT_POSTPROCESS_TIME_WEIGHT,
+                            "debugTrace": request.debug,
                         }
                     )
                     exact_solutions = [
                         PartitionSolutionPreviewModel.model_validate(solution_payload)
                         for solution_payload in exact_response.get("solutions", [])
                     ]
+                    debug_by_signature = exact_response.get("debugBySignature")
+                    if isinstance(debug_by_signature, dict):
+                        exact_debug_by_signature.update(
+                            {
+                                str(signature): trace
+                                for signature, trace in debug_by_signature.items()
+                                if isinstance(trace, dict)
+                            }
+                        )
                 if exact_solutions:
                     solutions = exact_solutions
                 logger.warning(
@@ -614,6 +1065,8 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                     [solution.rankingSource for solution in exact_solutions],
                 )
             except Exception as exc:  # noqa: BLE001
+                exact_status = "failed"
+                exact_error = str(exc)
                 logger.exception(
                     "[terrain-split-backend][%s] exact partition rerank failed; using surrogate ordering error=%s",
                     request_id,
@@ -626,6 +1079,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                     exc,
                 )
         elif EXACT_RUNTIME_BRIDGE is None:
+            exact_skip_reason = "no-exact-bridge"
             logger.warning(
                 "[terrain-split-autosplit][%s] exact-rerank skipped polygonId=%s reason=no-exact-bridge surrogateSolutions=%d",
                 request_id,
@@ -633,6 +1087,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                 len(solutions),
             )
         else:
+            exact_skip_reason = "not-enough-solutions"
             logger.warning(
                 "[terrain-split-autosplit][%s] exact-rerank skipped polygonId=%s reason=not-enough-solutions surrogateSolutions=%d",
                 request_id,
@@ -642,8 +1097,112 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         exact_postprocess_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         debug_payload = None
+        request_perf_summary = _build_request_phase_performance_summary(
+            fetch_dem_ms=fetch_dem_ms,
+            build_grid_ms=build_grid_ms,
+            compute_features_ms=compute_features_ms,
+            solve_ms=solve_ms,
+            exact_postprocess_ms=exact_postprocess_ms,
+        )
+        exact_rank_by_signature = {
+            solution.signature: index + 1 for index, solution in enumerate(exact_solutions)
+        }
+        exact_rerank_perf_summary = _build_exact_rerank_performance_summary(
+            exact_mode=exact_mode,
+            exact_postprocess_ms=exact_postprocess_ms,
+            exact_candidates=exact_candidates,
+            exact_rank_by_signature=exact_rank_by_signature,
+            exact_debug_by_signature=exact_debug_by_signature,
+            exact_candidate_elapsed_ms=exact_candidate_elapsed_ms,
+        )
         if request.debug:
             stage_started_at = time.perf_counter()
+            solution_lookup = {solution.signature: solution for solution in solutions}
+            exact_artifacts: dict[str, Any] = {}
+            summary_candidates = []
+            for surrogate_rank, solution in enumerate(surrogate_solutions, start=1):
+                signature = solution.signature
+                exact_requested = EXACT_RUNTIME_BRIDGE is not None and len(surrogate_solutions) > 1 and surrogate_rank <= len(exact_candidates)
+                exact_evaluated = signature in exact_debug_by_signature
+                not_evaluated_reason: str | None = None
+                if not exact_evaluated:
+                    if surrogate_rank > len(exact_candidates):
+                        not_evaluated_reason = "outside-top-k"
+                    elif exact_skip_reason is not None:
+                        not_evaluated_reason = exact_skip_reason
+                    elif signature in exact_candidate_errors:
+                        not_evaluated_reason = "candidate-failed"
+                    elif exact_status == "failed":
+                        not_evaluated_reason = "exact-rerank-failed"
+                summary_candidates.append(
+                    _solution_debug_summary(
+                        solution_lookup.get(signature, solution),
+                        surrogate_rank=surrogate_rank,
+                        exact_requested=exact_requested,
+                        exact_evaluated=exact_evaluated,
+                        not_evaluated_reason=not_evaluated_reason,
+                        exact_rank=exact_rank_by_signature.get(signature),
+                        candidate_error=exact_candidate_errors.get(signature),
+                    )
+                )
+                if exact_evaluated:
+                    safe_signature = _safe_artifact_component(signature)
+                    exact_solution = solution_lookup.get(signature)
+                    exact_trace = exact_debug_by_signature[signature]
+                    exact_artifacts[f"exact_candidate_{surrogate_rank}_{safe_signature}"] = {
+                        "requestId": request_id,
+                        "polygonId": polygon_id,
+                        "surrogateRank": surrogate_rank,
+                        "exactRank": exact_rank_by_signature.get(signature),
+                        "signature": signature,
+                        "surrogateSolution": solution.model_dump(mode="json"),
+                        "refinedSolution": exact_solution.model_dump(mode="json") if exact_solution is not None else None,
+                        "runtimeConfig": {
+                            "exactOptimizeZoom": exact_trace.get("exactOptimizeZoom", EXACT_POSTPROCESS_OPTIMIZE_ZOOM),
+                            "timeWeight": exact_trace.get("timeWeight", EXACT_POSTPROCESS_TIME_WEIGHT),
+                            "qualityWeight": exact_trace.get("qualityWeight", EXACT_POSTPROCESS_QUALITY_WEIGHT),
+                        },
+                        "timings": {
+                            "bridgeElapsedMs": round(exact_candidate_elapsed_ms.get(signature), 3)
+                            if signature in exact_candidate_elapsed_ms
+                            else None,
+                            **(exact_trace.get("timings") if isinstance(exact_trace.get("timings"), dict) else {}),
+                        },
+                        "performanceSummary": _build_exact_candidate_performance_summary(
+                            signature=signature,
+                            exact_trace=exact_trace,
+                            bridge_elapsed_ms=exact_candidate_elapsed_ms.get(signature),
+                        ),
+                        "partitionScoreBreakdown": exact_trace.get("partitionScoreBreakdown"),
+                        "preview": exact_trace.get("preview"),
+                        "regions": exact_trace.get("regions"),
+                    }
+            exact_artifacts["exact_rerank_summary"] = {
+                "requestId": request_id,
+                "polygonId": request.polygonId,
+                "payloadKind": request.payloadKind,
+                "topK": len(exact_candidates),
+                "exactOptimizeZoom": EXACT_POSTPROCESS_OPTIMIZE_ZOOM,
+                "timeWeight": EXACT_POSTPROCESS_TIME_WEIGHT,
+                "qualityWeight": EXACT_POSTPROCESS_QUALITY_WEIGHT,
+                "rerankMode": exact_mode,
+                "exactStatus": exact_status,
+                "skipReason": exact_skip_reason,
+                "error": exact_error,
+                "surrogateSolutionCount": len(surrogate_solutions),
+                "candidateSolutions": summary_candidates,
+                "exactRankingOrder": [
+                    {
+                        "exactRank": index + 1,
+                        "signature": solution.signature,
+                        "exactScore": solution.exactScore,
+                    }
+                    for index, solution in enumerate(exact_solutions)
+                ],
+                "returnedOrder": [solution.signature for solution in solutions],
+                "winningSignature": solutions[0].signature if solutions else None,
+                "performanceSummary": exact_rerank_perf_summary,
+            }
             artifacts = write_debug_artifacts(
                 DEBUG_DIR,
                 request_id,
@@ -671,6 +1230,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                     },
                     "solutions": [solution.model_dump(mode="json") for solution in solutions],
                     "solver": solver_debug_payload or {},
+                    **exact_artifacts,
                     "timing": {
                         "fetchDemMs": round(fetch_dem_ms, 3),
                         "buildGridMs": round(build_grid_ms, 3),
@@ -678,17 +1238,56 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
                         "solveMs": round(solve_ms, 3),
                         "exactPostprocessMs": round(exact_postprocess_ms, 3),
                         "totalMs": round((time.perf_counter() - started_at) * 1000.0, 3),
+                        "performanceSummary": {
+                            "requestPhases": request_perf_summary,
+                            "solver": solver_perf_summary,
+                            "exactRerank": exact_rerank_perf_summary,
+                        },
                     },
                 },
             )
             debug_artifacts_ms = (time.perf_counter() - stage_started_at) * 1000.0
             debug_payload = DebugArtifacts(requestId=request_id, artifactPaths=artifacts)
+            if artifacts:
+                logger.info(
+                    "[terrain-split-backend][%s] debug artifacts written dir=%s files=%d",
+                    request_id,
+                    Path(artifacts[0]).parent,
+                    len(artifacts),
+                )
             for solution in solutions:
                 solution.debug = debug_payload
         else:
             debug_artifacts_ms = 0.0
 
         total_ms = (time.perf_counter() - started_at) * 1000.0
+        final_request_perf_summary = _build_request_phase_performance_summary(
+            fetch_dem_ms=fetch_dem_ms,
+            build_grid_ms=build_grid_ms,
+            compute_features_ms=compute_features_ms,
+            solve_ms=solve_ms,
+            exact_postprocess_ms=exact_postprocess_ms,
+            debug_artifacts_ms=debug_artifacts_ms,
+            total_ms=total_ms,
+        )
+        if request.debug:
+            logger.info(
+                "[terrain-split-backend][%s] perf hotspots polygonId=%s requestStages=%s solverInclusive=%s exactCandidates=%s",
+                request_id,
+                request.polygonId or "<none>",
+                _format_hotspot_log_entries(
+                    final_request_perf_summary.get("topStages", []),
+                    label_key="stage",
+                ),
+                _format_hotspot_log_entries(
+                    (solver_perf_summary or {}).get("topInclusiveMs", []),
+                    label_key="metric",
+                ),
+                _format_hotspot_log_entries(
+                    exact_rerank_perf_summary.get("topCandidatesByBridgeElapsedMs", []),
+                    label_key="signature",
+                ),
+            )
         logger.info(
             "[terrain-split-backend][%s] solve request finished polygonId=%s payload=%s solutions=%d fetchDemMs=%.1f buildGridMs=%.1f computeFeaturesMs=%.1f solveMs=%.1f exactPostprocessMs=%.1f debugArtifactsMs=%.1f totalMs=%.1f",
             request_id,
