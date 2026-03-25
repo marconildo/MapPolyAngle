@@ -18,6 +18,7 @@
 import {
   SONY_RX1R2,
   SONY_RX1R3,
+  SONY_A6100_20MM,
   DJI_ZENMUSE_P1_24MM,
   ILX_LR1_INSPECT_85MM,
   MAP61_17MM,
@@ -255,6 +256,7 @@ function runForAltitude(ALT_AGL: number) {
   const cameras: Record<string, CameraModel> = {
     SONY_RX1R2,
     SONY_RX1R3,
+    SONY_A6100_20MM,
     DJI_ZENMUSE_P1_24MM,
     ILX_LR1_INSPECT_85MM,
     MAP61_17MM,
