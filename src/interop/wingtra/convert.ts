@@ -1,7 +1,7 @@
 // src/interop/wingtra/convert.ts
 
 import type { CameraModel, FlightParams, LidarModel, LidarReturnMode, LngLat, PayloadKind } from "@/domain/types";
-import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, DJI_ZENMUSE_P1_24MM } from "@/domain/camera";
+import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2, SONY_RX1R3, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, DJI_ZENMUSE_P1_24MM } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, WINGTRA_LIDAR_XT32M2X, lidarDeliverableDensity, lidarLineSpacing } from "@/domain/lidar";
 import type {
   ExportedArea,
@@ -33,6 +33,13 @@ const payloadMatches = (candidate: string, name: string) => {
   return false;
 };
 
+function isWingtraFlightPlan(value: unknown): value is WingtraFlightPlan {
+  if (!value || typeof value !== "object") return false;
+  const maybePlan = (value as { flightPlan?: unknown }).flightPlan;
+  if (!maybePlan || typeof maybePlan !== "object") return false;
+  return Array.isArray((maybePlan as { items?: unknown }).items);
+}
+
 /**
  * Convert Wingtra "grid.angle" to "bearing° clockwise from North".
  * - If the JSON is already northCW, this is identity.
@@ -63,6 +70,7 @@ export function resolveCameraFromWingtra(payloadName?: string, payloadKey?: stri
 // Simplified resolver: uses names arrays for exact matching
 const CAMERA_LIST: Array<{ key:string; model: CameraModel }> = [
   { key: 'SONY_RX1R2', model: SONY_RX1R2 },
+  { key: 'SONY_RX1R3', model: SONY_RX1R3 },
   { key: 'ILX_LR1_INSPECT_85MM', model: ILX_LR1_INSPECT_85MM },
   { key: 'MAP61_17MM', model: MAP61_17MM },
   { key: 'RGB61_24MM', model: RGB61_24MM },
@@ -231,6 +239,13 @@ export function importWingtraFlightPlan(
   fp: WingtraFlightPlan,
   opts?: { angleConvention?: WingtraAngleConvention }
 ): ImportedWingtraPlan {
+  if (!isWingtraFlightPlan(fp)) {
+    const maybeGeotags = fp && typeof fp === "object" && Array.isArray((fp as { flights?: unknown }).flights);
+    if (maybeGeotags) {
+      throw new Error("This file looks like Wingtra geotag JSON, not a flightplan. Use Import > Wingtra Geotags (.json).");
+    }
+    throw new Error("Invalid Wingtra flightplan file.");
+  }
   const angleConv = opts?.angleConvention ?? "northCW";
   const payloadName = fp.flightPlan.payload;
   const payloadKey  = (fp.flightPlan as any).payloadUniqueString as string | undefined;

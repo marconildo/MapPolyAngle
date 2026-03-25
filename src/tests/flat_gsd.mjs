@@ -11,6 +11,15 @@ const SONY_RX1R2 = {
   names: [ 'RX1RII 42MP', 'RX1RII', 'RX1R2', 'SONY_RX1R2' ],
 };
 
+const SONY_RX1R3 = {
+  f_m: 0.035,
+  sx_m: 35.7e-3 / 9504,
+  sy_m: 23.8e-3 / 6336,
+  w_px: 9504,
+  h_px: 6336,
+  names: [ 'SURVEY61', 'SURVEY61 v5', 'SUR61', 'RX1R3_v5', 'RX1R3', 'SONY_RX1R3' ],
+};
+
 const DJI_ZENMUSE_P1_24MM = {
   f_m: 5626.690009970837 * 4.27246e-6,
   sx_m: 4.27246e-6,
@@ -161,7 +170,7 @@ function computeGSDStatsViaWorkerMath(cam, altitudeAGL, gridSize = 64) {
 function describeCamera(cam){ return cam.names?.[0] || `f=${cam.f_m}m ${cam.w_px}x${cam.h_px}`; }
 
 function runForAltitude(ALT){
-  const cameras = { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM };
+  const cameras = { SONY_RX1R2, SONY_RX1R3, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM };
   console.log("=== Flat-ground GSD test ===");
   console.log(`Area: ${AREA_SIDE_M}m x ${AREA_SIDE_M}m (${(AREA_M2/1_000_000).toFixed(2)} km²)`);
   console.log(`Altitude AGL: ${ALT} m`);
