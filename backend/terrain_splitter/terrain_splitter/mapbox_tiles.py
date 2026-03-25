@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from PIL import Image
 
 from .geometry import clamp, lnglat_to_mercator
 from .schemas import TerrainSourceModel
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _terrain_rgb_to_elevation(image: Image.Image) -> np.ndarray:
@@ -30,7 +33,7 @@ def tile_bounds_mercator(z: int, x: int, y: int) -> tuple[float, float, float, f
 
 
 def choose_grid_step_m(area_m2: float) -> float:
-    return clamp(math.sqrt(max(area_m2, 1.0)) / 28.0, 24.0, 80.0)
+    return clamp(math.sqrt(max(area_m2, 1.0)) / 28.0, 24.0, 120.0)
 
 
 def choose_terrain_zoom(grid_step_m: float) -> int:
@@ -167,6 +170,25 @@ def fetch_dem_for_ring(
     max_y += padding
     zoom = choose_terrain_zoom(grid_step_m or 40.0)
     xs_range, ys_range = mercator_bounds_to_tile_range(min_x, min_y, max_x, max_y, zoom)
+    terrain_source_label = (
+        f"{terrain_source.mode}:{terrain_source.datasetId}"
+        if terrain_source is not None and terrain_source.datasetId
+        else terrain_source.mode
+        if terrain_source is not None
+        else "mapbox"
+    )
+    logger.info(
+        "[terrain-split-backend] dem fetch choose zoom=%d gridStepM=%.1f paddingM=%.1f tileCount=%d xTiles=%d..%d yTiles=%d..%d terrainSource=%s",
+        zoom,
+        float(grid_step_m or 40.0),
+        padding,
+        len(xs_range) * len(ys_range),
+        xs_range.start,
+        xs_range.stop - 1,
+        ys_range.start,
+        ys_range.stop - 1,
+        terrain_source_label,
+    )
     token = mapbox_token()
     cache = TerrainTileCache(cache_dir)
     tiles: dict[tuple[int, int], TerrainTile] = {}

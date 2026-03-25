@@ -29,8 +29,9 @@ from .dsm_uploads import (
 )
 from .exact_bridge import create_exact_runtime_bridge
 from .features import compute_feature_field
+from .geometry import ring_to_polygon_mercator
 from .grid import build_grid
-from .mapbox_tiles import TerrainTileCache, fetch_dem_for_ring, mapbox_token
+from .mapbox_tiles import TerrainTileCache, choose_grid_step_m, fetch_dem_for_ring, mapbox_token
 from .schemas import (
     DebugArtifacts,
     DsmFinalizeUploadRequest,
@@ -430,16 +431,19 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
     )
     try:
         stage_started_at = time.perf_counter()
+        # Keep DEM zoom selection aligned with the area-derived grid resolution.
+        grid_step_m = choose_grid_step_m(float(ring_to_polygon_mercator(request.ring).area))
         dem, zoom = fetch_dem_for_ring(
             request.ring,
             CACHE_DIR,
+            grid_step_m=grid_step_m,
             terrain_source=request.terrainSource,
             dsm_store=DSM_DATASET_STORE,
         )
         fetch_dem_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         stage_started_at = time.perf_counter()
-        grid = build_grid(request.ring, dem)
+        grid = build_grid(request.ring, dem, grid_step_m=grid_step_m)
         build_grid_ms = (time.perf_counter() - stage_started_at) * 1000.0
 
         stage_started_at = time.perf_counter()

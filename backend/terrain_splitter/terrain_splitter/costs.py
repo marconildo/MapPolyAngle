@@ -98,6 +98,15 @@ class RegionStaticInputs:
     grid_step_m: float
 
 
+@dataclass(slots=True)
+class _ScanlineEdge:
+    x1: float
+    y1: float
+    dx_dy: float
+    min_y: float
+    max_y: float
+
+
 def _camera_model(params: FlightParamsModel) -> dict[str, float]:
     return CAMERA_REGISTRY.get(params.cameraKey or "SONY_RX1R2", CAMERA_REGISTRY["SONY_RX1R2"])
 
@@ -295,7 +304,68 @@ def summarize_line_lift(
     )
 
 
-def estimate_region_flight_time(
+def _scanline_edges(
+    polygon: Polygon,
+    *,
+    center_x: float,
+    center_y: float,
+    ux: float,
+    uy: float,
+    px: float,
+    py: float,
+) -> list[_ScanlineEdge]:
+    edges: list[_ScanlineEdge] = []
+
+    def add_ring(coords) -> None:
+        coord_list = list(coords)
+        for start, end in zip(coord_list, coord_list[1:]):
+            sx = float(start[0]) - center_x
+            sy = float(start[1]) - center_y
+            ex = float(end[0]) - center_x
+            ey = float(end[1]) - center_y
+            x1 = sx * ux + sy * uy
+            y1 = sx * px + sy * py
+            x2 = ex * ux + ey * uy
+            y2 = ex * px + ey * py
+            delta_y = y2 - y1
+            if abs(delta_y) <= 1e-12:
+                continue
+            edges.append(
+                _ScanlineEdge(
+                    x1=x1,
+                    y1=y1,
+                    dx_dy=(x2 - x1) / delta_y,
+                    min_y=min(y1, y2),
+                    max_y=max(y1, y2),
+                )
+            )
+
+    add_ring(polygon.exterior.coords)
+    for interior in polygon.interiors:
+        add_ring(interior.coords)
+    return edges
+
+
+def _scanline_intervals(edges: list[_ScanlineEdge], offset_m: float) -> list[tuple[float, float]]:
+    intersections: list[float] = []
+    for edge in edges:
+        if edge.min_y <= offset_m < edge.max_y:
+            intersections.append(edge.x1 + (offset_m - edge.y1) * edge.dx_dy)
+    if len(intersections) < 2:
+        return []
+    intersections.sort()
+    intervals: list[tuple[float, float]] = []
+    limit = len(intersections) - (len(intersections) % 2)
+    for index in range(0, limit, 2):
+        start_x = intersections[index]
+        end_x = intersections[index + 1]
+        if end_x - start_x <= 1e-9:
+            continue
+        intervals.append((start_x, end_x))
+    return intervals
+
+
+def _estimate_region_flight_time_geos_deprecated(
     polygon: Polygon,
     bearing_deg: float,
     params: FlightParamsModel,
@@ -339,6 +409,62 @@ def estimate_region_flight_time(
             for j in range(1, len(segments)):
                 gaps.append(segments[j].distance(segments[j - 1]))
         lengths.extend(segment.length for segment in segments)
+
+    total_length = sum(lengths)
+    total_gap = sum(gaps)
+    speed = params.speedMps or (LIDAR_DEFAULTS["default_speed_mps"] if params.payloadKind == "lidar" else 12.0)
+    turn_count = max(0, len(lengths) - 1) + fragmented
+    return {
+        "line_spacing_m": line_spacing,
+        "line_count": float(len(lengths)),
+        "fragmented_line_count": float(fragmented),
+        "fragmented_line_fraction": (fragmented / len(lengths)) if lengths else 0.0,
+        "inter_segment_gap_length_m": total_gap,
+        "overflight_transit_fraction": total_gap / max(1.0, total_length + total_gap),
+        "turn_count": float(turn_count),
+        "total_flight_line_length_m": total_length,
+        "mean_line_length_m": float(np.mean(lengths)) if lengths else 0.0,
+        "median_line_length_m": float(np.median(lengths)) if lengths else 0.0,
+        "short_line_fraction": (sum(1 for length in lengths if length < max(80.0, line_spacing * 5.0)) / len(lengths)) if lengths else 1.0,
+        "cruise_speed_mps": speed,
+        "total_mission_time_sec": (total_length + total_gap) / max(1.0, speed) + turn_count * 8.0 + 25.0,
+    }
+
+
+def estimate_region_flight_time(
+    polygon: Polygon,
+    bearing_deg: float,
+    params: FlightParamsModel,
+    *,
+    static_inputs: RegionStaticInputs | None = None,
+) -> dict[str, float]:
+    line_spacing = line_spacing_for_params(params)
+    along_len, cross_width = project_extents(polygon, bearing_deg)
+    lengths: list[float] = []
+    gaps: list[float] = []
+    fragmented = 0
+    center = polygon.centroid
+    center_x = float(center.x)
+    center_y = float(center.y)
+    perp_rad = deg_to_rad((bearing_deg + 90.0) % 360.0)
+    along_rad = deg_to_rad(bearing_deg)
+    ux, uy = math.sin(along_rad), math.cos(along_rad)
+    px, py = math.sin(perp_rad), math.cos(perp_rad)
+    line_count_est = max(1, int(math.ceil(cross_width / max(1.0, line_spacing))))
+    edges = _scanline_edges(polygon, center_x=center_x, center_y=center_y, ux=ux, uy=uy, px=px, py=py)
+
+    for i in range(-line_count_est - 1, line_count_est + 2):
+        offset = i * line_spacing
+        intervals = _scanline_intervals(edges, offset)
+        if not intervals:
+            continue
+        if len(intervals) > 1:
+            fragmented += len(intervals) - 1
+            for j in range(1, len(intervals)):
+                gap = intervals[j][0] - intervals[j - 1][1]
+                if gap > 1e-9:
+                    gaps.append(gap)
+        lengths.extend(end_x - start_x for start_x, end_x in intervals)
 
     total_length = sum(lengths)
     total_gap = sum(gaps)
