@@ -1120,6 +1120,64 @@ def _pareto_frontier(plans: list[PartitionPlan], root_area_m2: float, line_lengt
     return _thin_frontier(nondominated, root_area_m2, line_length_scale)
 
 
+def _pareto_frontier_with_perf(
+    plans: list[PartitionPlan],
+    root_area_m2: float,
+    line_length_scale: float,
+    perf: dict[str, float],
+) -> list[PartitionPlan]:
+    prune_started_at = time.perf_counter()
+    try:
+        return _pareto_frontier(plans, root_area_m2, line_length_scale)
+    finally:
+        perf["frontier_prune_ms"] += (time.perf_counter() - prune_started_at) * 1000.0
+
+
+def _solve_region_recursive_child(
+    cell_ids: tuple[int, ...],
+    depth: int,
+    context: SolverContext,
+    caches: SolverCaches,
+    perf: dict[str, float],
+    *,
+    allow_nested_lambda_fanout: bool,
+) -> list[PartitionPlan]:
+    subsolve_started_at = time.perf_counter()
+    try:
+        return _solve_region_recursive(
+            cell_ids,
+            depth,
+            context,
+            caches,
+            perf,
+            allow_nested_lambda_fanout=allow_nested_lambda_fanout,
+        ) or []
+    finally:
+        perf["recursive_subsolve_ms"] += (time.perf_counter() - subsolve_started_at) * 1000.0
+
+
+def _extend_combined_candidates(
+    destination: list[PartitionPlan],
+    left_frontier: list[PartitionPlan],
+    right_frontier: list[PartitionPlan],
+    boundary: BoundaryStats,
+    split: SplitCandidate,
+    perf: dict[str, float],
+) -> None:
+    combine_started_at = time.perf_counter()
+    try:
+        for left_plan in left_frontier:
+            for right_plan in right_frontier:
+                combined = _combine_plans(left_plan, right_plan, boundary, split)
+                if combined.region_count > MAX_REGIONS:
+                    perf["combine_region_limit_rejections"] += 1
+                    continue
+                destination.append(combined)
+                perf["combined_plan_candidates"] += 1
+    finally:
+        perf["plan_combine_ms"] += (time.perf_counter() - combine_started_at) * 1000.0
+
+
 def _principal_axis_bearing(cell_ids: tuple[int, ...], cell_lookup: dict[int, GridCell]) -> float | None:
     if len(cell_ids) < 2:
         return None
@@ -1715,28 +1773,37 @@ def _reevaluate_plan_with_exact_geometry(
     caches: SolverCaches,
     perf: dict[str, float],
 ) -> PartitionPlan | None:
-    if plan.geometry_tree is None:
-        return plan
-    reconstructed = _reconstruct_plan_polygons_from_tree(context.grid.polygon_mercator, plan.geometry_tree)
-    if reconstructed is None:
-        return None
-
-    exact_regions: list[EvaluatedRegion] = []
-    for region in plan.regions:
-        polygon = reconstructed.get(region.cell_ids)
-        if polygon is None or polygon.is_empty:
+    perf["exact_geometry_plan_count"] += 1
+    reevaluate_started_at = time.perf_counter()
+    try:
+        if plan.geometry_tree is None:
+            return plan
+        reconstruct_started_at = time.perf_counter()
+        reconstructed = _reconstruct_plan_polygons_from_tree(context.grid.polygon_mercator, plan.geometry_tree)
+        perf["exact_geometry_reconstruct_ms"] += (time.perf_counter() - reconstruct_started_at) * 1000.0
+        if reconstructed is None:
             return None
-        exact_region = _reevaluate_region_with_polygon(region, polygon, context, caches, perf)
-        if exact_region is None:
-            return None
-        exact_regions.append(exact_region)
 
-    return _plan_from_regions(
-        tuple(exact_regions),
-        internal_boundary_m=plan.internal_boundary_m,
-        break_weight_sum=plan.break_weight_sum,
-        geometry_tree=plan.geometry_tree,
-    )
+        exact_regions: list[EvaluatedRegion] = []
+        for region in plan.regions:
+            polygon = reconstructed.get(region.cell_ids)
+            if polygon is None or polygon.is_empty:
+                return None
+            region_started_at = time.perf_counter()
+            exact_region = _reevaluate_region_with_polygon(region, polygon, context, caches, perf)
+            perf["exact_geometry_region_reeval_ms"] += (time.perf_counter() - region_started_at) * 1000.0
+            if exact_region is None:
+                return None
+            exact_regions.append(exact_region)
+
+        return _plan_from_regions(
+            tuple(exact_regions),
+            internal_boundary_m=plan.internal_boundary_m,
+            break_weight_sum=plan.break_weight_sum,
+            geometry_tree=plan.geometry_tree,
+        )
+    finally:
+        perf["exact_geometry_reeval_ms"] += (time.perf_counter() - reevaluate_started_at) * 1000.0
 
 
 def _generate_split_candidates(
@@ -1761,129 +1828,133 @@ def _generate_split_candidates(
     line_length_scale: float,
     perf: dict[str, float],
 ) -> list[SplitCandidate]:
-    parent_area = max(1.0, baseline_region.objective.area_m2)
-    seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
-    candidates: list[SplitCandidate] = []
-    directions = _cut_direction_candidates(baseline_region, cell_ids, feature_lookup, cell_lookup, feature_field)
-    perf["split_direction_count"] += len(directions)
-    for direction_deg in directions:
-        projected = _projection_values(cell_ids, cell_lookup, direction_deg)
-        for quantile in SPLIT_QUANTILES:
-            perf["split_attempts"] += 1
-            split = _split_cell_ids_by_projection_values(projected, quantile)
-            if split is None:
-                perf["split_projection_failures"] += 1
-                continue
-            left_ids, right_ids, threshold = split
-            left_area = sum(cell_lookup[cell_id].area_m2 for cell_id in left_ids)
-            right_area = sum(cell_lookup[cell_id].area_m2 for cell_id in right_ids)
-            left_fraction = left_area / parent_area
-            right_fraction = right_area / parent_area
-            if min(left_fraction, right_fraction) < MIN_CHILD_AREA_FRACTION:
-                perf["split_small_child_rejections"] += 1
-                continue
-            signature = (left_ids, right_ids) if left_ids < right_ids else (right_ids, left_ids)
-            if signature in seen:
-                perf["split_duplicate_rejections"] += 1
-                continue
-            seen.add(signature)
+    enumerate_started_at = time.perf_counter()
+    try:
+        parent_area = max(1.0, baseline_region.objective.area_m2)
+        seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+        candidates: list[SplitCandidate] = []
+        directions = _cut_direction_candidates(baseline_region, cell_ids, feature_lookup, cell_lookup, feature_field)
+        perf["split_direction_count"] += len(directions)
+        for direction_deg in directions:
+            projected = _projection_values(cell_ids, cell_lookup, direction_deg)
+            for quantile in SPLIT_QUANTILES:
+                perf["split_attempts"] += 1
+                split = _split_cell_ids_by_projection_values(projected, quantile)
+                if split is None:
+                    perf["split_projection_failures"] += 1
+                    continue
+                left_ids, right_ids, threshold = split
+                left_area = sum(cell_lookup[cell_id].area_m2 for cell_id in left_ids)
+                right_area = sum(cell_lookup[cell_id].area_m2 for cell_id in right_ids)
+                left_fraction = left_area / parent_area
+                right_fraction = right_area / parent_area
+                if min(left_fraction, right_fraction) < MIN_CHILD_AREA_FRACTION:
+                    perf["split_small_child_rejections"] += 1
+                    continue
+                signature = (left_ids, right_ids) if left_ids < right_ids else (right_ids, left_ids)
+                if signature in seen:
+                    perf["split_duplicate_rejections"] += 1
+                    continue
+                seen.add(signature)
 
-            if len(_connected_components_for_subset(left_ids, neighbors)) != 1:
-                perf["split_disconnected_rejections"] += 1
-                continue
-            if len(_connected_components_for_subset(right_ids, neighbors)) != 1:
-                perf["split_disconnected_rejections"] += 1
-                continue
+                if len(_connected_components_for_subset(left_ids, neighbors)) != 1:
+                    perf["split_disconnected_rejections"] += 1
+                    continue
+                if len(_connected_components_for_subset(right_ids, neighbors)) != 1:
+                    perf["split_disconnected_rejections"] += 1
+                    continue
 
-            boundary = _boundary_stats_for_split(set(left_ids), set(right_ids), grid, feature_lookup)
-            if boundary.shared_boundary_m <= grid.grid_step_m * 0.8:
-                perf["split_boundary_rejections"] += 1
-                continue
-            boundary_alignment = _boundary_alignment(boundary)
-            left_region = _build_region(
-                left_ids,
-                boundary_alignment,
-                grid,
-                neighbors,
-                feature_lookup,
-                cell_lookup,
-                feature_field,
-                params,
-                best_bearing_cache,
-                region_cache,
-                region_static_cache,
-                region_bearing_core_cache,
-                heading_candidates_cache,
-                polygon_cache,
-                perf,
-            )
-            right_region = _build_region(
-                right_ids,
-                boundary_alignment,
-                grid,
-                neighbors,
-                feature_lookup,
-                cell_lookup,
-                feature_field,
-                params,
-                best_bearing_cache,
-                region_cache,
-                region_static_cache,
-                region_bearing_core_cache,
-                heading_candidates_cache,
-                polygon_cache,
-                perf,
-            )
-            if left_region is None or right_region is None:
-                perf["split_region_build_rejections"] += 1
-                continue
-            left_basic_diag = _region_gate_diagnostics(left_region, parent_area, practical=False, line_length_scale=line_length_scale)
-            right_basic_diag = _region_gate_diagnostics(right_region, parent_area, practical=False, line_length_scale=line_length_scale)
-            left_basic_failures = _region_gate_failure_margins(left_basic_diag, practical=False)
-            right_basic_failures = _region_gate_failure_margins(right_basic_diag, practical=False)
-            if left_basic_failures or right_basic_failures:
-                perf["split_basic_validity_rejections"] += 1
-                if left_basic_failures:
-                    _record_region_failure_summary(basic_rejection_summary, left_region, left_basic_diag, left_basic_failures)
-                if right_basic_failures:
-                    _record_region_failure_summary(basic_rejection_summary, right_region, right_basic_diag, right_basic_failures)
-                _record_split_failure_summary(
-                    basic_split_rejection_summary,
-                    direction_deg=direction_deg,
-                    threshold=threshold,
-                    boundary=boundary,
-                    left_diagnostics=left_basic_diag,
-                    left_failures=left_basic_failures,
-                    right_diagnostics=right_basic_diag,
-                    right_failures=right_basic_failures,
+                boundary = _boundary_stats_for_split(set(left_ids), set(right_ids), grid, feature_lookup)
+                if boundary.shared_boundary_m <= grid.grid_step_m * 0.8:
+                    perf["split_boundary_rejections"] += 1
+                    continue
+                boundary_alignment = _boundary_alignment(boundary)
+                left_region = _build_region(
+                    left_ids,
+                    boundary_alignment,
+                    grid,
+                    neighbors,
+                    feature_lookup,
+                    cell_lookup,
+                    feature_field,
+                    params,
+                    best_bearing_cache,
+                    region_cache,
+                    region_static_cache,
+                    region_bearing_core_cache,
+                    heading_candidates_cache,
+                    polygon_cache,
+                    perf,
                 )
-                continue
-            immediate_plan = _plan_from_regions((left_region, right_region), boundary.shared_boundary_m, boundary.break_weight_sum)
-            quality_gain = baseline_plan.quality_cost - immediate_plan.quality_cost
-            time_delta = immediate_plan.mission_time_sec - baseline_plan.mission_time_sec
-            rank_score = (
-                quality_gain
-                - max(0.0, time_delta) / SPLIT_RANK_TIME_DIVISOR_SEC
-                + boundary_alignment / 28.0
-                - abs(left_fraction - right_fraction) * 0.2
-            )
-            if quality_gain <= -SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION and rank_score <= SPLIT_NON_IMPROVING_MIN_RANK_SCORE:
-                perf["split_non_improving_rejections"] += 1
-                continue
-            candidates.append(
-                SplitCandidate(
-                    left_ids=left_ids,
-                    right_ids=right_ids,
-                    boundary=boundary,
-                    direction_deg=direction_deg,
-                    threshold=threshold,
-                    rank_score=rank_score,
+                right_region = _build_region(
+                    right_ids,
+                    boundary_alignment,
+                    grid,
+                    neighbors,
+                    feature_lookup,
+                    cell_lookup,
+                    feature_field,
+                    params,
+                    best_bearing_cache,
+                    region_cache,
+                    region_static_cache,
+                    region_bearing_core_cache,
+                    heading_candidates_cache,
+                    polygon_cache,
+                    perf,
                 )
-            )
-            perf["split_candidates_kept"] += 1
-    candidates.sort(key=lambda candidate: candidate.rank_score, reverse=True)
-    perf["split_candidates_returned"] += min(len(candidates), MAX_SPLIT_OPTIONS)
-    return candidates[:MAX_SPLIT_OPTIONS]
+                if left_region is None or right_region is None:
+                    perf["split_region_build_rejections"] += 1
+                    continue
+                left_basic_diag = _region_gate_diagnostics(left_region, parent_area, practical=False, line_length_scale=line_length_scale)
+                right_basic_diag = _region_gate_diagnostics(right_region, parent_area, practical=False, line_length_scale=line_length_scale)
+                left_basic_failures = _region_gate_failure_margins(left_basic_diag, practical=False)
+                right_basic_failures = _region_gate_failure_margins(right_basic_diag, practical=False)
+                if left_basic_failures or right_basic_failures:
+                    perf["split_basic_validity_rejections"] += 1
+                    if left_basic_failures:
+                        _record_region_failure_summary(basic_rejection_summary, left_region, left_basic_diag, left_basic_failures)
+                    if right_basic_failures:
+                        _record_region_failure_summary(basic_rejection_summary, right_region, right_basic_diag, right_basic_failures)
+                    _record_split_failure_summary(
+                        basic_split_rejection_summary,
+                        direction_deg=direction_deg,
+                        threshold=threshold,
+                        boundary=boundary,
+                        left_diagnostics=left_basic_diag,
+                        left_failures=left_basic_failures,
+                        right_diagnostics=right_basic_diag,
+                        right_failures=right_basic_failures,
+                    )
+                    continue
+                immediate_plan = _plan_from_regions((left_region, right_region), boundary.shared_boundary_m, boundary.break_weight_sum)
+                quality_gain = baseline_plan.quality_cost - immediate_plan.quality_cost
+                time_delta = immediate_plan.mission_time_sec - baseline_plan.mission_time_sec
+                rank_score = (
+                    quality_gain
+                    - max(0.0, time_delta) / SPLIT_RANK_TIME_DIVISOR_SEC
+                    + boundary_alignment / 28.0
+                    - abs(left_fraction - right_fraction) * 0.2
+                )
+                if quality_gain <= -SPLIT_NON_IMPROVING_MAX_QUALITY_REGRESSION and rank_score <= SPLIT_NON_IMPROVING_MIN_RANK_SCORE:
+                    perf["split_non_improving_rejections"] += 1
+                    continue
+                candidates.append(
+                    SplitCandidate(
+                        left_ids=left_ids,
+                        right_ids=right_ids,
+                        boundary=boundary,
+                        direction_deg=direction_deg,
+                        threshold=threshold,
+                        rank_score=rank_score,
+                    )
+                )
+                perf["split_candidates_kept"] += 1
+        candidates.sort(key=lambda candidate: candidate.rank_score, reverse=True)
+        perf["split_candidates_returned"] += min(len(candidates), MAX_SPLIT_OPTIONS)
+        return candidates[:MAX_SPLIT_OPTIONS]
+    finally:
+        perf["split_candidate_enumeration_ms"] += (time.perf_counter() - enumerate_started_at) * 1000.0
 
 
 def _build_region_for_context(
@@ -2000,7 +2071,9 @@ def _generate_relaxed_root_fallback_candidates(
             )
             left_plan = _plan_from_regions((left_region,), 0.0, 0.0)
             right_plan = _plan_from_regions((right_region,), 0.0, 0.0)
+            combine_started_at = time.perf_counter()
             candidate_plan = _combine_plans(left_plan, right_plan, boundary, split_candidate)
+            perf["plan_combine_ms"] += (time.perf_counter() - combine_started_at) * 1000.0
             exact_plan = _reevaluate_plan_with_exact_geometry(candidate_plan, context, caches, perf)
             if exact_plan is None or exact_plan.region_count <= 1:
                 continue
@@ -2123,63 +2196,63 @@ def _solve_region_recursive(
                 exc_info=exc,
             )
             for split in split_candidates:
-                left_frontier = _solve_region_recursive(
+                left_frontier = _solve_region_recursive_child(
                     split.left_ids,
                     depth - 1,
                     context,
                     caches,
                     perf,
                     allow_nested_lambda_fanout=allow_nested_lambda_fanout,
-                ) or []
-                right_frontier = _solve_region_recursive(
+                )
+                right_frontier = _solve_region_recursive_child(
                     split.right_ids,
                     depth - 1,
                     context,
                     caches,
                     perf,
                     allow_nested_lambda_fanout=allow_nested_lambda_fanout,
-                ) or []
+                )
                 if not left_frontier or not right_frontier:
                     continue
-                for left_plan in left_frontier:
-                    for right_plan in right_frontier:
-                        combined = _combine_plans(left_plan, right_plan, split.boundary, split)
-                        if combined.region_count > MAX_REGIONS:
-                            perf["combine_region_limit_rejections"] += 1
-                            continue
-                        candidates.append(combined)
-                        perf["combined_plan_candidates"] += 1
+                _extend_combined_candidates(
+                    candidates,
+                    left_frontier,
+                    right_frontier,
+                    split.boundary,
+                    split,
+                    perf,
+                )
     else:
         for split in split_candidates:
-            left_frontier = _solve_region_recursive(
+            left_frontier = _solve_region_recursive_child(
                 split.left_ids,
                 depth - 1,
                 context,
                 caches,
                 perf,
                 allow_nested_lambda_fanout=allow_nested_lambda_fanout,
-            ) or []
-            right_frontier = _solve_region_recursive(
+            )
+            right_frontier = _solve_region_recursive_child(
                 split.right_ids,
                 depth - 1,
                 context,
                 caches,
                 perf,
                 allow_nested_lambda_fanout=allow_nested_lambda_fanout,
-            ) or []
+            )
             if not left_frontier or not right_frontier:
                 continue
-            for left_plan in left_frontier:
-                for right_plan in right_frontier:
-                    combined = _combine_plans(left_plan, right_plan, split.boundary, split)
-                    if combined.region_count > MAX_REGIONS:
-                        perf["combine_region_limit_rejections"] += 1
-                        continue
-                    candidates.append(combined)
-                    perf["combined_plan_candidates"] += 1
+            _extend_combined_candidates(
+                candidates,
+                left_frontier,
+                right_frontier,
+                split.boundary,
+                split,
+                perf,
+            )
     perf["split_generation_ms"] += (time.perf_counter() - split_gen_started_at) * 1000.0
 
-    frontier = _pareto_frontier(candidates, context.root_area_m2, context.practical_line_length_scale)
+    frontier = _pareto_frontier_with_perf(candidates, context.root_area_m2, context.practical_line_length_scale, perf)
     perf["frontier_plan_count"] += len(frontier)
     caches.frontier_cache[key] = frontier
     return frontier
@@ -2198,46 +2271,46 @@ def _solve_root_split_branch_with_context(
 ) -> tuple[list[PartitionPlan], dict[str, float]]:
     caches = _make_solver_caches()
     perf = _make_perf()
-    left_frontier = _solve_region_recursive(
+    left_frontier = _solve_region_recursive_child(
         task.left_ids,
         task.depth,
         context,
         caches,
         perf,
         allow_nested_lambda_fanout=True,
-    ) or []
-    right_frontier = _solve_region_recursive(
+    )
+    right_frontier = _solve_region_recursive_child(
         task.right_ids,
         task.depth,
         context,
         caches,
         perf,
         allow_nested_lambda_fanout=True,
-    ) or []
+    )
     if not left_frontier or not right_frontier:
         return [], dict(perf)
     combined_candidates: list[PartitionPlan] = []
-    for left_plan in left_frontier:
-        for right_plan in right_frontier:
-            combined = _combine_plans(
-                left_plan,
-                right_plan,
-                task.boundary,
-                SplitCandidate(
-                    left_ids=task.left_ids,
-                    right_ids=task.right_ids,
-                    boundary=task.boundary,
-                    direction_deg=task.direction_deg,
-                    threshold=task.threshold,
-                    rank_score=0.0,
-                ),
-            )
-            if combined.region_count > MAX_REGIONS:
-                perf["combine_region_limit_rejections"] += 1
-                continue
-            combined_candidates.append(combined)
-            perf["combined_plan_candidates"] += 1
-    branch_frontier = _pareto_frontier(combined_candidates, context.root_area_m2, context.practical_line_length_scale)
+    _extend_combined_candidates(
+        combined_candidates,
+        left_frontier,
+        right_frontier,
+        task.boundary,
+        SplitCandidate(
+            left_ids=task.left_ids,
+            right_ids=task.right_ids,
+            boundary=task.boundary,
+            direction_deg=task.direction_deg,
+            threshold=task.threshold,
+            rank_score=0.0,
+        ),
+        perf,
+    )
+    branch_frontier = _pareto_frontier_with_perf(
+        combined_candidates,
+        context.root_area_m2,
+        context.practical_line_length_scale,
+        perf,
+    )
     perf["frontier_plan_count"] += len(branch_frontier)
     return branch_frontier, dict(perf)
 
@@ -2793,14 +2866,14 @@ def _solve_split_candidates_via_nested_lambda(
         right_frontier = subtree_results.get(index, {}).get("right", [])
         if not left_frontier or not right_frontier:
             continue
-        for left_plan in left_frontier:
-            for right_plan in right_frontier:
-                combined = _combine_plans(left_plan, right_plan, split.boundary, split)
-                if combined.region_count > MAX_REGIONS:
-                    perf["combine_region_limit_rejections"] += 1
-                    continue
-                candidates.append(combined)
-                perf["combined_plan_candidates"] += 1
+        _extend_combined_candidates(
+            candidates,
+            left_frontier,
+            right_frontier,
+            split.boundary,
+            split,
+            perf,
+        )
     return candidates
 
 
@@ -2920,14 +2993,14 @@ def solve_partition_hierarchy(
                                     right_frontier = subtree_results.get(index, {}).get("right", [])
                                     if not left_frontier or not right_frontier:
                                         continue
-                                    for left_plan in left_frontier:
-                                        for right_plan in right_frontier:
-                                            combined = _combine_plans(left_plan, right_plan, split.boundary, split)
-                                            if combined.region_count > MAX_REGIONS:
-                                                perf["combine_region_limit_rejections"] += 1
-                                                continue
-                                            branch_candidates.append(combined)
-                                            perf["combined_plan_candidates"] += 1
+                                    _extend_combined_candidates(
+                                        branch_candidates,
+                                        left_frontier,
+                                        right_frontier,
+                                        split.boundary,
+                                        split,
+                                        perf,
+                                    )
                             else:
                                 branch_workers = _resolve_lambda_parallel_invocations(
                                     len(tasks),
@@ -2965,14 +3038,14 @@ def solve_partition_hierarchy(
                                     right_frontier = subtree_results.get(index, {}).get("right", [])
                                     if not left_frontier or not right_frontier:
                                         continue
-                                    for left_plan in left_frontier:
-                                        for right_plan in right_frontier:
-                                            combined = _combine_plans(left_plan, right_plan, split.boundary, split)
-                                            if combined.region_count > MAX_REGIONS:
-                                                perf["combine_region_limit_rejections"] += 1
-                                                continue
-                                            branch_candidates.append(combined)
-                                            perf["combined_plan_candidates"] += 1
+                                    _extend_combined_candidates(
+                                        branch_candidates,
+                                        left_frontier,
+                                        right_frontier,
+                                        split.boundary,
+                                        split,
+                                        perf,
+                                    )
                             else:
                                 with ProcessPoolExecutor(
                                     max_workers=usable_workers,
@@ -2994,10 +3067,11 @@ def solve_partition_hierarchy(
                         all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
                     else:
                         perf["root_parallel_ms"] += (time.perf_counter() - branch_started_at) * 1000.0
-                        all_plans = _pareto_frontier(
+                        all_plans = _pareto_frontier_with_perf(
                             [baseline_plan] + branch_candidates,
                             root_area_m2,
                             practical_line_length_scale,
+                            perf,
                         )
                         perf["frontier_plan_count"] += len(all_plans)
     if not all_plans:
@@ -3058,7 +3132,7 @@ def solve_partition_hierarchy(
         if exact_plan is not None:
             exact_all_plans.append(exact_plan)
     if exact_all_plans:
-        all_plans = _pareto_frontier(exact_all_plans, root_area_m2, practical_line_length_scale)
+        all_plans = _pareto_frontier_with_perf(exact_all_plans, root_area_m2, practical_line_length_scale, perf)
         baseline = min(
             (plan for plan in all_plans if plan.region_count == 1),
             key=lambda plan: (plan.quality_cost, plan.mission_time_sec),
@@ -3281,7 +3355,7 @@ def solve_partition_hierarchy(
     comparison_pool = practical[:]
     if baseline is not None:
         comparison_pool.append(baseline)
-    filtered = _pareto_frontier(comparison_pool, root_area_m2, practical_line_length_scale)
+    filtered = _pareto_frontier_with_perf(comparison_pool, root_area_m2, practical_line_length_scale, perf)
     practical_filtered = [
         plan
         for plan in filtered

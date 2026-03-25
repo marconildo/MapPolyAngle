@@ -3,7 +3,13 @@ import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappi
 import type { FlightParams, TerrainTile } from "@/domain/types";
 import { build3DFlightPath, calculateOptimalTerrainZoom, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
 import { generateFlightLinesForPolygon } from "@/flight/flightLines";
-import type { ExactCameraTileInput, ExactCameraTileOutput, ExactLidarTileInput, ExactLidarTileOutput } from "@/overlap/exact-core";
+import type {
+  ExactCameraTileInput,
+  ExactCameraTileOutput,
+  ExactLidarTileInput,
+  ExactLidarTileOutput,
+  ExactScoreBreakdown,
+} from "@/overlap/exact-core";
 import { scoreExactCameraStats, scoreExactLidarStats } from "@/overlap/exact-core";
 import { aggregateMetricStats } from "@/overlap/metricAggregation";
 import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
@@ -77,6 +83,9 @@ export interface ExactBearingCandidate {
   metricKind: ExactMetricKind;
   stats: GSDStats;
   diagnostics: Record<string, number>;
+  qualityBreakdown: ExactScoreBreakdown;
+  costBreakdown: ExactScoreBreakdown;
+  missionBreakdown: ExactMissionBreakdown;
 }
 
 export interface ExactBearingSearchResult {
@@ -85,6 +94,15 @@ export interface ExactBearingSearchResult {
   seedBearingDeg: number;
   lineSpacingM: number;
   safeParams: FlightParams;
+}
+
+export interface ExactMissionBreakdown {
+  totalLengthM: number;
+  speedMps: number;
+  lineCount: number;
+  sampleCount?: number;
+  segmentCount?: number;
+  sampleLabel?: string;
 }
 
 export interface ExactRegionSummary {
@@ -110,12 +128,45 @@ export interface ExactPartitionRerankResult {
   bestIndex: number;
   solutions: TerrainPartitionSolutionPreview[];
   previewsBySignature: Record<string, ExactPartitionPreview>;
+  debugBySignature?: Record<string, ExactSolutionDebugTrace>;
 }
 
 export interface ExactPartitionSolutionEvaluation {
   solution: TerrainPartitionSolutionPreview;
   preview: ExactPartitionPreview;
   score: number;
+  debugTrace?: ExactSolutionDebugTrace;
+}
+
+export interface ExactRegionSearchTrace {
+  regionIndex: number;
+  originalBearingDeg: number;
+  seedBearingDeg: number;
+  chosenBearingDeg: number | null;
+  chosenExactCost: number | null;
+  searchMode: ExactSearchMode;
+  halfWindowDeg: number;
+  lineSpacingM: number;
+  elapsedMs: number;
+  evaluatedBearings: ExactBearingCandidate[];
+}
+
+export interface ExactSolutionDebugTrace {
+  signature: string;
+  polygonId: string;
+  rankingSource: "backend-exact" | "frontend-exact";
+  exactOptimizeZoom: number;
+  timeWeight: number;
+  qualityWeight: number;
+  fastestMissionTimeSec: number;
+  partitionScoreBreakdown: ExactScoreBreakdown;
+  preview: ExactPartitionPreview;
+  timings: {
+    totalElapsedMs: number;
+    previewElapsedMs: number;
+    regionSearchElapsedMs: number[];
+  };
+  regions: ExactRegionSearchTrace[];
 }
 
 function tileKey(tileRef: ExactTileRef) {
@@ -162,6 +213,43 @@ function path3dLengthMeters(path3d: [number, number, number][][]) {
     }
   }
   return total;
+}
+
+function buildScoreBreakdown(
+  modelVersion: string,
+  signals: Record<string, number>,
+  weights: Record<string, number>,
+) {
+  const contributions = Object.fromEntries(
+    Object.entries(weights).map(([key, weight]) => [key, (signals[key] ?? 0) * weight]),
+  );
+  return {
+    modelVersion,
+    total: Object.values(contributions).reduce((sum, value) => sum + value, 0),
+    signals,
+    weights,
+    contributions,
+  } satisfies ExactScoreBreakdown;
+}
+
+function buildExactCostBreakdown(
+  modelVersion: string,
+  qualityWeight: number,
+  qualityCost: number,
+  timeWeight: number,
+  normalizedTimeCost: number,
+) {
+  return buildScoreBreakdown(
+    modelVersion,
+    {
+      qualityCost,
+      normalizedTimeCost,
+    },
+    {
+      qualityCost: qualityWeight,
+      normalizedTimeCost: timeWeight,
+    },
+  );
 }
 
 function isLidarParams(params: FlightParams): boolean {
@@ -234,7 +322,7 @@ async function resolveGeometryTiles(
   return toTerrainTiles(tiles);
 }
 
-function estimateMissionTimeSec(
+function estimateMissionBreakdown(
   ring: [number, number][],
   bearingDeg: number,
   lineSpacing: number,
@@ -245,7 +333,16 @@ function estimateMissionTimeSec(
   turnExtendM: number,
 ) {
   const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
-  if (!flightLines.length) return 0;
+  if (!flightLines.length) {
+    return {
+      missionTimeSec: 0,
+      totalLengthM: 0,
+      speedMps: isLidarParams(params)
+        ? (params.speedMps ?? getLidarModel(params.lidarKey).defaultSpeedMps)
+        : DEFAULT_CAMERA_SPEED_MPS,
+      lineCount: 0,
+    };
+  }
   const path3d = build3DFlightPath(
     flightLines,
     terrainTiles,
@@ -257,7 +354,12 @@ function estimateMissionTimeSec(
   const speedMps = isLidarParams(params)
     ? (params.speedMps ?? getLidarModel(params.lidarKey).defaultSpeedMps)
     : DEFAULT_CAMERA_SPEED_MPS;
-  return totalLengthM / Math.max(0.1, speedMps);
+  return {
+    missionTimeSec: totalLengthM / Math.max(0.1, speedMps),
+    totalLengthM,
+    speedMps,
+    lineCount: flightLines.length,
+  };
 }
 
 async function buildCameraPosesForBearing(
@@ -405,7 +507,8 @@ export async function evaluateRegionBearingExact(
   const lineSpacingM = getLineSpacingForParams(safeParams);
   const geometryTiles = await resolveGeometryTiles(runtime, args.ring, args.geometryTiles);
   const exactZoom = args.exactOptimizeZoom ?? DEFAULT_EXACT_OPTIMIZE_ZOOM;
-  const exactQualityWeight = 1 - (args.timeWeight ?? DEFAULT_TIME_WEIGHT);
+  const timeWeight = args.timeWeight ?? DEFAULT_TIME_WEIGHT;
+  const exactQualityWeight = 1 - timeWeight;
   const normalizedBearingDeg = normalizeAxialBearingDeg(args.bearingDeg);
   const tileRefs = (() => {
     const seen = new Set<string>();
@@ -455,7 +558,7 @@ export async function evaluateRegionBearingExact(
     if (!perTileStats.length) return null;
     const stats = aggregateMetricStats(perTileStats);
     const scored = scoreExactLidarStats(stats, safeParams);
-    const missionTimeSec = estimateMissionTimeSec(
+    const mission = estimateMissionBreakdown(
       args.ring,
       normalizedBearingDeg,
       lineSpacingM,
@@ -465,19 +568,33 @@ export async function evaluateRegionBearingExact(
       args.minClearanceM,
       args.turnExtendM,
     );
-    const normalizedTimeCost = missionTimeSec / 180;
-    const exactCost = exactQualityWeight * scored.qualityCost + (args.timeWeight ?? DEFAULT_TIME_WEIGHT) * normalizedTimeCost;
+    const normalizedTimeCost = mission.missionTimeSec / 180;
+    const costBreakdown = buildExactCostBreakdown(
+      scored.breakdown.modelVersion,
+      exactQualityWeight,
+      scored.qualityCost,
+      timeWeight,
+      normalizedTimeCost,
+    );
+    const missionBreakdown: ExactMissionBreakdown = {
+      totalLengthM: mission.totalLengthM,
+      speedMps: mission.speedMps,
+      lineCount: mission.lineCount,
+      sampleCount: new Set(strips.map((strip) => strip.passIndex ?? -1)).size,
+      segmentCount: strips.length,
+      sampleLabel: "Flight lines",
+    };
     return {
       bearingDeg: normalizedBearingDeg,
-      exactCost,
+      exactCost: costBreakdown.total,
       qualityCost: scored.qualityCost,
-      missionTimeSec,
+      missionTimeSec: mission.missionTimeSec,
       normalizedTimeCost,
       metricKind: "density",
       stats,
       diagnostics: {
         qualityCost: scored.qualityCost,
-        missionTimeSec,
+        missionTimeSec: mission.missionTimeSec,
         normalizedTimeCost,
         targetDensityPtsM2: scored.targetDensityPtsM2,
         holeFraction: scored.holeFraction,
@@ -485,6 +602,9 @@ export async function evaluateRegionBearingExact(
         q10: scored.q10,
         q25: scored.q25,
       },
+      qualityBreakdown: scored.breakdown,
+      costBreakdown,
+      missionBreakdown,
     };
   }
 
@@ -523,7 +643,7 @@ export async function evaluateRegionBearingExact(
   if (!perTileStats.length) return null;
   const stats = aggregateMetricStats(perTileStats);
   const scored = scoreExactCameraStats(stats, safeParams);
-  const missionTimeSec = estimateMissionTimeSec(
+  const mission = estimateMissionBreakdown(
     args.ring,
     normalizedBearingDeg,
     lineSpacingM,
@@ -533,25 +653,41 @@ export async function evaluateRegionBearingExact(
     args.minClearanceM,
     args.turnExtendM,
   );
-  const normalizedTimeCost = missionTimeSec / 180;
-  const exactCost = exactQualityWeight * scored.qualityCost + (args.timeWeight ?? DEFAULT_TIME_WEIGHT) * normalizedTimeCost;
+  const normalizedTimeCost = mission.missionTimeSec / 180;
+  const costBreakdown = buildExactCostBreakdown(
+    scored.breakdown.modelVersion,
+    exactQualityWeight,
+    scored.qualityCost,
+    timeWeight,
+    normalizedTimeCost,
+  );
+  const missionBreakdown: ExactMissionBreakdown = {
+    totalLengthM: mission.totalLengthM,
+    speedMps: mission.speedMps,
+    lineCount: mission.lineCount,
+    sampleCount: poses.length,
+    sampleLabel: "Images",
+  };
   return {
     bearingDeg: normalizedBearingDeg,
-    exactCost,
+    exactCost: costBreakdown.total,
     qualityCost: scored.qualityCost,
-    missionTimeSec,
+    missionTimeSec: mission.missionTimeSec,
     normalizedTimeCost,
     metricKind: "gsd",
     stats,
     diagnostics: {
       qualityCost: scored.qualityCost,
-      missionTimeSec,
+      missionTimeSec: mission.missionTimeSec,
       normalizedTimeCost,
       targetGsdM: scored.targetGsdM,
       overTargetAreaFraction: scored.overTargetAreaFraction,
       q75: scored.q75,
       q90: scored.q90,
     },
+    qualityBreakdown: scored.breakdown,
+    costBreakdown,
+    missionBreakdown,
   };
 }
 
@@ -918,19 +1054,36 @@ function scoreLidarPartitionPreview(
     ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
     : 0;
   const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.035;
-  const score =
-    4.8 * worstRegionHoleFraction +
-    2.9 * worstRegionLowFraction +
-    2.1 * worstRegionQ10Deficit +
-    0.9 * worstRegionMeanDeficit +
-    4.2 * overall.holeFraction +
-    2.4 * overall.lowFraction +
-    1.9 * Math.max(0, 1 - overall.q10 / Math.max(1e-6, targetDensityPtsM2)) +
-    1.2 * Math.max(0, 1 - overall.q25 / Math.max(1e-6, targetDensityPtsM2)) +
-    0.8 * Math.max(0, 1 - preview.stats.mean / Math.max(1e-6, targetDensityPtsM2)) +
-    0.18 * relativeTimePenalty +
-    regionPenalty;
-  return { score, totalAreaM2, holeThreshold, weakThreshold };
+  const breakdown = buildScoreBreakdown(
+    "lidar-partition-v1",
+    {
+      worstRegionHoleFraction,
+      worstRegionLowFraction,
+      worstRegionQ10Deficit,
+      worstRegionMeanDeficit,
+      overallHoleFraction: overall.holeFraction,
+      overallLowFraction: overall.lowFraction,
+      overallQ10Deficit: Math.max(0, 1 - overall.q10 / Math.max(1e-6, targetDensityPtsM2)),
+      overallQ25Deficit: Math.max(0, 1 - overall.q25 / Math.max(1e-6, targetDensityPtsM2)),
+      overallMeanDeficit: Math.max(0, 1 - preview.stats.mean / Math.max(1e-6, targetDensityPtsM2)),
+      relativeTimePenalty,
+      regionPenalty: solution.regionCount > 1 ? solution.regionCount - 1 : 0,
+    },
+    {
+      worstRegionHoleFraction: 4.8,
+      worstRegionLowFraction: 2.9,
+      worstRegionQ10Deficit: 2.1,
+      worstRegionMeanDeficit: 0.9,
+      overallHoleFraction: 4.2,
+      overallLowFraction: 2.4,
+      overallQ10Deficit: 1.9,
+      overallQ25Deficit: 1.2,
+      overallMeanDeficit: 0.8,
+      relativeTimePenalty: 0.18,
+      regionPenalty: 0.035,
+    },
+  );
+  return { score: breakdown.total, totalAreaM2, holeThreshold, weakThreshold, breakdown };
 }
 
 function scoreCameraPartitionPreview(
@@ -952,17 +1105,34 @@ function scoreCameraPartitionPreview(
     ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
     : 0;
   const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.12;
+  const breakdown = buildScoreBreakdown(
+    "camera-partition-v1",
+    {
+      worstRegionQ90Cm,
+      worstRegionMeanCm,
+      worstRegionMaxCm,
+      overallQ90Cm,
+      overallQ75Cm,
+      overallMeanCm,
+      overallMaxCm,
+      relativeTimePenalty,
+      regionPenalty: solution.regionCount > 1 ? solution.regionCount - 1 : 0,
+    },
+    {
+      worstRegionQ90Cm: 2.6,
+      worstRegionMeanCm: 2.0,
+      worstRegionMaxCm: 1.2,
+      overallQ90Cm: 1.0,
+      overallQ75Cm: 0.7,
+      overallMeanCm: 0.4,
+      overallMaxCm: 0.25,
+      relativeTimePenalty: 0.35,
+      regionPenalty: 0.12,
+    },
+  );
   return {
-    score:
-      2.6 * worstRegionQ90Cm +
-      2.0 * worstRegionMeanCm +
-      1.2 * worstRegionMaxCm +
-      1.0 * overallQ90Cm +
-      0.7 * overallQ75Cm +
-      0.4 * overallMeanCm +
-      0.25 * overallMaxCm +
-      0.35 * relativeTimePenalty +
-      regionPenalty,
+    score: breakdown.total,
+    breakdown,
   };
 }
 
@@ -993,13 +1163,21 @@ export async function evaluatePartitionSolutionCandidateExact(
     solution: TerrainPartitionSolutionPreview;
     fastestMissionTimeSec: number;
     rankingSource?: "backend-exact" | "frontend-exact";
+    debugTrace?: boolean;
   },
 ): Promise<ExactPartitionSolutionEvaluation> {
+  const evaluationStartedAt = performance.now();
   const rankingSource = args.rankingSource ?? "frontend-exact";
+  const timeWeight = args.timeWeight ?? DEFAULT_TIME_WEIGHT;
+  const qualityWeight = 1 - timeWeight;
+  const exactOptimizeZoom = args.exactOptimizeZoom ?? DEFAULT_EXACT_OPTIMIZE_ZOOM;
   const solution = args.solution;
   const refinedRegions = [];
+  const regionTraces: ExactRegionSearchTrace[] = [];
+  const regionSearchElapsedMs: number[] = [];
   for (let regionIndex = 0; regionIndex < solution.regions.length; regionIndex++) {
     const region = solution.regions[regionIndex];
+    const regionStartedAt = performance.now();
     const local = await optimizeBearingExact(runtime, {
       ...args,
       scopeId: `${args.polygonId}::${regionIndex}`,
@@ -1009,6 +1187,8 @@ export async function evaluatePartitionSolutionCandidateExact(
       mode: "local",
       halfWindowDeg: 30,
     });
+    const elapsedMs = performance.now() - regionStartedAt;
+    regionSearchElapsedMs.push(elapsedMs);
     const best = local.best;
     refinedRegions.push({
       ...region,
@@ -1016,22 +1196,58 @@ export async function evaluatePartitionSolutionCandidateExact(
       exactScore: best?.exactCost ?? null,
       exactSeedBearingDeg: local.seedBearingDeg,
     });
+    if (args.debugTrace) {
+      regionTraces.push({
+        regionIndex,
+        originalBearingDeg: region.bearingDeg,
+        seedBearingDeg: local.seedBearingDeg,
+        chosenBearingDeg: best?.bearingDeg ?? region.bearingDeg,
+        chosenExactCost: best?.exactCost ?? null,
+        searchMode: "local",
+        halfWindowDeg: 30,
+        lineSpacingM: local.lineSpacingM,
+        elapsedMs,
+        evaluatedBearings: local.evaluated,
+      });
+    }
   }
   const refinedSolution: TerrainPartitionSolutionPreview = {
     ...solution,
     regions: refinedRegions,
   };
+  const previewStartedAt = performance.now();
   const preview = await evaluatePartitionSolutionExact(runtime, {
     ...args,
     solution: refinedSolution,
   });
-  const score = isLidarParams(args.params)
-    ? scoreLidarPartitionPreview(args.params, refinedSolution, preview, args.fastestMissionTimeSec).score
-    : scoreCameraPartitionPreview(args.params, refinedSolution, preview, args.fastestMissionTimeSec).score;
+  const previewElapsedMs = performance.now() - previewStartedAt;
+  const partitionScore = isLidarParams(args.params)
+    ? scoreLidarPartitionPreview(args.params, refinedSolution, preview, args.fastestMissionTimeSec)
+    : scoreCameraPartitionPreview(args.params, refinedSolution, preview, args.fastestMissionTimeSec);
+  const score = partitionScore.score;
   return {
     solution: withExactSummary(args.params, refinedSolution, preview, rankingSource, score),
     preview,
     score,
+    debugTrace: args.debugTrace
+      ? {
+        signature: solution.signature,
+        polygonId: args.polygonId,
+        rankingSource,
+        exactOptimizeZoom,
+        timeWeight,
+        qualityWeight,
+        fastestMissionTimeSec: args.fastestMissionTimeSec,
+        partitionScoreBreakdown: partitionScore.breakdown,
+        preview,
+        timings: {
+          totalElapsedMs: performance.now() - evaluationStartedAt,
+          previewElapsedMs,
+          regionSearchElapsedMs,
+        },
+        regions: regionTraces,
+      }
+      : undefined,
   };
 }
 
@@ -1041,6 +1257,7 @@ export async function rerankPartitionSolutionsExact(
     polygonId: string;
     solutions: TerrainPartitionSolutionPreview[];
     rankingSource?: "backend-exact" | "frontend-exact";
+    debugTrace?: boolean;
   },
 ): Promise<ExactPartitionRerankResult> {
   if (args.solutions.length === 0) return { bestIndex: 0, solutions: [], previewsBySignature: {} };
@@ -1051,6 +1268,7 @@ export async function rerankPartitionSolutionsExact(
   );
   const preparedSolutions = [...args.solutions];
   const previewsBySignature: Record<string, ExactPartitionPreview> = {};
+  const debugBySignature: Record<string, ExactSolutionDebugTrace> = {};
   let bestIndex = 0;
   let bestScore = Number.POSITIVE_INFINITY;
 
@@ -1062,6 +1280,9 @@ export async function rerankPartitionSolutionsExact(
     });
     previewsBySignature[args.solutions[index].signature] = evaluated.preview;
     preparedSolutions[index] = evaluated.solution;
+    if (evaluated.debugTrace) {
+      debugBySignature[args.solutions[index].signature] = evaluated.debugTrace;
+    }
     if (evaluated.score < bestScore - 1e-9) {
       bestScore = evaluated.score;
       bestIndex = index;
@@ -1072,5 +1293,6 @@ export async function rerankPartitionSolutionsExact(
     bestIndex,
     solutions: preparedSolutions,
     previewsBySignature,
+    debugBySignature: args.debugTrace ? debugBySignature : undefined,
   };
 }

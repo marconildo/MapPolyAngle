@@ -10,6 +10,7 @@ from base64 import b64encode
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import tifffile
@@ -399,6 +400,8 @@ class _FakeExactBridge:
         self.optimize_requests: list[dict] = []
         self.evaluate_solution_requests: list[dict] = []
         self.rerank_requests: list[dict] = []
+        self.begin_candidate_batch_calls = 0
+        self.end_candidate_batch_calls = 0
 
     def supports_candidate_fanout(self) -> bool:
         return self._supports_candidate_fanout
@@ -406,11 +409,18 @@ class _FakeExactBridge:
     def candidate_max_inflight(self) -> int:
         return self._candidate_max_inflight
 
+    def begin_candidate_batch(self):
+        self.begin_candidate_batch_calls += 1
+        return object()
+
+    def end_candidate_batch(self, _batch_handle) -> None:
+        self.end_candidate_batch_calls += 1
+
     def optimize_bearing(self, request: dict) -> dict:
         self.optimize_requests.append(request)
         return self.optimize_response
 
-    def evaluate_solution(self, request: dict) -> dict:
+    def evaluate_solution(self, request: dict, *, batch_handle=None) -> dict:
         self.evaluate_solution_requests.append(request)
         signature = request["solution"]["signature"]
         if signature in self.evaluate_solution_errors:
@@ -432,6 +442,151 @@ class _FakeExactBridge:
     def rerank_solutions(self, request: dict) -> dict:
         self.rerank_requests.append(request)
         return self.rerank_response
+
+
+def _read_debug_artifacts(debug_dir: Path, request_id: str) -> dict[str, dict]:
+    request_dir = debug_dir / request_id
+    return {
+        path.stem: json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(request_dir.glob("*.json"))
+    }
+
+
+def _fake_exact_debug_trace(signature: str, *, exact_score: float = 4.5) -> dict:
+    return {
+        "signature": signature,
+        "polygonId": "poly-1",
+        "rankingSource": "backend-exact",
+        "exactOptimizeZoom": 14,
+        "timeWeight": 0.1,
+        "qualityWeight": 0.9,
+        "fastestMissionTimeSec": 120.0,
+        "partitionScoreBreakdown": {
+            "modelVersion": "camera-partition-v1",
+            "total": exact_score,
+            "signals": {"worstRegionQ90Cm": exact_score / 2.6},
+            "weights": {"worstRegionQ90Cm": 2.6},
+            "contributions": {"worstRegionQ90Cm": exact_score},
+        },
+        "preview": {
+            "solution": {
+                "signature": signature,
+                "tradeoff": 0.5,
+                "regionCount": 1,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.2,
+                "weightedMeanMismatchDeg": 0.0,
+                "hierarchyLevel": 0,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 1.0,
+                "isFirstPracticalSplit": signature == "surrogate-a",
+                "regions": [],
+            },
+            "metricKind": "gsd",
+            "stats": {
+                "mean": 1.0,
+                "q25": 1.0,
+                "q75": 1.0,
+                "q90": 1.0,
+                "max": 1.0,
+                "count": 1,
+                "totalAreaM2": 1.0,
+                "histogram": [],
+            },
+            "regionStats": [
+                {
+                    "mean": 1.0,
+                    "q25": 1.0,
+                    "q75": 1.0,
+                    "q90": 1.0,
+                    "max": 1.0,
+                    "count": 1,
+                    "totalAreaM2": 1.0,
+                    "histogram": [],
+                }
+            ],
+            "regionCount": 1,
+            "sampleCount": 1,
+            "sampleLabel": "Images",
+        },
+        "timings": {
+            "totalElapsedMs": 12.0,
+            "previewElapsedMs": 3.0,
+            "regionSearchElapsedMs": [9.0],
+        },
+        "regions": [
+            {
+                "regionIndex": 0,
+                "originalBearingDeg": 35.0,
+                "seedBearingDeg": 35.0,
+                "chosenBearingDeg": 90.0,
+                "chosenExactCost": 1.5,
+                "searchMode": "local",
+                "halfWindowDeg": 30,
+                "lineSpacingM": 50.0,
+                "elapsedMs": 9.0,
+                "evaluatedBearings": [
+                    {
+                        "bearingDeg": 90.0,
+                        "exactCost": 1.5,
+                        "qualityCost": 0.5,
+                        "missionTimeSec": 120.0,
+                        "normalizedTimeCost": 0.6666666667,
+                        "metricKind": "gsd",
+                        "stats": {
+                            "mean": 1.0,
+                            "q25": 1.0,
+                            "q75": 1.0,
+                            "q90": 1.0,
+                            "max": 1.0,
+                            "count": 1,
+                            "totalAreaM2": 1.0,
+                            "histogram": [],
+                        },
+                        "diagnostics": {
+                            "qualityCost": 0.5,
+                            "missionTimeSec": 120.0,
+                            "normalizedTimeCost": 0.6666666667,
+                            "targetGsdM": 0.02,
+                            "overTargetAreaFraction": 0.0,
+                            "q75": 0.02,
+                            "q90": 0.03,
+                        },
+                        "qualityBreakdown": {
+                            "modelVersion": "camera-region-v1",
+                            "total": 0.5,
+                            "signals": {"q90Overshoot": 0.27027027027},
+                            "weights": {"q90Overshoot": 1.85},
+                            "contributions": {"q90Overshoot": 0.5},
+                        },
+                        "costBreakdown": {
+                            "modelVersion": "camera-region-v1",
+                            "total": 1.5,
+                            "signals": {"qualityCost": 0.5, "normalizedTimeCost": 0.6666666667},
+                            "weights": {"qualityCost": 0.9, "normalizedTimeCost": 0.1},
+                            "contributions": {"qualityCost": 1.43333333333, "normalizedTimeCost": 0.06666666667},
+                        },
+                        "missionBreakdown": {
+                            "totalLengthM": 1440.0,
+                            "speedMps": 12.0,
+                            "lineCount": 4,
+                            "sampleCount": 25,
+                            "sampleLabel": "Images",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _debug_grid_stub():
+    return SimpleNamespace(grid_step_m=40.0, cells=[], edges=[])
+
+
+def _debug_feature_field_stub():
+    return SimpleNamespace(dominant_preferred_bearing_deg=0.0, cells=[])
 
 
 def _encode_png_bytes(size: int, rgba_value: int = 128) -> bytes:
@@ -1994,6 +2149,491 @@ def test_partition_solve_preserves_surrogate_only_behavior_when_exact_disabled(m
         app_module.EXACT_RUNTIME_BRIDGE = original_bridge
 
 
+def test_partition_solve_debug_false_writes_no_debug_artifacts(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        app_module,
+        "solve_partition_hierarchy",
+        lambda *_args, **_kwargs: [
+            PartitionSolutionPreviewModel.model_validate(
+                {
+                    "signature": "surrogate-a",
+                    "tradeoff": 0.5,
+                    "regionCount": 1,
+                    "totalMissionTimeSec": 120.0,
+                    "normalizedQualityCost": 0.4,
+                    "weightedMeanMismatchDeg": 4.0,
+                    "hierarchyLevel": 1,
+                    "largestRegionFraction": 1.0,
+                    "meanConvexity": 1.0,
+                    "boundaryBreakAlignment": 0.7,
+                    "isFirstPracticalSplit": True,
+                    "regions": [
+                        {"areaM2": 10.0, "bearingDeg": 20.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                    ],
+                }
+            ),
+            PartitionSolutionPreviewModel.model_validate(
+                {
+                    "signature": "surrogate-b",
+                    "tradeoff": 0.6,
+                    "regionCount": 1,
+                    "totalMissionTimeSec": 130.0,
+                    "normalizedQualityCost": 0.5,
+                    "weightedMeanMismatchDeg": 5.0,
+                    "hierarchyLevel": 1,
+                    "largestRegionFraction": 1.0,
+                    "meanConvexity": 1.0,
+                    "boundaryBreakAlignment": 0.7,
+                    "isFirstPracticalSplit": False,
+                    "regions": [
+                        {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                    ],
+                }
+            ),
+        ],
+    )
+    debug_dir = tmp_path / "debug-artifacts"
+    debug_dir.mkdir()
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_debug_dir = app_module.DEBUG_DIR
+    app_module.EXACT_RUNTIME_BRIDGE = None
+    app_module.DEBUG_DIR = debug_dir
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[7.0, 47.0], [7.01, 47.0], [7.01, 47.01], [7.0, 47.01], [7.0, 47.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 120, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                },
+            )
+        assert response.status_code == 200
+        assert list(debug_dir.iterdir()) == []
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+        app_module.DEBUG_DIR = original_debug_dir
+
+
+def test_partition_solve_debug_true_writes_skipped_exact_summary(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: _debug_grid_stub())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: _debug_feature_field_stub())
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.5,
+                "regionCount": 1,
+                "totalMissionTimeSec": 120.0,
+                "normalizedQualityCost": 0.4,
+                "weightedMeanMismatchDeg": 4.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 20.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0, 0], [1, 0], [1, 1], [0, 0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    debug_dir = tmp_path / "debug-artifacts"
+    debug_dir.mkdir()
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_debug_dir = app_module.DEBUG_DIR
+    app_module.EXACT_RUNTIME_BRIDGE = None
+    app_module.DEBUG_DIR = debug_dir
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[7.0, 47.0], [7.01, 47.0], [7.01, 47.01], [7.0, 47.01], [7.0, 47.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 120, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                    "debug": True,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        artifacts = _read_debug_artifacts(debug_dir, payload["requestId"])
+        assert "exact_rerank_summary" in artifacts
+        summary = artifacts["exact_rerank_summary"]
+        assert summary["exactStatus"] == "skipped"
+        assert summary["skipReason"] == "no-exact-bridge"
+        assert [candidate["notEvaluatedReason"] for candidate in summary["candidateSolutions"]] == [
+            "no-exact-bridge",
+            "no-exact-bridge",
+        ]
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+        app_module.DEBUG_DIR = original_debug_dir
+
+
+def test_partition_solve_debug_true_writes_exact_rerank_candidate_artifacts(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: _debug_grid_stub())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: _debug_feature_field_stub())
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.4,
+                "regionCount": 1,
+                "totalMissionTimeSec": 125.0,
+                "normalizedQualityCost": 0.3,
+                "weightedMeanMismatchDeg": 3.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.8,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 35.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-c",
+                "tradeoff": 0.8,
+                "regionCount": 1,
+                "totalMissionTimeSec": 150.0,
+                "normalizedQualityCost": 0.7,
+                "weightedMeanMismatchDeg": 7.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.6,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 55.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    bridge = _FakeExactBridge(
+        evaluate_solution_responses={
+            "surrogate-a": {
+                "solution": {
+                    **surrogate_solutions[0].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 9.2,
+                    "exactQualityCost": 1.1,
+                    "exactMissionTimeSec": 125.0,
+                    "exactMetricKind": "gsd",
+                    "regions": [
+                        {
+                            **surrogate_solutions[0].regions[0].model_dump(mode="json"),
+                            "bearingDeg": 90.0,
+                            "exactScore": 3.2,
+                            "exactSeedBearingDeg": 35.0,
+                        }
+                    ],
+                },
+                "preview": {
+                    "metricKind": "gsd",
+                    "stats": {"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0},
+                    "regionStats": [{"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0}],
+                    "regionCount": 1,
+                    "sampleCount": 1,
+                    "sampleLabel": "Images",
+                },
+                "debugTrace": _fake_exact_debug_trace("surrogate-a", exact_score=9.2),
+            },
+            "surrogate-b": {
+                "solution": {
+                    **surrogate_solutions[1].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 4.5,
+                    "exactQualityCost": 0.7,
+                    "exactMissionTimeSec": 130.0,
+                    "exactMetricKind": "gsd",
+                    "regions": [
+                        {
+                            **surrogate_solutions[1].regions[0].model_dump(mode="json"),
+                            "bearingDeg": 12.0,
+                            "exactScore": 2.0,
+                            "exactSeedBearingDeg": 40.0,
+                        }
+                    ],
+                },
+                "preview": {
+                    "metricKind": "gsd",
+                    "stats": {"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0},
+                    "regionStats": [{"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0}],
+                    "regionCount": 1,
+                    "sampleCount": 1,
+                    "sampleLabel": "Images",
+                },
+                "debugTrace": _fake_exact_debug_trace("surrogate-b", exact_score=4.5),
+            },
+        },
+        supports_candidate_fanout=True,
+        candidate_max_inflight=3,
+    )
+    debug_dir = tmp_path / "debug-artifacts"
+    debug_dir.mkdir()
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+    original_debug_dir = app_module.DEBUG_DIR
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    app_module.EXACT_POSTPROCESS_TOP_K = 2
+    app_module.DEBUG_DIR = debug_dir
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 110, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                    "debug": True,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert [solution["signature"] for solution in payload["solutions"]] == ["surrogate-b", "surrogate-a"]
+        artifacts = _read_debug_artifacts(debug_dir, payload["requestId"])
+        summary = artifacts["exact_rerank_summary"]
+        assert summary["exactStatus"] == "executed"
+        assert summary["rerankMode"] == "fanout"
+        assert [item["signature"] for item in summary["exactRankingOrder"]] == ["surrogate-b", "surrogate-a"]
+        assert summary["candidateSolutions"][2]["signature"] == "surrogate-c"
+        assert summary["candidateSolutions"][2]["notEvaluatedReason"] == "outside-top-k"
+        assert summary["performanceSummary"]["candidateCount"] == 2
+        assert summary["performanceSummary"]["topCandidatesByBridgeElapsedMs"]
+        assert "exact_candidate_1_surrogate-a" in artifacts
+        assert "exact_candidate_2_surrogate-b" in artifacts
+        assert "exact_candidate_3_surrogate-c" not in artifacts
+        candidate_artifact = artifacts["exact_candidate_1_surrogate-a"]
+        assert candidate_artifact["surrogateSolution"]["signature"] == "surrogate-a"
+        assert candidate_artifact["partitionScoreBreakdown"]["modelVersion"] == "camera-partition-v1"
+        assert candidate_artifact["performanceSummary"]["regionSearchTotalMs"] == 9.0
+        assert candidate_artifact["performanceSummary"]["longestRegion"]["regionIndex"] == 0
+        assert candidate_artifact["regions"][0]["evaluatedBearings"][0]["qualityBreakdown"]["modelVersion"] == "camera-region-v1"
+        assert artifacts["timing"]["performanceSummary"]["requestPhases"]["topStages"]
+        assert artifacts["timing"]["performanceSummary"]["exactRerank"]["candidateCount"] == 2
+        assert payload["solutions"][0]["debug"]["artifactPaths"]
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+        app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+        app_module.DEBUG_DIR = original_debug_dir
+
+
+def test_build_solver_performance_summary_includes_surrogate_breakdown() -> None:
+    summary = app_module._build_solver_performance_summary(
+        {
+            "solverSummary": {
+                "performance": {
+                    "objective_ms": 100.0,
+                    "flight_time_ms": 25.0,
+                    "line_lift_ms": 15.0,
+                    "node_cost_ms": 35.0,
+                    "shape_metric_ms": 5.0,
+                    "build_region_ms": 220.0,
+                    "split_candidate_enumeration_ms": 40.0,
+                    "recursive_subsolve_ms": 120.0,
+                    "plan_combine_ms": 18.0,
+                    "frontier_prune_ms": 6.0,
+                    "exact_geometry_reeval_ms": 60.0,
+                    "exact_geometry_region_reeval_ms": 48.0,
+                    "exact_geometry_reconstruct_ms": 12.0,
+                    "exact_region_objective_ms": 44.0,
+                    "exact_geometry_plan_count": 5.0,
+                    "root_parallel_ms": 0.0,
+                    "nested_parallel_ms": 0.0,
+                    "root_parallel_workers_used": 0.0,
+                    "nested_parallel_workers_used_max": 0.0,
+                    "region_cache_hits": 4.0,
+                    "region_cache_misses": 6.0,
+                    "region_static_hits": 2.0,
+                    "region_static_misses": 8.0,
+                    "region_bearing_hits": 3.0,
+                    "region_bearing_misses": 9.0,
+                    "build_region_calls": 10.0,
+                    "objective_calls": 12.0,
+                    "split_attempts": 20.0,
+                    "split_candidates_returned": 4.0,
+                    "frontier_plan_count": 7.0,
+                }
+            }
+        },
+        solve_ms=400.0,
+    )
+
+    assert summary is not None
+    assert summary["flightTimeAnalysis"]["shareOfObjectiveMs"] == 0.25
+    assert summary["flightTimeAnalysis"]["shareOfSolveMs"] == 0.0625
+    assert summary["objectiveComponentBreakdown"]["topStages"][0]["stage"] == "nodeCostMs"
+    assert any(stage["stage"] == "splitCandidateEnumerationMs" for stage in summary["searchStageBreakdown"]["topStages"])
+    assert summary["exactGeometryBreakdown"]["planCount"] == 5
+    assert summary["exactGeometryBreakdown"]["topStages"][0]["stage"] == "regionReevalMs"
+
+
+def test_partition_solve_debug_true_records_exact_failure_summary(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
+    monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: _debug_grid_stub())
+    monkeypatch.setattr(app_module, "compute_feature_field", lambda *_args, **_kwargs: _debug_feature_field_stub())
+    surrogate_solutions = [
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-a",
+                "tradeoff": 0.4,
+                "regionCount": 1,
+                "totalMissionTimeSec": 125.0,
+                "normalizedQualityCost": 0.3,
+                "weightedMeanMismatchDeg": 3.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.8,
+                "isFirstPracticalSplit": True,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 35.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+        PartitionSolutionPreviewModel.model_validate(
+            {
+                "signature": "surrogate-b",
+                "tradeoff": 0.6,
+                "regionCount": 1,
+                "totalMissionTimeSec": 130.0,
+                "normalizedQualityCost": 0.5,
+                "weightedMeanMismatchDeg": 5.0,
+                "hierarchyLevel": 1,
+                "largestRegionFraction": 1.0,
+                "meanConvexity": 1.0,
+                "boundaryBreakAlignment": 0.7,
+                "isFirstPracticalSplit": False,
+                "regions": [
+                    {"areaM2": 10.0, "bearingDeg": 40.0, "atomCount": 2, "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0]], "convexity": 1.0, "compactness": 0.8},
+                ],
+            }
+        ),
+    ]
+    monkeypatch.setattr(app_module, "solve_partition_hierarchy", lambda *_args, **_kwargs: surrogate_solutions)
+    bridge = _FakeExactBridge(
+        evaluate_solution_responses={
+            "surrogate-a": {
+                "solution": {
+                    **surrogate_solutions[0].model_dump(mode="json"),
+                    "rankingSource": "backend-exact",
+                    "exactScore": 9.2,
+                    "exactQualityCost": 1.1,
+                    "exactMissionTimeSec": 125.0,
+                    "exactMetricKind": "gsd",
+                },
+                "preview": {
+                    "metricKind": "gsd",
+                    "stats": {"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0},
+                    "regionStats": [{"mean": 1.0, "q25": 1.0, "q75": 1.0, "q90": 1.0, "max": 1.0, "count": 1, "totalAreaM2": 1.0}],
+                    "regionCount": 1,
+                    "sampleCount": 1,
+                    "sampleLabel": "Images",
+                },
+                "debugTrace": _fake_exact_debug_trace("surrogate-a", exact_score=9.2),
+            },
+        },
+        evaluate_solution_errors={"surrogate-b": RuntimeError("boom")},
+        supports_candidate_fanout=True,
+        candidate_max_inflight=3,
+    )
+    debug_dir = tmp_path / "debug-artifacts"
+    debug_dir.mkdir()
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    original_top_k = app_module.EXACT_POSTPROCESS_TOP_K
+    original_debug_dir = app_module.DEBUG_DIR
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    app_module.EXACT_POSTPROCESS_TOP_K = 2
+    app_module.DEBUG_DIR = debug_dir
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/partition/solve",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[0.0, 0.0], [0.018, 0.0], [0.018, 0.0045], [0.0, 0.0045], [0.0, 0.0]],
+                    "payloadKind": "camera",
+                    "params": {"payloadKind": "camera", "altitudeAGL": 110, "frontOverlap": 75, "sideOverlap": 70},
+                    "terrainSource": {"mode": "mapbox"},
+                    "altitudeMode": "legacy",
+                    "minClearanceM": 0,
+                    "turnExtendM": 0,
+                    "debug": True,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert [solution["signature"] for solution in payload["solutions"]] == ["surrogate-a", "surrogate-b"]
+        artifacts = _read_debug_artifacts(debug_dir, payload["requestId"])
+        summary = artifacts["exact_rerank_summary"]
+        assert summary["exactStatus"] == "failed"
+        assert "boom" in summary["error"]
+        candidate_map = {candidate["signature"]: candidate for candidate in summary["candidateSolutions"]}
+        assert candidate_map["surrogate-b"]["notEvaluatedReason"] == "candidate-failed"
+        assert candidate_map["surrogate-b"]["candidateError"] == "boom"
+        assert "exact_candidate_1_surrogate-a" in artifacts
+        assert "exact_candidate_2_surrogate-b" not in artifacts
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+        app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
+        app_module.DEBUG_DIR = original_debug_dir
+
+
 def test_partition_solve_exact_rerank_matches_local_exact_runtime(monkeypatch) -> None:
     monkeypatch.setattr(app_module, "fetch_dem_for_ring", lambda *_args, **_kwargs: (np.zeros((4, 4), dtype=np.float32), 14))
     monkeypatch.setattr(app_module, "build_grid", lambda *_args, **_kwargs: object())
@@ -2217,6 +2857,8 @@ def test_partition_solve_endpoint_uses_lambda_exact_candidate_fanout(monkeypatch
         assert [solution["rankingSource"] for solution in payload["solutions"]] == ["backend-exact", "backend-exact"]
         assert bridge.rerank_requests == []
         assert [request["solution"]["signature"] for request in bridge.evaluate_solution_requests] == ["surrogate-a", "surrogate-b"]
+        assert bridge.begin_candidate_batch_calls == 1
+        assert bridge.end_candidate_batch_calls == 1
     finally:
         app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
         app_module.EXACT_RUNTIME_BRIDGE = original_bridge
@@ -2295,6 +2937,8 @@ def test_partition_solve_endpoint_fanout_failure_falls_back_to_surrogate(monkeyp
         assert [solution["rankingSource"] for solution in payload["solutions"]] == [None, None]
         assert bridge.rerank_requests == []
         assert len(bridge.evaluate_solution_requests) == 2
+        assert bridge.begin_candidate_batch_calls == 1
+        assert bridge.end_candidate_batch_calls == 1
     finally:
         app_module.EXACT_POSTPROCESS_TOP_K = original_top_k
         app_module.EXACT_RUNTIME_BRIDGE = original_bridge

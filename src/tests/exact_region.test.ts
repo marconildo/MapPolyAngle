@@ -197,6 +197,15 @@ function approxEqual(actual: number, expected: number, tolerance = 1e-9) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `expected ${expected}, got ${actual}`);
 }
 
+function assertBreakdownTotal(actualTotal: number, breakdown: { total: number; contributions: Record<string, number> }) {
+  approxEqual(actualTotal, breakdown.total, 1e-12);
+  approxEqual(
+    Object.values(breakdown.contributions).reduce((sum, value) => sum + value, 0),
+    actualTotal,
+    1e-12,
+  );
+}
+
 async function main() {
   const { tile, geometryTile } = createFixtureTile();
   const runtime = createRuntime(tile);
@@ -217,6 +226,11 @@ async function main() {
   approxEqual(cameraCandidate.stats.mean, 0.012879483432478302);
   assert.equal(cameraCandidate.stats.count, 728);
   assert.equal(cameraCandidate.stats.histogram.length, 1);
+  assert.equal(cameraCandidate.qualityBreakdown.modelVersion, "camera-region-v1");
+  assert.equal(cameraCandidate.costBreakdown.modelVersion, "camera-region-v1");
+  assertBreakdownTotal(cameraCandidate.qualityCost, cameraCandidate.qualityBreakdown);
+  assertBreakdownTotal(cameraCandidate.exactCost, cameraCandidate.costBreakdown);
+  approxEqual(cameraCandidate.missionBreakdown.totalLengthM / cameraCandidate.missionBreakdown.speedMps, cameraCandidate.missionTimeSec);
 
   const lidarCandidate = await evaluateRegionBearingExact(runtime, {
     ...baseArgs,
@@ -233,6 +247,11 @@ async function main() {
   approxEqual(lidarCandidate.stats.mean, 26.662644939809407);
   assert.equal(lidarCandidate.stats.count, 728);
   assert.equal(lidarCandidate.stats.histogram[0]?.bin, 0);
+  assert.equal(lidarCandidate.qualityBreakdown.modelVersion, "lidar-region-v1");
+  assert.equal(lidarCandidate.costBreakdown.modelVersion, "lidar-region-v1");
+  assertBreakdownTotal(lidarCandidate.qualityCost, lidarCandidate.qualityBreakdown);
+  assertBreakdownTotal(lidarCandidate.exactCost, lidarCandidate.costBreakdown);
+  approxEqual(lidarCandidate.missionBreakdown.totalLengthM / lidarCandidate.missionBreakdown.speedMps, lidarCandidate.missionTimeSec);
 
   const globalOptimize = await optimizeBearingExact(runtime, {
     ...baseArgs,
@@ -293,6 +312,7 @@ async function main() {
       makeSolution("bad", badSeed, baseArgs.ring),
     ],
     rankingSource: "frontend-exact",
+    debugTrace: true,
   });
   assert.equal(reranked.bestIndex, 0);
   assert.equal(reranked.solutions.length, 2);
@@ -311,6 +331,15 @@ async function main() {
   approxEqual(reranked.previewsBySignature.bad.stats.mean, 0.012881537813662582);
   assert.ok(reranked.previewsBySignature.good);
   assert.ok(reranked.previewsBySignature.bad);
+  assert.ok(reranked.debugBySignature?.good);
+  assert.ok(reranked.debugBySignature?.bad);
+  assert.equal(reranked.debugBySignature?.good.partitionScoreBreakdown.modelVersion, "camera-partition-v1");
+  assert.equal(reranked.debugBySignature?.good.regions.length, 1);
+  assert.equal(reranked.debugBySignature?.good.regions[0].evaluatedBearings[0].qualityBreakdown.modelVersion, "camera-region-v1");
+  assertBreakdownTotal(
+    reranked.solutions[0].exactScore ?? Number.NaN,
+    reranked.debugBySignature!.good.partitionScoreBreakdown,
+  );
 
   const candidateSolutions = [
     makeSolution("good", goodSeed, baseArgs.ring),
@@ -327,6 +356,7 @@ async function main() {
         solution,
         fastestMissionTimeSec,
         rankingSource: "frontend-exact",
+        debugTrace: true,
       })
     ),
   );
@@ -350,6 +380,8 @@ async function main() {
     approxEqual(item.solution.exactScore ?? Number.NaN, rerankedSolution.exactScore ?? Number.NaN);
     approxEqual(item.solution.exactQualityCost ?? Number.NaN, rerankedSolution.exactQualityCost ?? Number.NaN);
     approxEqual(item.solution.regions[0].bearingDeg, rerankedSolution.regions[0].bearingDeg);
+    assert.ok(item.debugTrace);
+    assertBreakdownTotal(item.solution.exactScore ?? Number.NaN, item.debugTrace!.partitionScoreBreakdown);
   });
 
   console.log("exact_region tests passed");

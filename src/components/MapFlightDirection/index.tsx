@@ -931,6 +931,25 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               metricKind: backendResult.metricKind ?? (isLidarParams(safeParams) ? 'density' : 'gsd'),
               stats: { min: 0, max: 0, mean: 0, count: 0, totalAreaM2: 0, histogram: [] },
               diagnostics: backendResult.diagnostics ?? {},
+              qualityBreakdown: {
+                modelVersion: isLidarParams(safeParams) ? 'lidar-region-v1' : 'camera-region-v1',
+                total: backendResult.qualityCost ?? Number.POSITIVE_INFINITY,
+                signals: {},
+                weights: {},
+                contributions: {},
+              },
+              costBreakdown: {
+                modelVersion: isLidarParams(safeParams) ? 'lidar-region-v1' : 'camera-region-v1',
+                total: backendResult.exactScore ?? Number.POSITIVE_INFINITY,
+                signals: {},
+                weights: {},
+                contributions: {},
+              },
+              missionBreakdown: {
+                totalLengthM: 0,
+                speedMps: 0,
+                lineCount: 0,
+              },
             };
             evaluated = best ? [best] : [];
           }

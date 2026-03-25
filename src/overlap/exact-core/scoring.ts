@@ -3,7 +3,7 @@ import { getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity } from "@
 import type { FlightParams } from "@/domain/types";
 
 import type { GSDStats } from "../types";
-import type { ExactCameraScore, ExactLidarScore } from "./types";
+import type { ExactCameraScore, ExactLidarScore, ExactScoreBreakdown } from "./types";
 
 const CAMERA_REGISTRY: Record<string, typeof SONY_RX1R2> = {
   SONY_RX1R2,
@@ -16,6 +16,24 @@ const CAMERA_REGISTRY: Record<string, typeof SONY_RX1R2> = {
 };
 
 const DEFAULT_CAMERA = SONY_RX1R2;
+
+function buildScoreBreakdown(
+  modelVersion: string,
+  signals: Record<string, number>,
+  weights: Record<string, number>,
+) {
+  const contributions = Object.fromEntries(
+    Object.entries(weights).map(([key, weight]) => [key, (signals[key] ?? 0) * weight]),
+  );
+  const total = Object.values(contributions).reduce((sum, value) => sum + value, 0);
+  return {
+    modelVersion,
+    total,
+    signals,
+    weights,
+    contributions,
+  } satisfies ExactScoreBreakdown;
+}
 
 export function statsTotalAreaM2(stats: GSDStats) {
   if (stats.totalAreaM2 && stats.totalAreaM2 > 0) return stats.totalAreaM2;
@@ -112,19 +130,37 @@ export function scoreExactLidarStats(stats: GSDStats, params: FlightParams): Exa
   const q10Deficit = Math.max(0, 1 - q10 / Math.max(1e-6, targetDensityPtsM2));
   const q25Deficit = Math.max(0, 1 - q25 / Math.max(1e-6, targetDensityPtsM2));
   const meanDeficit = Math.max(0, 1 - stats.mean / Math.max(1e-6, targetDensityPtsM2));
-  const qualityCost =
-    4.2 * holeFraction +
-    2.4 * lowFraction +
-    1.9 * q10Deficit +
-    1.2 * q25Deficit +
-    0.8 * meanDeficit;
+  const breakdown = buildScoreBreakdown(
+    "lidar-region-v1",
+    {
+      holeFraction,
+      lowFraction,
+      q10Deficit,
+      q25Deficit,
+      meanDeficit,
+    },
+    {
+      holeFraction: 4.2,
+      lowFraction: 2.4,
+      q10Deficit: 1.9,
+      q25Deficit: 1.2,
+      meanDeficit: 0.8,
+    },
+  );
+  const qualityCost = breakdown.total;
   return {
     qualityCost,
     targetDensityPtsM2,
     holeFraction,
     lowFraction,
+    holeThreshold,
+    weakThreshold,
     q10,
     q25,
+    q10Deficit,
+    q25Deficit,
+    meanDeficit,
+    breakdown,
   };
 }
 
@@ -140,17 +176,34 @@ export function scoreExactCameraStats(stats: GSDStats, params: FlightParams): Ex
   const q75Overshoot = Math.max(0, q75 / Math.max(1e-6, targetGsdM) - 1);
   const q90Overshoot = Math.max(0, q90 / Math.max(1e-6, targetGsdM) - 1);
   const maxOvershoot = Math.max(0, stats.max / Math.max(1e-6, targetGsdM) - 1);
-  const qualityCost =
-    1.85 * q90Overshoot +
-    1.25 * overTargetAreaFraction +
-    0.95 * meanOvershoot +
-    0.55 * q75Overshoot +
-    0.2 * maxOvershoot;
+  const breakdown = buildScoreBreakdown(
+    "camera-region-v1",
+    {
+      q90Overshoot,
+      overTargetAreaFraction,
+      meanOvershoot,
+      q75Overshoot,
+      maxOvershoot,
+    },
+    {
+      q90Overshoot: 1.85,
+      overTargetAreaFraction: 1.25,
+      meanOvershoot: 0.95,
+      q75Overshoot: 0.55,
+      maxOvershoot: 0.2,
+    },
+  );
+  const qualityCost = breakdown.total;
   return {
     qualityCost,
     targetGsdM,
     overTargetAreaFraction,
     q75,
     q90,
+    meanOvershoot,
+    q75Overshoot,
+    q90Overshoot,
+    maxOvershoot,
+    breakdown,
   };
 }
