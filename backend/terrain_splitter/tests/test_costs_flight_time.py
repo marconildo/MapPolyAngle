@@ -11,7 +11,6 @@ from terrain_splitter.costs import (
 )
 from terrain_splitter.schemas import FlightParamsModel
 
-
 CAMERA_PARAMS = FlightParamsModel(
     payloadKind="camera",
     altitudeAGL=120.0,
@@ -74,4 +73,3 @@ def test_scanline_flight_time_matches_deprecated_geos(polygon: Polygon, bearings
         reference = _estimate_region_flight_time_geos_deprecated(polygon, bearing_deg, CAMERA_PARAMS)
         candidate = estimate_region_flight_time(polygon, bearing_deg, CAMERA_PARAMS)
         _assert_outputs_close(reference, candidate)
-
