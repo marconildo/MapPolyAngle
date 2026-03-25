@@ -27,7 +27,7 @@ import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove
 import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
-import { SONY_RX1R2, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, calculateGSD, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
+import { SONY_RX1R2, SONY_RX1R3, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, calculateGSD, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from '@/domain/lidar';
 import type { BearingOverride, MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
@@ -52,6 +52,7 @@ import { shouldConsumeClearAllEpoch } from '@/state/clearAllState';
 
 const CAMERA_REGISTRY: Record<string, any> = {
   SONY_RX1R2,
+  SONY_RX1R3,
   DJI_ZENMUSE_P1_24MM,
   ILX_LR1_INSPECT_85MM,
   MAP61_17MM,
