@@ -20,36 +20,58 @@ interface TerrainPartitionBackendResponse {
   solutions: TerrainPartitionSolutionPreview[];
 }
 
-const backendBaseUrl = import.meta.env.VITE_TERRAIN_PARTITION_BACKEND_URL as string | undefined;
+function configuredBackendBaseUrl(): string | undefined {
+  const fromImportMeta = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_TERRAIN_PARTITION_BACKEND_URL;
+  const fromProcess = typeof process !== 'undefined' ? process.env.VITE_TERRAIN_PARTITION_BACKEND_URL : undefined;
+  return [fromImportMeta, fromProcess].find(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0
+  );
+}
+
+function configuredBackendDebugEnabled(): boolean {
+  const fromImportMeta = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_TERRAIN_PARTITION_BACKEND_DEBUG;
+  const fromProcess = typeof process !== 'undefined' ? process.env.VITE_TERRAIN_PARTITION_BACKEND_DEBUG : undefined;
+  const configured = [fromImportMeta, fromProcess].find(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0
+  );
+  return typeof configured === 'string' && /^(1|true|yes|on)$/i.test(configured.trim());
+}
 
 export function isTerrainPartitionBackendEnabled(): boolean {
+  const backendBaseUrl = configuredBackendBaseUrl();
   return typeof backendBaseUrl === 'string' && backendBaseUrl.trim().length > 0;
 }
 
 export async function solveTerrainPartitionWithBackend(
   request: TerrainPartitionBackendRequest,
 ): Promise<TerrainPartitionSolutionPreview[]> {
+  const backendBaseUrl = configuredBackendBaseUrl();
   if (!isTerrainPartitionBackendEnabled()) {
     throw new Error('Terrain partition backend is not configured.');
   }
+  const effectiveRequest: TerrainPartitionBackendRequest = {
+    ...request,
+    debug: request.debug ?? configuredBackendDebugEnabled(),
+  };
   const endpoint = `${backendBaseUrl!.replace(/\/$/, '')}/v1/partition/solve`;
   console.log('[terrain-split][backend-request] POST /v1/partition/solve', {
-    polygonId: request.polygonId ?? null,
-    payloadKind: request.payloadKind,
-    terrainMode: request.terrainSource.mode,
-    datasetId: request.terrainSource.datasetId ?? null,
-    ringPoints: request.ring.length,
+    polygonId: effectiveRequest.polygonId ?? null,
+    payloadKind: effectiveRequest.payloadKind,
+    terrainMode: effectiveRequest.terrainSource.mode,
+    datasetId: effectiveRequest.terrainSource.datasetId ?? null,
+    ringPoints: effectiveRequest.ring.length,
+    debug: effectiveRequest.debug ?? false,
     endpoint,
   });
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
+    body: JSON.stringify(effectiveRequest),
   });
   if (!response.ok) {
     const text = await response.text();
     console.warn('[terrain-split][backend-request] POST /v1/partition/solve failed', {
-      polygonId: request.polygonId ?? null,
+      polygonId: effectiveRequest.polygonId ?? null,
       status: response.status,
       detail: text || null,
     });
@@ -58,7 +80,7 @@ export async function solveTerrainPartitionWithBackend(
   const payload = await response.json() as TerrainPartitionBackendResponse;
   const solutions = Array.isArray(payload.solutions) ? payload.solutions : [];
   console.log('[terrain-split][backend-request] POST /v1/partition/solve succeeded', {
-    polygonId: request.polygonId ?? null,
+    polygonId: effectiveRequest.polygonId ?? null,
     requestId: payload.requestId,
     solutionCount: solutions.length,
     regionCounts: solutions.map((solution) => solution.regionCount),

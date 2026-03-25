@@ -1,5 +1,5 @@
 import type { FlightParams } from "@/domain/types";
-import type { ExactMetricKind } from "@/overlap/exact-region";
+import type { ExactMetricKind, ExactSolutionDebugTrace } from "@/overlap/exact-region";
 import type { GSDStats } from "@/overlap/types";
 import type { TerrainPartitionSolutionPreview } from "@/terrain-partition/types";
 import type { TerrainSourceSelection } from "@/terrain/types";
@@ -52,6 +52,7 @@ export type ExactRuntimeCommonRequest = {
   clipInnerBufferM?: number;
   minOverlapForGsd?: number;
   timeWeight?: number;
+  debugTrace?: boolean;
 };
 
 export type ExactRuntimeEvaluateRegionRequest = ExactRuntimeCommonRequest & {
@@ -129,6 +130,7 @@ export type ExactRuntimeEvaluateSolutionResponse = {
   operation: "evaluate-solution";
   solution: TerrainPartitionSolutionPreview;
   preview: ExactRuntimePartitionPreviewPayload;
+  debugTrace?: ExactSolutionDebugTrace;
 };
 
 export type ExactRuntimeRerankSolutionsResponse = {
@@ -136,6 +138,7 @@ export type ExactRuntimeRerankSolutionsResponse = {
   bestIndex: number;
   solutions: TerrainPartitionSolutionPreview[];
   previewsBySignature: Record<string, ExactRuntimePartitionPreviewPayload>;
+  debugBySignature?: Record<string, ExactSolutionDebugTrace>;
 };
 
 export type ExactRuntimeResponse =

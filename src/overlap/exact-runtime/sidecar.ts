@@ -1,7 +1,14 @@
 import { createInterface } from "node:readline";
+import { performance } from "node:perf_hooks";
 
 import { handleExactRuntimeRequest } from "./service";
 import type { ExactRuntimeEnvelope, ExactRuntimeEnvelopeResponse } from "./protocol";
+
+function resolvedExactZoom(request: ExactRuntimeEnvelope["request"]) {
+  return "exactOptimizeZoom" in request && typeof request.exactOptimizeZoom === "number"
+    ? request.exactOptimizeZoom
+    : 14;
+}
 
 function summarizeRequest(envelope: ExactRuntimeEnvelope) {
   const { request } = envelope;
@@ -9,13 +16,13 @@ function summarizeRequest(envelope: ExactRuntimeEnvelope) {
     case "terrain-batch":
       return `operation=terrain-batch tiles=${request.tiles.length}`;
     case "evaluate-region":
-      return `operation=evaluate-region scopeId=${request.scopeId ?? "exact-region"} bearingDeg=${request.bearingDeg}`;
+      return `operation=evaluate-region scopeId=${request.scopeId ?? "exact-region"} bearingDeg=${request.bearingDeg} exactZoom=${resolvedExactZoom(request)}`;
     case "evaluate-solution":
-      return `operation=evaluate-solution polygonId=${request.polygonId} signature=${request.solution.signature}`;
+      return `operation=evaluate-solution polygonId=${request.polygonId} signature=${request.solution.signature} regions=${request.solution.regions.length} exactZoom=${resolvedExactZoom(request)}`;
     case "optimize-bearing":
-      return `operation=optimize-bearing scopeId=${request.scopeId ?? request.polygonId ?? "optimize-bearing"} mode=${request.mode ?? "global"} seedBearingDeg=${request.seedBearingDeg}`;
+      return `operation=optimize-bearing scopeId=${request.scopeId ?? request.polygonId ?? "optimize-bearing"} mode=${request.mode ?? "global"} seedBearingDeg=${request.seedBearingDeg} exactZoom=${resolvedExactZoom(request)}`;
     case "rerank-solutions":
-      return `operation=rerank-solutions polygonId=${request.polygonId} solutions=${request.solutions.length}`;
+      return `operation=rerank-solutions polygonId=${request.polygonId} solutions=${request.solutions.length} exactZoom=${resolvedExactZoom(request)}`;
   }
 }
 
@@ -44,7 +51,12 @@ async function main() {
       const envelope = JSON.parse(trimmed) as ExactRuntimeEnvelope;
       requestId = envelope.id;
       requestSummary = summarizeRequest(envelope);
+      const startedAt = performance.now();
+      process.stderr.write(`[exact-runtime-sidecar] start ${requestSummary}\n`);
       const exactResponse = await handleExactRuntimeRequest(envelope.request);
+      process.stderr.write(
+        `[exact-runtime-sidecar] finish ${requestSummary} elapsedMs=${(performance.now() - startedAt).toFixed(1)}\n`,
+      );
       response = {
         id: envelope.id,
         ok: true,

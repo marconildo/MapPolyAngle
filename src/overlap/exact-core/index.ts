@@ -18,5 +18,6 @@ export type {
   ExactLidarScore,
   ExactLidarTileInput,
   ExactLidarTileOutput,
+  ExactScoreBreakdown,
   ExactStats,
 } from "./types";

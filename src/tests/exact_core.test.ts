@@ -207,6 +207,16 @@ function approxEqual(actual: number, expected: number, tolerance = 1e-9) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `expected ${expected}, got ${actual}`);
 }
 
+function assertBreakdownTotals(name: string, actualTotal: number, breakdown: { total: number; contributions: Record<string, number> }) {
+  approxEqual(breakdown.total, actualTotal, 1e-12);
+  approxEqual(
+    Object.values(breakdown.contributions).reduce((sum, value) => sum + value, 0),
+    actualTotal,
+    1e-12,
+  );
+  assert.ok(Object.keys(breakdown.contributions).length > 0, `${name} should emit weighted contributions`);
+}
+
 function makeCameraFixture() {
   const z = 16;
   const x = 34120;
@@ -376,6 +386,8 @@ function testExactScoringHelpersMatchPreviousFormulas() {
   approxEqual(actualCamera.overTargetAreaFraction, expectedCamera.overTargetAreaFraction);
   approxEqual(actualCamera.q75, expectedCamera.q75);
   approxEqual(actualCamera.q90, expectedCamera.q90);
+  assert.equal(actualCamera.breakdown.modelVersion, "camera-region-v1");
+  assertBreakdownTotals("camera", actualCamera.qualityCost, actualCamera.breakdown);
 
   const lidarStats: GSDStats = {
     min: 0,
@@ -408,6 +420,8 @@ function testExactScoringHelpersMatchPreviousFormulas() {
   approxEqual(actualLidar.lowFraction, expectedLidar.lowFraction);
   approxEqual(actualLidar.q10, expectedLidar.q10);
   approxEqual(actualLidar.q25, expectedLidar.q25);
+  assert.equal(actualLidar.breakdown.modelVersion, "lidar-region-v1");
+  assertBreakdownTotals("lidar", actualLidar.qualityCost, actualLidar.breakdown);
 }
 
 testCameraExactCoreMatchesWorkerWrapper();
