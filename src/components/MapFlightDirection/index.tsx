@@ -2615,6 +2615,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     const pickDefaultPartitionSolution = useCallback((solutions: TerrainPartitionSolutionPreview[]) => {
       const candidates = solutions.filter((solution) => solution.regions.length > 1);
       if (candidates.length === 0) return null;
+      if (candidates.every((solution) => solution.rankingSource === 'backend-exact')) {
+        return candidates[0];
+      }
       const firstPractical = candidates.find((solution) => solution.isFirstPracticalSplit);
       if (firstPractical) return firstPractical;
       const bestTradeoffDistance = candidates.reduce(
