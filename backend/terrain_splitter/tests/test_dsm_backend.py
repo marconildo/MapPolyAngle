@@ -386,6 +386,8 @@ class _FakeExactBridge:
         optimize_response: dict | None = None,
         rerank_response: dict | None = None,
         *,
+        evaluate_region_responses: dict[float, dict | None] | None = None,
+        evaluate_region_errors: dict[float, Exception] | None = None,
         evaluate_solution_responses: dict[str, dict] | None = None,
         evaluate_solution_errors: dict[str, Exception] | None = None,
         supports_candidate_fanout: bool = False,
@@ -393,11 +395,14 @@ class _FakeExactBridge:
     ):
         self.optimize_response = optimize_response or {}
         self.rerank_response = rerank_response or {}
+        self.evaluate_region_responses = evaluate_region_responses or {}
+        self.evaluate_region_errors = evaluate_region_errors or {}
         self.evaluate_solution_responses = evaluate_solution_responses or {}
         self.evaluate_solution_errors = evaluate_solution_errors or {}
         self._supports_candidate_fanout = supports_candidate_fanout
         self._candidate_max_inflight = candidate_max_inflight
         self.optimize_requests: list[dict] = []
+        self.evaluate_region_requests: list[dict] = []
         self.evaluate_solution_requests: list[dict] = []
         self.rerank_requests: list[dict] = []
         self.begin_candidate_batch_calls = 0
@@ -419,6 +424,14 @@ class _FakeExactBridge:
     def optimize_bearing(self, request: dict) -> dict:
         self.optimize_requests.append(request)
         return self.optimize_response
+
+    def evaluate_region(self, request: dict, *, batch_handle=None) -> dict:
+        self.evaluate_region_requests.append(request)
+        bearing_deg = float(request["bearingDeg"])
+        if bearing_deg in self.evaluate_region_errors:
+            raise self.evaluate_region_errors[bearing_deg]
+        candidate = self.evaluate_region_responses.get(bearing_deg)
+        return {"candidate": candidate}
 
     def evaluate_solution(self, request: dict, *, batch_handle=None) -> dict:
         self.evaluate_solution_requests.append(request)
@@ -1916,6 +1929,57 @@ def test_exact_optimize_endpoint_matches_local_exact_runtime(monkeypatch) -> Non
         finally:
             bridge.close()
             app_module.EXACT_RUNTIME_BRIDGE = original_bridge
+
+
+def test_exact_optimize_endpoint_uses_candidate_fanout_when_supported() -> None:
+    coarse_bearings = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0, 135.0, 150.0, 165.0, 10.0]
+    refine_bearings = [22.0, 38.0, 26.0, 34.0, 28.0, 32.0, 29.0, 31.0]
+    responses = {
+        bearing: {
+            "bearingDeg": bearing,
+            "exactCost": 1.0 if bearing == 30.0 else 10.0 + (bearing / 100.0),
+            "qualityCost": 0.5,
+            "missionTimeSec": 90.0 + bearing,
+            "normalizedTimeCost": 0.5,
+            "metricKind": "gsd",
+            "diagnostics": {"q90": 0.03},
+        }
+        for bearing in [*coarse_bearings, *refine_bearings]
+    }
+    bridge = _FakeExactBridge(
+        evaluate_region_responses=responses,
+        supports_candidate_fanout=True,
+        candidate_max_inflight=4,
+    )
+    original_bridge = app_module.EXACT_RUNTIME_BRIDGE
+    app_module.EXACT_RUNTIME_BRIDGE = bridge
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post(
+                "/v1/exact/optimize-bearing",
+                json={
+                    "polygonId": "poly-1",
+                    "ring": [[7.0, 47.0], [7.01, 47.0], [7.01, 47.01], [7.0, 47.01], [7.0, 47.0]],
+                    "payloadKind": "camera",
+                    "params": {
+                        "payloadKind": "camera",
+                        "altitudeAGL": 100,
+                        "frontOverlap": 75,
+                        "sideOverlap": 70,
+                    },
+                    "terrainSource": {"mode": "mapbox"},
+                    "seedBearingDeg": 10,
+                },
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["bearingDeg"] == 30.0
+        assert bridge.optimize_requests == []
+        assert bridge.begin_candidate_batch_calls == 1
+        assert bridge.end_candidate_batch_calls == 1
+        assert len(bridge.evaluate_region_requests) >= len(coarse_bearings)
+    finally:
+        app_module.EXACT_RUNTIME_BRIDGE = original_bridge
 
 
 def test_exact_optimize_endpoint_matches_between_sharded_and_legacy_dsm(monkeypatch, tmp_path: Path) -> None:

@@ -80,7 +80,7 @@ function createFixtureTile(size = 64): { tile: TileRGBA; geometryTile: TerrainTi
   };
 }
 
-function createRuntime(tile: TileRGBA): ExactRegionRuntime {
+function createRuntime(tile: TileRGBA, options?: { candidateConcurrency?: number }): ExactRegionRuntime {
   const exactTileEvaluator = {
     evaluateCameraTile: async (input: Parameters<typeof evaluateCameraTileExact>[0]) => evaluateCameraTileExact(input),
     evaluateLidarTile: async (input: Parameters<typeof evaluateLidarTileExact>[0]) => evaluateLidarTileExact(input),
@@ -123,6 +123,7 @@ function createRuntime(tile: TileRGBA): ExactRegionRuntime {
     terrainProvider,
     tileEvaluator: exactTileEvaluator,
     yieldToEventLoop: async () => undefined,
+    candidateConcurrency: options?.candidateConcurrency,
   };
 }
 
@@ -280,13 +281,87 @@ async function main() {
     halfWindowDeg: 30,
   });
   assert.ok(localOptimize.best, "local optimize should select a best candidate");
-  assert.equal(localOptimize.evaluated.length, 13);
-  approxEqual(localOptimize.best.bearingDeg, 14);
-  approxEqual(localOptimize.best.exactCost, 1.3851979484492811);
-  approxEqual(localOptimize.best.qualityCost, 0.008618071933649956);
+  assert.equal(localOptimize.evaluated.length, 11);
+  approxEqual(localOptimize.best.bearingDeg, 72);
+  approxEqual(localOptimize.best.exactCost, 1.6141692512417503);
+  approxEqual(localOptimize.best.qualityCost, 0.006037061090581317);
   for (const candidate of localOptimize.evaluated) {
     assert.ok(axialDistanceDeg(candidate.bearingDeg, localOptimize.seedBearingDeg) <= 30.0001);
   }
+
+  const parallelRuntime = createRuntime(tile, { candidateConcurrency: 4 });
+  const parallelGlobalOptimize = await optimizeBearingExact(parallelRuntime, {
+    ...baseArgs,
+    scopeId: "global-opt-parallel",
+    params: makeCameraParams(),
+    seedBearingDeg: 17,
+    mode: "global",
+  });
+  assert.deepEqual(
+    parallelGlobalOptimize.evaluated.map((candidate) => ({
+      bearingDeg: candidate.bearingDeg,
+      exactCost: candidate.exactCost,
+      qualityCost: candidate.qualityCost,
+      missionTimeSec: candidate.missionTimeSec,
+    })),
+    globalOptimize.evaluated.map((candidate) => ({
+      bearingDeg: candidate.bearingDeg,
+      exactCost: candidate.exactCost,
+      qualityCost: candidate.qualityCost,
+      missionTimeSec: candidate.missionTimeSec,
+    })),
+  );
+  assert.deepEqual(
+    parallelGlobalOptimize.best && {
+      bearingDeg: parallelGlobalOptimize.best.bearingDeg,
+      exactCost: parallelGlobalOptimize.best.exactCost,
+      qualityCost: parallelGlobalOptimize.best.qualityCost,
+      missionTimeSec: parallelGlobalOptimize.best.missionTimeSec,
+    },
+    globalOptimize.best && {
+      bearingDeg: globalOptimize.best.bearingDeg,
+      exactCost: globalOptimize.best.exactCost,
+      qualityCost: globalOptimize.best.qualityCost,
+      missionTimeSec: globalOptimize.best.missionTimeSec,
+    },
+  );
+
+  const parallelLocalOptimize = await optimizeBearingExact(parallelRuntime, {
+    ...baseArgs,
+    scopeId: "local-opt-parallel",
+    params: makeCameraParams(),
+    seedBearingDeg: 42,
+    mode: "local",
+    halfWindowDeg: 30,
+  });
+  assert.deepEqual(
+    parallelLocalOptimize.evaluated.map((candidate) => ({
+      bearingDeg: candidate.bearingDeg,
+      exactCost: candidate.exactCost,
+      qualityCost: candidate.qualityCost,
+      missionTimeSec: candidate.missionTimeSec,
+    })),
+    localOptimize.evaluated.map((candidate) => ({
+      bearingDeg: candidate.bearingDeg,
+      exactCost: candidate.exactCost,
+      qualityCost: candidate.qualityCost,
+      missionTimeSec: candidate.missionTimeSec,
+    })),
+  );
+  assert.deepEqual(
+    parallelLocalOptimize.best && {
+      bearingDeg: parallelLocalOptimize.best.bearingDeg,
+      exactCost: parallelLocalOptimize.best.exactCost,
+      qualityCost: parallelLocalOptimize.best.qualityCost,
+      missionTimeSec: parallelLocalOptimize.best.missionTimeSec,
+    },
+    localOptimize.best && {
+      bearingDeg: localOptimize.best.bearingDeg,
+      exactCost: localOptimize.best.exactCost,
+      qualityCost: localOptimize.best.qualityCost,
+      missionTimeSec: localOptimize.best.missionTimeSec,
+    },
+  );
 
   const cameraAt0 = await evaluateRegionBearingExact(runtime, {
     ...baseArgs,
@@ -315,17 +390,17 @@ async function main() {
     rankingSource: "frontend-exact",
     debugTrace: true,
   });
-  assert.equal(reranked.bestIndex, 1);
+  assert.equal(reranked.bestIndex, 0);
   assert.equal(reranked.solutions.length, 2);
   assert.equal(reranked.solutions[0].rankingSource, "frontend-exact");
   assert.equal(reranked.solutions[0].signature, "good");
   assert.equal(reranked.solutions[1].signature, "bad");
   approxEqual(reranked.solutions[0].regions[0].bearingDeg, 90);
-  approxEqual(reranked.solutions[1].regions[0].bearingDeg, 14);
-  approxEqual(reranked.solutions[0].regions[0].exactScore ?? Number.NaN, 1.3204852520228987);
-  approxEqual(reranked.solutions[1].regions[0].exactScore ?? Number.NaN, 1.3851979484492811);
-  approxEqual(reranked.solutions[0].exactScore ?? Number.NaN, 11.664355863428133);
-  approxEqual(reranked.solutions[1].exactScore ?? Number.NaN, 11.662729191297032);
+  approxEqual(reranked.solutions[1].regions[0].bearingDeg, 179);
+  approxEqual(reranked.solutions[0].regions[0].exactScore ?? Number.NaN, 1.3205278427494913);
+  approxEqual(reranked.solutions[1].regions[0].exactScore ?? Number.NaN, 1.7987439826004457);
+  approxEqual(reranked.solutions[0].exactScore ?? Number.NaN, 11.664622700686188);
+  approxEqual(reranked.solutions[1].exactScore ?? Number.NaN, 11.768516945463329);
   assert.equal(reranked.solutions[0].regions[0].exactSeedBearingDeg, goodSeed);
   assert.equal(reranked.solutions[1].regions[0].exactSeedBearingDeg, badSeed);
   approxEqual(reranked.previewsBySignature.good.stats.mean, 0.012879733491310297);

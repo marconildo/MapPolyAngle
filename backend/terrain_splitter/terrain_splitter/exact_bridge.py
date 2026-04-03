@@ -57,6 +57,9 @@ class ExactRuntimeBridge:
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def evaluate_region(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
+        raise NotImplementedError
+
     def evaluate_solution(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -193,6 +196,9 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request({"operation": "optimize-bearing", **request})
 
+    def evaluate_region(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
+        return self._request({"operation": "evaluate-region", **request}, batch_handle=batch_handle)
+
     def evaluate_solution(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
         return self._request({"operation": "evaluate-solution", **request}, batch_handle=batch_handle)
 
@@ -244,6 +250,9 @@ class LambdaExactRuntimeBridge(ExactRuntimeBridge):
 
     def optimize_bearing(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._invoke({"operation": "optimize-bearing", **request})
+
+    def evaluate_region(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
+        return self._invoke({"operation": "evaluate-region", **request})
 
     def evaluate_solution(self, request: dict[str, Any], *, batch_handle: Any | None = None) -> dict[str, Any]:
         return self._invoke({"operation": "evaluate-solution", **request})
