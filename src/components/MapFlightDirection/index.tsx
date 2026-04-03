@@ -20,8 +20,8 @@ import {
   removeTriggerPointsForPolygon,
   clearAllTriggerPoints,
   setProcessingPerimeterPolygons,
-  generateFlightLinesForPolygon,
   setSelectedPolygonHighlight,
+  renderFlightLinesForPolygon,
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
 import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from './utils/geometry';
@@ -56,6 +56,7 @@ import {
 } from '@/interop/wingtra/convert';
 import { shouldApplyAsyncPolygonUpdate, shouldRunAsyncGeneration } from '@/state/asyncUpdateGuard';
 import { shouldConsumeClearAllEpoch } from '@/state/clearAllState';
+import { PlannedGeometryWorkerController } from '@/flight/plannedGeometryController';
 
 const CAMERA_REGISTRY: Record<string, any> = {
   SONY_RX1R2,
@@ -507,6 +508,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     // NEW: Suppress per‑polygon flight line update events during batched imports
     const suppressFlightLineEventsRef = React.useRef(false);
     const pendingOptimizeRef = React.useRef<Set<string>>(new Set());
+    const plannedGeometryWorkerRef = React.useRef<PlannedGeometryWorkerController | null>(null);
     const resetGenerationRef = React.useRef(0);
     const lastHandledClearAllEpochRef = React.useRef(clearAllEpoch);
     const guardedTimeoutsRef = React.useRef<Set<number>>(new Set());
@@ -526,6 +528,13 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     React.useEffect(() => { importedOriginalsRef.current = importedOriginals; }, [importedOriginals]);
     React.useEffect(() => { terrainSourceRef.current = terrainSource; }, [terrainSource]);
     React.useEffect(() => { onTerrainSourceReadyRef.current = onTerrainSourceReady; }, [onTerrainSourceReady]);
+
+    const getPlannedGeometryWorker = useCallback(() => {
+      if (!plannedGeometryWorkerRef.current) {
+        plannedGeometryWorkerRef.current = new PlannedGeometryWorkerController();
+      }
+      return plannedGeometryWorkerRef.current;
+    }, []);
 
     const applyTerrainSourceToMap = useCallback((map: MapboxMap, tileUrlTemplate: string | null, nextTerrainSource: TerrainSourceSelection) => {
       const applySeq = terrainSourceApplySeqRef.current + 1;
@@ -689,7 +698,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       return timeoutId;
     }, [onAnalysisComplete, scheduleGuardedTimeout]);
 
-    const applyPolygonParams = useCallback((polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
+    const applyPolygonParams = useCallback(async (polygonId: string, params: PolygonParams, opts?: { skipEvent?: boolean; skipQueue?: boolean }) => {
       const safeParams = sanitizePolygonParams(params);
       const nextParams = new Map(polygonParamsRef.current);
       nextParams.set(polygonId, safeParams);
@@ -746,17 +755,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
       const bearingDeg = override ? override.bearingDeg : res.result.contourDirDeg;
       const spacing = override?.lineSpacingM ?? defaultSpacing;
-
-      removeFlightLinesForPolygon(mapRef.current, polygonId);
-      const fl = addFlightLinesForPolygon(
-        mapRef.current,
+      const generation = resetGenerationRef.current;
+      const fl = await buildFlightLinesForPolygonAsync({
         polygonId,
-        res.polygon.coordinates,
+        ring: res.polygon.coordinates as [number, number][],
         bearingDeg,
-        spacing,
-        safeParams,
-        res.result.fitQuality
-      );
+        lineSpacingM: spacing,
+        params: safeParams,
+        quality: res.result.fitQuality,
+        startedGeneration: generation,
+      });
+      if (!fl) return;
 
       const nextFlightLines = new Map(polygonFlightLinesRef.current);
       nextFlightLines.set(polygonId, { ...fl, altitudeAGL: safeParams.altitudeAGL });
@@ -806,7 +815,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
         return rest;
       });
-    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, syncFlightLinesVisibility]);
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, syncFlightLinesVisibility, buildFlightLinesForPolygonAsync]);
 
     const applyPolygonParamsBatch = useCallback((updates: Array<{ polygonId: string; params: PolygonParams }>) => {
       const latestByPolygon = new Map<string, PolygonParams>();
@@ -819,7 +828,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const prevSuppress = suppressFlightLineEventsRef.current;
       suppressFlightLineEventsRef.current = true;
       latestByPolygon.forEach((params, polygonId) => {
-        applyPolygonParams(polygonId, params, { skipEvent: true, skipQueue: true });
+        void applyPolygonParams(polygonId, params, { skipEvent: true, skipQueue: true });
       });
       suppressFlightLineEventsRef.current = prevSuppress;
 
@@ -1002,7 +1011,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const nextOverrides = new Map(bearingOverridesRef.current);
         nextOverrides.delete(polygonId);
         bearingOverridesRef.current = nextOverrides;
-        applyPolygonParams(polygonId, safeParams, { skipQueue: true });
+        void applyPolygonParams(polygonId, safeParams, { skipQueue: true });
         return;
       }
 
@@ -1031,7 +1040,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const nextOverrides = new Map(bearingOverridesRef.current);
       nextOverrides.set(polygonId, optimizedOverride);
       bearingOverridesRef.current = nextOverrides;
-      applyPolygonParams(polygonId, safeParams, { skipQueue: true });
+      void applyPolygonParams(polygonId, safeParams, { skipQueue: true });
     }, [
       altitudeMode,
       applyPolygonParams,
@@ -1081,9 +1090,61 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
     }, []);
 
+    async function buildFlightLinesForPolygonAsync({
+      polygonId,
+      ring,
+      bearingDeg,
+      lineSpacingM,
+      params,
+      quality,
+      startedGeneration,
+    }: {
+      polygonId: string;
+      ring: [number, number][];
+      bearingDeg: number;
+      lineSpacingM: number;
+      params?: PolygonParams;
+      quality?: string;
+      startedGeneration?: number;
+    }): Promise<PlannedFlightGeometry | undefined> {
+      const isStillValid = () => {
+        if (startedGeneration === undefined) return true;
+        const draw = drawRef.current as any;
+        return shouldApplyAsyncPolygonUpdate({
+          startedGeneration,
+          currentGeneration: resetGenerationRef.current,
+          polygonStillExists: !!draw?.get?.(polygonId),
+        });
+      };
+
+      if (!params || !mapRef.current) {
+        if (!mapRef.current || !isStillValid()) return undefined;
+        return addFlightLinesForPolygon(mapRef.current, polygonId, ring, bearingDeg, lineSpacingM, params, quality);
+      }
+
+      try {
+        const geometry = await getPlannedGeometryWorker().run({
+          ring,
+          bearingDeg,
+          lineSpacingM,
+          params,
+        });
+
+        if (!mapRef.current || !isStillValid()) return undefined;
+        return renderFlightLinesForPolygon(mapRef.current, polygonId, geometry, quality, bearingDeg);
+      } catch (error) {
+        console.warn('[flight-lines] planned geometry worker failed, falling back to main thread', {
+          polygonId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (!mapRef.current || !isStillValid()) return undefined;
+        return addFlightLinesForPolygon(mapRef.current, polygonId, ring, bearingDeg, lineSpacingM, params, quality);
+      }
+    }
+
     // ---------- analysis callbacks ----------
     const handleAnalysisResult = useCallback(
-      (result: PolygonAnalysisResult, tiles: any[]) => {
+      async (result: PolygonAnalysisResult, tiles: any[]) => {
         if (pendingProgrammaticDeletesRef.current.has(result.polygonId)) {
           splitPerfLog(result.polygonId, 'ignoring late analysis result for polygon pending deletion', {
             polygonId: result.polygonId,
@@ -1149,23 +1210,23 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const safeParams = sanitizePolygonParams(params);
         const bearingDeg = override ? override.bearingDeg : result.result.contourDirDeg;
 
+        const generation = resetGenerationRef.current;
+
         // Spacing: keep override spacing if present, otherwise recompute from params
         const spacing =
           override?.lineSpacingM ??
           getLineSpacingForParams(safeParams);
 
-        // Remove existing flight lines first to avoid Mapbox layer conflicts
-        removeFlightLinesForPolygon(mapRef.current, result.polygonId);
-
-        const lines = addFlightLinesForPolygon(
-          mapRef.current,
-          result.polygonId,
-          result.polygon.coordinates,
+        const lines = await buildFlightLinesForPolygonAsync({
+          polygonId: result.polygonId,
+          ring: result.polygon.coordinates as [number, number][],
           bearingDeg,
-          spacing,
-          safeParams,
-          result.result.fitQuality
-        );
+          lineSpacingM: spacing,
+          params: safeParams,
+          quality: result.result.fitQuality,
+          startedGeneration: generation,
+        });
+        if (!lines) return;
 
         const nextFlightLines = new Map(polygonFlightLinesRef.current);
         nextFlightLines.set(result.polygonId, { ...lines, altitudeAGL: safeParams.altitudeAGL });
@@ -1222,7 +1283,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           );
         }
       },
-      [debouncedAnalysisComplete, onFlightLinesUpdated, altitudeMode, minClearanceM, runOptimizedBearingSearch, scheduleGuardedTimeout, withProcessingPolygon]
+      [debouncedAnalysisComplete, onFlightLinesUpdated, altitudeMode, minClearanceM, runOptimizedBearingSearch, scheduleGuardedTimeout, withProcessingPolygon, buildFlightLinesForPolygonAsync]
     );
 
     const memoizedOnAnalysisStart = useCallback((polygonId: string) => {
@@ -1837,13 +1898,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           };
           polygonsToUpdate.set(id, polygonState);
 
-          const lines = addFlightLinesForPolygon(
-            mapRef.current,
-            id,
-            item.ring as number[][],
-            item.angleDeg,
-            item.lineSpacingM,
-            {
+          const lines = await buildFlightLinesForPolygonAsync({
+            polygonId: id,
+            ring: item.ring as [number, number][],
+            bearingDeg: item.angleDeg,
+            lineSpacingM: item.lineSpacingM,
+            params: {
               payloadKind,
               planeHardwareVersion,
               altitudeAGL: item.altitudeAGL,
@@ -1857,8 +1917,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
               mappingFovDeg: payloadKind === 'lidar' ? item.mappingFovDeg : undefined,
               maxLidarRangeM: payloadKind === 'lidar' ? item.maxLidarRangeM : undefined,
             },
-            undefined
-          );
+            startedGeneration: generation,
+          });
+          if (!lines) continue;
           flightLinesToUpdate.set(id, { ...lines, altitudeAGL: item.altitudeAGL });
 
           areasOut.push({
@@ -1983,7 +2044,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         suspendAutoAnalysisRef.current = false;
         return { added: 0, total: 0, areas: [] };
       }
-    }, [mapboxToken, addRingAsDrawFeature, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, isAsyncGenerationStillValid, onFlightLinesUpdated, onError]);
+    }, [mapboxToken, addRingAsDrawFeature, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, isAsyncGenerationStillValid, onFlightLinesUpdated, onError, buildFlightLinesForPolygonAsync]);
 
     const handleFlightplanFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = e.target.files;
@@ -2081,7 +2142,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       suppressFlightLineEventsRef.current = true;
       for (const pid of queueSnapshot) {
         if (polygonResultsRef.current.has(pid)) {
-          applyPolygonParams(pid, params, { skipEvent: true, skipQueue: true });
+          void applyPolygonParams(pid, params, { skipEvent: true, skipQueue: true });
         }
       }
       setPendingParamPolygons([]);
@@ -2127,7 +2188,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [analyzePolygon, runOptimizedBearingSearch, withProcessingPolygon]);
 
     // RESTORED: revertPolygonToImportedDirection
-    const revertPolygonToImportedDirection = useCallback((polygonId: string) => {
+    const revertPolygonToImportedDirection = useCallback(async (polygonId: string) => {
       console.log(`📁 Reverting polygon ${polygonId} to file direction (Wingtra bearing/spacing)`);
       const original = importedOriginals.get(polygonId);
       const res = polygonResults.get(polygonId);
@@ -2142,16 +2203,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const currentParams = polygonParams.get(polygonId) ?? { altitudeAGL: 100, frontOverlap: 80, sideOverlap: 70 };
       const params: PolygonParams = { ...currentParams, useCustomBearing: false };
       if ('customBearingDeg' in params) delete (params as any).customBearingDeg;
-      removeFlightLinesForPolygon(mapRef.current, polygonId);
-      const fl = addFlightLinesForPolygon(
-        mapRef.current,
+      const generation = resetGenerationRef.current;
+      const fl = await buildFlightLinesForPolygonAsync({
         polygonId,
-        res.polygon.coordinates,
-        original.bearingDeg,
-        original.lineSpacingM,
+        ring: res.polygon.coordinates as [number, number][],
+        bearingDeg: original.bearingDeg,
+        lineSpacingM: original.lineSpacingM,
         params,
-        res.result.fitQuality
-      );
+        quality: res.result.fitQuality,
+        startedGeneration: generation,
+      });
+      if (!fl) return;
       setPolygonFlightLines((prev) => {
         const next = new Map(prev);
         next.set(polygonId, { ...fl, altitudeAGL: params.altitudeAGL });
@@ -2169,7 +2231,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
       console.log(`✅ Restored file direction: ${original.bearingDeg}° bearing, ${original.lineSpacingM}m spacing`);
       onFlightLinesUpdated?.(polygonId);
-    }, [importedOriginals, polygonResults, polygonParams, polygonTiles, onFlightLinesUpdated]);
+    }, [importedOriginals, polygonResults, polygonParams, polygonTiles, onFlightLinesUpdated, buildFlightLinesForPolygonAsync]);
 
     // RESTORED: runFullAnalysis
     const runFullAnalysis = useCallback((polygonId: string) => {
@@ -2532,7 +2594,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           return { createdIds: [], replaced: false };
         }
         for (const { id, region } of createdRegions) {
-          applyPolygonParams(id, {
+          void applyPolygonParams(id, {
             ...inheritedParams,
             altitudeAGL: region.baseAltitudeAGL ?? inheritedParams.altitudeAGL,
           }, { skipEvent: true, skipQueue: true });
@@ -2744,6 +2806,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     const resetAllDrawingsState = useCallback(() => {
       resetGenerationRef.current += 1;
+      plannedGeometryWorkerRef.current?.terminate();
+      plannedGeometryWorkerRef.current = null;
       cancelAllGuardedTimeouts();
       setProcessingPolygonIds([]);
       if (drawRef.current) drawRef.current.deleteAll();
@@ -2860,7 +2924,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       removeCameraPoints: (polygonId: string) => {
         if (deckOverlayRef.current) remove3DCameraPointsLayer(deckOverlayRef.current, polygonId, setDeckLayers);
       },
-      applyPolygonParams,
+      applyPolygonParams: (polygonId: string, params: PolygonParams) => {
+        void applyPolygonParams(polygonId, params);
+      },
       applyPolygonParamsBatch,
       // expose bulk apply helper
       applyParamsToAllPending,
@@ -2884,7 +2950,9 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       importWingtraFromText,
 
       optimizePolygonDirection,
-      revertPolygonToImportedDirection,
+      revertPolygonToImportedDirection: (polygonId: string) => {
+        void revertPolygonToImportedDirection(polygonId);
+      },
       runFullAnalysis,
 
 	      getBearingOverrides: () => Object.fromEntries(bearingOverridesRef.current),
@@ -2982,6 +3050,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }, [clearAllEpoch, resetAllDrawingsState]);
 
     React.useEffect(() => () => {
+      plannedGeometryWorkerRef.current?.terminate();
+      plannedGeometryWorkerRef.current = null;
       cancelAllGuardedTimeouts();
       stopProcessingPerimeterAnimation();
     }, [cancelAllGuardedTimeouts, stopProcessingPerimeterAnimation]);
