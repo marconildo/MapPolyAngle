@@ -1931,7 +1931,7 @@ def test_exact_optimize_endpoint_matches_local_exact_runtime(monkeypatch) -> Non
             app_module.EXACT_RUNTIME_BRIDGE = original_bridge
 
 
-def test_exact_optimize_endpoint_uses_candidate_fanout_when_supported() -> None:
+def test_exact_optimize_endpoint_uses_candidate_fanout_when_supported(monkeypatch) -> None:
     coarse_bearings = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0, 135.0, 150.0, 165.0, 10.0]
     refine_bearings = [22.0, 38.0, 26.0, 34.0, 28.0, 32.0, 29.0, 31.0]
     responses = {
@@ -1954,6 +1954,7 @@ def test_exact_optimize_endpoint_uses_candidate_fanout_when_supported() -> None:
     original_bridge = app_module.EXACT_RUNTIME_BRIDGE
     app_module.EXACT_RUNTIME_BRIDGE = bridge
     try:
+        monkeypatch.setenv("TERRAIN_SPLITTER_USE_PYTHON_EXACT_OPTIMIZE_FANOUT", "1")
         with TestClient(app_module.app) as client:
             response = client.post(
                 "/v1/exact/optimize-bearing",

@@ -281,7 +281,7 @@ async function main() {
     halfWindowDeg: 30,
   });
   assert.ok(localOptimize.best, "local optimize should select a best candidate");
-  assert.equal(localOptimize.evaluated.length, 11);
+  assert.equal(localOptimize.evaluated.length, 10);
   approxEqual(localOptimize.best.bearingDeg, 72);
   approxEqual(localOptimize.best.exactCost, 1.6141692512417503);
   approxEqual(localOptimize.best.qualityCost, 0.006037061090581317);

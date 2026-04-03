@@ -1,5 +1,9 @@
+import path from "node:path";
+import { cpus } from "node:os";
+import { Worker } from "node:worker_threads";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { existsSync } from "node:fs";
 import { PNG } from "pngjs";
 
 import { evaluateCameraTileExact, evaluateLidarTileExact } from "@/overlap/exact-core";
@@ -24,10 +28,19 @@ import type {
   ExactRuntimeTerrainBatchResponse,
   ExactRuntimeTilePayload,
 } from "./protocol";
+import type { ExactCameraTileInput, ExactCameraTileOutput, ExactLidarTileInput, ExactLidarTileOutput } from "@/overlap/exact-core";
 
 type TerrainBatchClient = {
   fetchTerrainBatch(request: ExactRuntimeTerrainBatchRequest): Promise<ExactRuntimeTerrainBatchResponse>;
 };
+
+type ExactRuntimeTileWorkerRequest =
+  | { id: number; kind: "camera"; input: ExactCameraTileInput }
+  | { id: number; kind: "lidar"; input: ExactLidarTileInput };
+
+type ExactRuntimeTileWorkerResponse =
+  | { id: number; ok: true; result: ExactCameraTileOutput | ExactLidarTileOutput }
+  | { id: number; ok: false; error: string };
 
 function describeError(error: unknown): string {
   if (error instanceof Error) {
@@ -62,6 +75,44 @@ function isRetryableLocalTerrainBatchError(error: unknown): boolean {
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveExactRuntimeTilePoolSize() {
+  const raw = process.env.EXACT_RUNTIME_TILE_POOL_SIZE;
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  const cpuCount = cpus().length;
+  return Math.min(4, Math.max(2, Math.floor(cpuCount / 2)));
+}
+
+function resolveExactRuntimeTileWorkerExecArgv() {
+  const out: string[] = [];
+  for (let index = 0; index < process.execArgv.length; index += 1) {
+    const arg = process.execArgv[index];
+    if (arg === "--eval" || arg === "-e" || arg === "--print" || arg === "-p") {
+      index += 1;
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+function resolveExactRuntimeTileWorkerPath() {
+  const explicitPath = process.env.EXACT_RUNTIME_TILE_WORKER_PATH;
+  if (explicitPath && existsSync(explicitPath)) {
+    return { path: explicitPath, usesTsSource: explicitPath.endsWith(".ts") };
+  }
+  const bundledPath = path.resolve(process.cwd(), "backend/terrain_splitter/exact-runtime/tileWorker.node.mjs");
+  if (existsSync(bundledPath)) {
+    return { path: bundledPath, usesTsSource: false };
+  }
+  const sourcePath = path.resolve(process.cwd(), "src/overlap/exact-runtime/tileWorker.node.ts");
+  return { path: sourcePath, usesTsSource: true };
 }
 
 async function postJsonWithoutKeepAlive(urlText: string, body: string) {
@@ -223,6 +274,194 @@ class DirectExactTileEvaluator implements ExactTileEvaluator {
   }
 }
 
+class RuntimeExactTileWorker {
+  private readonly worker: Worker;
+  private readonly pending = new Map<number, {
+    resolve: (value: ExactCameraTileOutput | ExactLidarTileOutput) => void;
+    reject: (reason?: unknown) => void;
+  }>();
+  private nextRequestId = 1;
+  private alive = true;
+  private terminateRequested = false;
+
+  constructor(workerPath: string, execArgv: string[]) {
+    this.worker = new Worker(workerPath, { execArgv });
+    this.worker.unref();
+    this.worker.on("message", this.handleMessage);
+    this.worker.on("error", this.handleError);
+    this.worker.on("exit", this.handleExit);
+  }
+
+  run(input: Omit<ExactRuntimeTileWorkerRequest, "id">) {
+    return new Promise<ExactCameraTileOutput | ExactLidarTileOutput>((resolve, reject) => {
+      if (!this.alive) {
+        reject(new Error("Exact runtime tile worker is not available."));
+        return;
+      }
+      const id = this.nextRequestId++;
+      this.pending.set(id, { resolve, reject });
+      let request: ExactRuntimeTileWorkerRequest;
+      if (input.kind === "camera") {
+        request = { id, kind: "camera", input: input.input as ExactCameraTileInput };
+      } else {
+        request = { id, kind: "lidar", input: input.input as ExactLidarTileInput };
+      }
+      this.worker.postMessage(request);
+    });
+  }
+
+  terminate() {
+    this.alive = false;
+    this.terminateRequested = true;
+    this.worker.off("message", this.handleMessage);
+    this.worker.off("error", this.handleError);
+    this.worker.off("exit", this.handleExit);
+    const error = new Error("Exact runtime tile worker terminated.");
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.worker.terminate().catch(() => undefined);
+  }
+
+  isUsable() {
+    return this.alive;
+  }
+
+  private readonly handleMessage = (message: ExactRuntimeTileWorkerResponse) => {
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    this.pending.delete(message.id);
+    if (message.ok) {
+      pending.resolve(message.result);
+      return;
+    }
+    pending.reject(new Error(message.error));
+  };
+
+  private readonly handleError = (error: Error) => {
+    this.alive = false;
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  };
+
+  private readonly handleExit = (code: number) => {
+    this.alive = false;
+    if (this.terminateRequested) return;
+    if (this.pending.size === 0) return;
+    const error = new Error(`Exact runtime tile worker exited unexpectedly (code=${code}).`);
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+  };
+}
+
+class WorkerPool<TInput, TOutput, TWorker extends { run(args: TInput): Promise<TOutput>; terminate(): void; isUsable?(): boolean }> {
+  private readonly workers: TWorker[];
+  private readonly idleWorkers: TWorker[];
+  private readonly queue: Array<{
+    input: TInput;
+    resolve: (value: TOutput) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  private terminating = false;
+
+  constructor(
+    private readonly createWorker: () => TWorker,
+    readonly size: number,
+  ) {
+    this.workers = Array.from({ length: size }, () => createWorker());
+    this.idleWorkers = [...this.workers];
+  }
+
+  run(input: TInput) {
+    return new Promise<TOutput>((resolve, reject) => {
+      if (this.terminating) {
+        reject(new Error("Worker pool has been terminated."));
+        return;
+      }
+      this.queue.push({ input, resolve, reject });
+      this.flush();
+    });
+  }
+
+  terminate() {
+    this.terminating = true;
+    while (this.queue.length > 0) {
+      this.queue.shift()?.reject(new Error("Worker pool has been terminated."));
+    }
+    for (const worker of this.workers) {
+      worker.terminate();
+    }
+    this.idleWorkers.length = 0;
+  }
+
+  private flush() {
+    while (!this.terminating && this.idleWorkers.length > 0 && this.queue.length > 0) {
+      let worker = this.idleWorkers.pop()!;
+      if (worker.isUsable && !worker.isUsable()) {
+        worker = this.replaceWorker(worker);
+      }
+      const job = this.queue.shift()!;
+      worker.run(job.input)
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          if (!this.terminating) {
+            if (worker.isUsable && !worker.isUsable()) {
+              this.idleWorkers.push(this.replaceWorker(worker));
+            } else {
+              this.idleWorkers.push(worker);
+            }
+            this.flush();
+          }
+        });
+    }
+  }
+
+  private replaceWorker(deadWorker: TWorker) {
+    const replacement = this.createWorker();
+    const index = this.workers.indexOf(deadWorker);
+    if (index >= 0) {
+      this.workers[index] = replacement;
+    }
+    return replacement;
+  }
+}
+
+class NodeWorkerBackedExactTileEvaluator implements ExactTileEvaluator {
+  readonly concurrency: number;
+  private readonly pool: WorkerPool<
+    Omit<ExactRuntimeTileWorkerRequest, "id">,
+    ExactCameraTileOutput | ExactLidarTileOutput,
+    RuntimeExactTileWorker
+  >;
+
+  constructor(poolSize: number) {
+    const workerSpec = resolveExactRuntimeTileWorkerPath();
+    const execArgv = workerSpec.usesTsSource ? resolveExactRuntimeTileWorkerExecArgv() : [];
+    this.concurrency = poolSize;
+    this.pool = new WorkerPool(
+      () => new RuntimeExactTileWorker(workerSpec.path, execArgv),
+      poolSize,
+    );
+  }
+
+  evaluateCameraTile(input: Parameters<typeof evaluateCameraTileExact>[0]) {
+    return this.pool.run({ kind: "camera", input }) as Promise<ExactCameraTileOutput>;
+  }
+
+  evaluateLidarTile(input: Parameters<typeof evaluateLidarTileExact>[0]) {
+    return this.pool.run({ kind: "lidar", input }) as Promise<ExactLidarTileOutput>;
+  }
+
+  dispose() {
+    this.pool.terminate();
+  }
+}
+
 class LocalHttpTerrainBatchClient implements TerrainBatchClient {
   constructor(private readonly baseUrl: string) {}
 
@@ -304,12 +543,31 @@ function createTerrainBatchClientFromEnv() {
   return new LocalHttpTerrainBatchClient(baseUrl);
 }
 
+let sharedNodeExactTileEvaluator: NodeWorkerBackedExactTileEvaluator | null = null;
+
+function getSharedExactTileEvaluator() {
+  const poolSize = resolveExactRuntimeTilePoolSize();
+  if (poolSize <= 1) {
+    return { tileEvaluator: new DirectExactTileEvaluator(), candidateConcurrency: 1 };
+  }
+  if (!sharedNodeExactTileEvaluator || sharedNodeExactTileEvaluator.concurrency !== poolSize) {
+    sharedNodeExactTileEvaluator?.dispose?.();
+    sharedNodeExactTileEvaluator = new NodeWorkerBackedExactTileEvaluator(poolSize);
+  }
+  return {
+    tileEvaluator: sharedNodeExactTileEvaluator,
+    candidateConcurrency: sharedNodeExactTileEvaluator.concurrency,
+  };
+}
+
 function createRuntimeForRequest(request: Extract<ExactRuntimeRequest, { terrainSource: unknown }>): ExactRegionRuntime {
   const terrainBatchClient = createTerrainBatchClientFromEnv();
+  const { tileEvaluator, candidateConcurrency } = getSharedExactTileEvaluator();
   return {
     terrainProvider: new TerrainBatchBackedProvider(terrainBatchClient, request.terrainSource),
-    tileEvaluator: new DirectExactTileEvaluator(),
+    tileEvaluator,
     yieldToEventLoop: async () => undefined,
+    candidateConcurrency,
   };
 }
 

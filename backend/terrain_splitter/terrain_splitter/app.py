@@ -130,6 +130,10 @@ def _should_enable_internal_http() -> bool:
     return _env_flag("TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP", default_enabled)
 
 
+def _should_use_python_exact_optimize_fanout() -> bool:
+    return _env_flag("TERRAIN_SPLITTER_USE_PYTHON_EXACT_OPTIMIZE_FANOUT", False)
+
+
 CACHE_DIR = _runtime_dir("TERRAIN_SPLITTER_CACHE_DIR", ".cache")
 DEBUG_DIR = _runtime_dir("TERRAIN_SPLITTER_DEBUG_DIR", ".debug")
 DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
@@ -948,7 +952,7 @@ def optimize_bearing_exact(request: ExactOptimizeBearingRequest) -> ExactOptimiz
     if EXACT_RUNTIME_BRIDGE is None:
         raise HTTPException(status_code=503, detail="Backend exact optimization is not available.")
     try:
-        if EXACT_RUNTIME_BRIDGE.supports_candidate_fanout():
+        if EXACT_RUNTIME_BRIDGE.supports_candidate_fanout() and _should_use_python_exact_optimize_fanout():
             payload = _optimize_bearing_exact_with_bridge_fanout(EXACT_RUNTIME_BRIDGE, request)
         else:
             payload = EXACT_RUNTIME_BRIDGE.optimize_bearing(request.model_dump(mode="json"))

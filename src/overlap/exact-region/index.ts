@@ -2,7 +2,7 @@ import { DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, SONY
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
 import type { CameraModel, FlightParams, PlannedFlightGeometry, TerrainTile } from "@/domain/types";
 import { build3DFlightPath, calculateOptimalTerrainZoom, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
-import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
+import { generatePlannedFlightGeometryForPolygon, summarizePlannedFlightGeometry } from "@/flight/plannedGeometry";
 import type {
   ExactCameraTileInput,
   ExactCameraTileOutput,
@@ -16,6 +16,7 @@ import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import type { GSDStats, LidarStripMeters, PaddedDemTileRGBA, PoseMeters, TileRGBA } from "@/overlap/types";
 import { tilesCoveringPolygon } from "@/overlap/tileCoverage";
 import type { TerrainPartitionSolutionPreview } from "@/terrain-partition/types";
+import { evaluatePreparedRegionOrientation, prepareRegionOrientationContext } from "@/utils/terrainPartitionObjective";
 
 const CAMERA_REGISTRY: Record<string, typeof SONY_RX1R2> = {
   SONY_RX1R2,
@@ -32,6 +33,20 @@ const DEFAULT_EXACT_OPTIMIZE_ZOOM = 14;
 const DEFAULT_TIME_WEIGHT = 0.1;
 const DEFAULT_CAMERA_SPEED_MPS = 12;
 const DEFAULT_MIN_OVERLAP_FOR_GSD = 3;
+const HYBRID_SURROGATE_POSE_THRESHOLD = 300;
+const HYBRID_SURROGATE_STEP_DEG = 10;
+const HYBRID_SURROGATE_MAX_HOTSPOTS = 3;
+const HYBRID_SURROGATE_MIN_SEPARATION_DEG = 30;
+const HYBRID_SURROGATE_ADDITIONAL_HOTSPOT_RELATIVE_COST_WINDOW = 0.03;
+
+function isExactRuntimeProfilingEnabled() {
+  return typeof process !== "undefined" && process.env?.EXACT_RUNTIME_PROFILE === "1";
+}
+
+function logExactRuntimeProfile(message: string) {
+  if (!isExactRuntimeProfilingEnabled()) return;
+  console.error(`[exact-runtime-profile] ${message}`);
+}
 export type ExactMetricKind = "gsd" | "density";
 export type ExactSearchMode = "local" | "global";
 
@@ -218,6 +233,11 @@ type ExactBearingEvaluationContext = {
   nextRequestOrder: number;
 };
 
+type SurrogateBasinCandidate = {
+  bearingDeg: number;
+  totalCost: number;
+};
+
 function tileKey(tileRef: ExactTileRef) {
   return `${tileRef.z}/${tileRef.x}/${tileRef.y}`;
 }
@@ -291,6 +311,45 @@ function buildLidarStripBuckets(
 
 function getCandidateConcurrency(runtime: ExactRegionRuntime) {
   return Math.max(1, Math.floor(runtime.candidateConcurrency ?? 1));
+}
+
+function getTileConcurrency(runtime: ExactRegionRuntime) {
+  return Math.max(1, Math.floor(runtime.candidateConcurrency ?? 1));
+}
+
+function estimatePoseCountFromMissionLength(totalFlightLineLengthM: number, photoSpacingM: number | null) {
+  if (!(photoSpacingM && photoSpacingM > 0)) return 0;
+  return totalFlightLineLengthM / photoSpacingM;
+}
+
+function axialDistanceDeg(left: number, right: number) {
+  const diff = Math.abs(normalizeAxialBearingDeg(left - right));
+  return Math.min(diff, 180 - diff);
+}
+
+function collectBestSurrogateBasins(
+  candidates: SurrogateBasinCandidate[],
+  maxHotspots: number,
+  minSeparationDeg: number,
+  additionalHotspotRelativeCostWindow: number,
+) {
+  if (candidates.length === 0) return [] as SurrogateBasinCandidate[];
+  const sorted = [...candidates].sort((left, right) => left.totalCost - right.totalCost || left.bearingDeg - right.bearingDeg);
+  const selected: SurrogateBasinCandidate[] = [];
+  const bestCost = sorted[0].totalCost;
+  for (const candidate of sorted) {
+    if (
+      selected.length > 0
+      && candidate.totalCost > bestCost * (1 + additionalHotspotRelativeCostWindow)
+    ) {
+      break;
+    }
+    if (selected.every((selectedCandidate) => axialDistanceDeg(selectedCandidate.bearingDeg, candidate.bearingDeg) >= minSeparationDeg)) {
+      selected.push(candidate);
+    }
+    if (selected.length >= maxHotspots) break;
+  }
+  return selected;
 }
 
 async function mapWithConcurrencyLimit<T, R>(
@@ -481,6 +540,7 @@ async function getExactBearingArtifacts(
   const cacheKey = Math.round(normalizedBearingDeg * 1000);
   if (!context.artifactCache.has(cacheKey)) {
     context.artifactCache.set(cacheKey, (async (): Promise<ExactBearingArtifacts> => {
+      const startedAt = performance.now();
       const geometry = generatePlannedFlightGeometryForPolygon(
         context.ring,
         normalizedBearingDeg,
@@ -580,7 +640,7 @@ async function getExactBearingArtifacts(
             });
           }
         }
-        return {
+        const result = {
           normalizedBearingDeg,
           geometry,
           path3d,
@@ -590,6 +650,10 @@ async function getExactBearingArtifacts(
             stripsByTile: buildLidarStripBuckets(context.tileRefs, strips),
           },
         };
+        logExactRuntimeProfile(
+          `bearing=${normalizedBearingDeg.toFixed(2)} phase=artifacts payload=lidar elapsedMs=${(performance.now() - startedAt).toFixed(1)} sweeps=${geometry.sweepLines.length} pathSegments=${path3d.length} strips=${strips.length}`,
+        );
+        return result;
       }
 
       const camera = getCameraForParams(context.safeParams);
@@ -615,7 +679,7 @@ async function getExactBearingArtifacts(
           polygonId: context.scopeId,
         };
       });
-      return {
+      const result = {
         normalizedBearingDeg,
         geometry,
         path3d,
@@ -626,6 +690,10 @@ async function getExactBearingArtifacts(
           poseCameraIndices: new Uint16Array(poses.length),
         },
       };
+      logExactRuntimeProfile(
+        `bearing=${normalizedBearingDeg.toFixed(2)} phase=artifacts payload=camera elapsedMs=${(performance.now() - startedAt).toFixed(1)} sweeps=${geometry.sweepLines.length} pathSegments=${path3d.length} poses=${poses.length}`,
+      );
+      return result;
     })());
   }
   return context.artifactCache.get(cacheKey)!;
@@ -635,6 +703,7 @@ async function evaluateRegionBearingExactWithContext(
   context: ExactBearingEvaluationContext,
   bearingDeg: number,
 ): Promise<ExactBearingCandidate | null> {
+  const candidateStartedAt = performance.now();
   if (context.runtime.yieldToEventLoop) {
     await context.runtime.yieldToEventLoop();
   }
@@ -643,24 +712,40 @@ async function evaluateRegionBearingExactWithContext(
 
   if (artifacts.lidar) {
     if (!artifacts.lidar.strips.length) return null;
+    const terrainStartedAt = performance.now();
     const tileMapWithHalo = await getTerrainTilesWithHaloForContext(context);
+    const terrainElapsedMs = performance.now() - terrainStartedAt;
+    const tileEvalStartedAt = performance.now();
+    const tileResults = await mapWithConcurrencyLimit(
+      context.tileRefs,
+      getTileConcurrency(context.runtime),
+      async (tileRef) => {
+        const key = tileKey(tileRef);
+        const tileBundle = tileMapWithHalo.get(key);
+        const tileStrips = artifacts.lidar!.stripsByTile.get(key);
+        if (!tileBundle || !tileStrips || tileStrips.length === 0) return null;
+        const response = await context.runtime.tileEvaluator.evaluateLidarTile({
+          tile: tileBundle.tile,
+          demTile: tileBundle.demTile,
+          polygons: [{ id: context.scopeId, ring: context.ring }],
+          strips: tileStrips,
+          options: { clipInnerBufferM: context.clipInnerBufferM },
+        });
+        const densityStats = response.perPolygon?.find((entry) => entry.polygonId === context.scopeId)?.densityStats;
+        return densityStats
+          ? { touched: true, stats: densityStats }
+          : { touched: true, stats: null };
+      },
+    );
     const perTileStats: GSDStats[] = [];
-    for (const tileRef of context.tileRefs) {
-      const key = tileKey(tileRef);
-      const tileBundle = tileMapWithHalo.get(key);
-      const tileStrips = artifacts.lidar.stripsByTile.get(key);
-      if (!tileBundle || !tileStrips || tileStrips.length === 0) continue;
-      const response = await context.runtime.tileEvaluator.evaluateLidarTile({
-        tile: tileBundle.tile,
-        demTile: tileBundle.demTile,
-        polygons: [{ id: context.scopeId, ring: context.ring }],
-        strips: tileStrips,
-        options: { clipInnerBufferM: context.clipInnerBufferM },
-      });
-      const densityStats = response.perPolygon?.find((entry) => entry.polygonId === context.scopeId)?.densityStats;
-      if (densityStats) perTileStats.push(densityStats);
+    let touchedTileCount = 0;
+    for (const tileResult of tileResults) {
+      if (!tileResult) continue;
+      touchedTileCount += tileResult.touched ? 1 : 0;
+      if (tileResult.stats) perTileStats.push(tileResult.stats);
     }
     if (!perTileStats.length) return null;
+    const tileEvalElapsedMs = performance.now() - tileEvalStartedAt;
     const stats = aggregateMetricStats(perTileStats);
     const scored = scoreExactLidarStats(stats, context.safeParams);
     const normalizedTimeCost = artifacts.mission.missionTimeSec / 180;
@@ -679,7 +764,7 @@ async function evaluateRegionBearingExactWithContext(
       segmentCount: artifacts.lidar.strips.length,
       sampleLabel: "Flight lines",
     };
-    return {
+    const result: ExactBearingCandidate = {
       bearingDeg: artifacts.normalizedBearingDeg,
       exactCost: costBreakdown.total,
       qualityCost: scored.qualityCost,
@@ -701,32 +786,52 @@ async function evaluateRegionBearingExactWithContext(
       costBreakdown,
       missionBreakdown,
     };
+    logExactRuntimeProfile(
+      `bearing=${artifacts.normalizedBearingDeg.toFixed(2)} payload=lidar totalMs=${(performance.now() - candidateStartedAt).toFixed(1)} terrainMs=${terrainElapsedMs.toFixed(1)} tileEvalMs=${tileEvalElapsedMs.toFixed(1)} touchedTiles=${touchedTileCount} strips=${artifacts.lidar.strips.length} exactCost=${result.exactCost.toFixed(4)}`,
+    );
+    return result;
   }
 
   const cameraArtifacts = artifacts.camera;
   if (!cameraArtifacts || cameraArtifacts.poses.length === 0) return null;
+  const terrainStartedAt = performance.now();
   const tileMap = await getTerrainTilesForContext(context);
+  const terrainElapsedMs = performance.now() - terrainStartedAt;
+  const tileEvalStartedAt = performance.now();
+  const tileResults = await mapWithConcurrencyLimit(
+    context.tileRefs,
+    getTileConcurrency(context.runtime),
+    async (tileRef) => {
+      const key = tileKey(tileRef);
+      const tile = tileMap.get(key);
+      if (!tile) return null;
+      const response = await context.runtime.tileEvaluator.evaluateCameraTile({
+        tile,
+        polygons: [{ id: context.scopeId, ring: context.ring }],
+        poses: cameraArtifacts.poses,
+        cameras: [cameraArtifacts.camera],
+        poseCameraIndices: cameraArtifacts.poseCameraIndices,
+        camera: undefined,
+        options: {
+          clipInnerBufferM: context.clipInnerBufferM,
+          minOverlapForGsd: context.minOverlapForGsd,
+        },
+      });
+      const gsdStats = response.perPolygon?.find((entry) => entry.polygonId === context.scopeId)?.gsdStats;
+      return gsdStats
+        ? { touched: true, stats: gsdStats }
+        : { touched: true, stats: null };
+    },
+  );
   const perTileStats: GSDStats[] = [];
-  for (const tileRef of context.tileRefs) {
-    const key = tileKey(tileRef);
-    const tile = tileMap.get(key);
-    if (!tile) continue;
-    const response = await context.runtime.tileEvaluator.evaluateCameraTile({
-      tile,
-      polygons: [{ id: context.scopeId, ring: context.ring }],
-      poses: cameraArtifacts.poses,
-      cameras: [cameraArtifacts.camera],
-      poseCameraIndices: cameraArtifacts.poseCameraIndices,
-      camera: undefined,
-      options: {
-        clipInnerBufferM: context.clipInnerBufferM,
-        minOverlapForGsd: context.minOverlapForGsd,
-      },
-    });
-    const gsdStats = response.perPolygon?.find((entry) => entry.polygonId === context.scopeId)?.gsdStats;
-    if (gsdStats) perTileStats.push(gsdStats);
+  let touchedTileCount = 0;
+  for (const tileResult of tileResults) {
+    if (!tileResult) continue;
+    touchedTileCount += tileResult.touched ? 1 : 0;
+    if (tileResult.stats) perTileStats.push(tileResult.stats);
   }
   if (!perTileStats.length) return null;
+  const tileEvalElapsedMs = performance.now() - tileEvalStartedAt;
   const stats = aggregateMetricStats(perTileStats);
   const scored = scoreExactCameraStats(stats, context.safeParams);
   const normalizedTimeCost = artifacts.mission.missionTimeSec / 180;
@@ -744,7 +849,7 @@ async function evaluateRegionBearingExactWithContext(
     sampleCount: cameraArtifacts.poses.length,
     sampleLabel: "Images",
   };
-  return {
+    const result: ExactBearingCandidate = {
     bearingDeg: artifacts.normalizedBearingDeg,
     exactCost: costBreakdown.total,
     qualityCost: scored.qualityCost,
@@ -765,6 +870,10 @@ async function evaluateRegionBearingExactWithContext(
     costBreakdown,
     missionBreakdown,
   };
+  logExactRuntimeProfile(
+    `bearing=${artifacts.normalizedBearingDeg.toFixed(2)} payload=camera totalMs=${(performance.now() - candidateStartedAt).toFixed(1)} terrainMs=${terrainElapsedMs.toFixed(1)} tileEvalMs=${tileEvalElapsedMs.toFixed(1)} touchedTiles=${touchedTileCount} poses=${cameraArtifacts.poses.length} exactCost=${result.exactCost.toFixed(4)}`,
+  );
+  return result;
 }
 
 export async function evaluateRegionBearingExact(
@@ -776,35 +885,47 @@ export async function evaluateRegionBearingExact(
   return evaluateRegionBearingExactWithContext(context, args.bearingDeg);
 }
 
-export async function optimizeBearingExact(
-  runtime: ExactRegionRuntime,
-  args: ExactRegionCommonArgs & {
+async function collectEvaluatedCandidates(context: ExactBearingEvaluationContext) {
+  return (await Promise.all(
+    [...context.candidateCache.values()].map(async (entry) => ({
+      requestOrder: entry.requestOrder,
+      candidate: entry.promise ? await entry.promise : null,
+    })),
+  ))
+    .filter((value): value is { requestOrder: number; candidate: ExactBearingCandidate } => value.candidate !== null)
+    .sort((left, right) => {
+      if (left.candidate.exactCost !== right.candidate.exactCost) {
+        return left.candidate.exactCost - right.candidate.exactCost;
+      }
+      return left.requestOrder - right.requestOrder;
+    })
+    .map((value) => value.candidate);
+}
+
+async function runExactBearingSearchWithContext(
+  context: ExactBearingEvaluationContext,
+  search: {
     seedBearingDeg: number;
-    mode?: ExactSearchMode;
-    halfWindowDeg?: number;
+    mode: ExactSearchMode;
+    halfWindowDeg: number;
   },
-): Promise<ExactBearingSearchResult> {
-  const normalizedSeedBearingDeg = Number.isFinite(args.seedBearingDeg)
-    ? normalizeAxialBearingDeg(args.seedBearingDeg)
+) {
+  const searchStartedAt = performance.now();
+  const normalizedSeedBearingDeg = Number.isFinite(search.seedBearingDeg)
+    ? normalizeAxialBearingDeg(search.seedBearingDeg)
     : 0;
-  const safeParams = { ...args.params, useCustomBearing: false, customBearingDeg: undefined };
-  const context = await createExactBearingEvaluationContext(runtime, args, safeParams);
-  const coarseOffsets = [-30, -20, -10, 0, 10, 20, 30];
-  const halfWindowDeg = Math.max(1, args.halfWindowDeg ?? 30);
-  const refineStepsDeg = [8, 4, 2, 1].filter((step) => step <= halfWindowDeg);
+  const coarseOffsets = [-10, 0, 10];
+  const refineStepsDeg = [8, 4, 2, 1].filter((step) => step <= search.halfWindowDeg);
   const globalCoarseBearings = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165];
   const minImprovement = 1e-4;
-  const mode = args.mode ?? "local";
-  const candidateConcurrency = getCandidateConcurrency(runtime);
+  const candidateConcurrency = getCandidateConcurrency(context.runtime);
 
   const getCandidateEntry = (bearingDeg: number) => {
     const normalized = normalizeAxialBearingDeg(bearingDeg);
     const cacheKey = Math.round(normalized * 1000);
     let entry = context.candidateCache.get(cacheKey);
     if (!entry) {
-      entry = {
-        requestOrder: context.nextRequestOrder++,
-      };
+      entry = { requestOrder: context.nextRequestOrder++ };
       context.candidateCache.set(cacheKey, entry);
     }
     return { normalized, entry };
@@ -819,14 +940,15 @@ export async function optimizeBearingExact(
   };
 
   const evaluateOffset = (offsetDeg: number) => {
-    if (Math.abs(offsetDeg) > halfWindowDeg + 1e-6) return Promise.resolve<ExactBearingCandidate | null>(null);
+    if (Math.abs(offsetDeg) > search.halfWindowDeg + 1e-6) return Promise.resolve<ExactBearingCandidate | null>(null);
     return evaluateBearing(normalizedSeedBearingDeg + offsetDeg);
   };
 
   let best: ExactBearingCandidate | null = null;
   let bestOffset = 0;
-  if (mode === "global") {
+  if (search.mode === "global") {
     const coarseCandidates = Array.from(new Set([...globalCoarseBearings, Math.round(normalizedSeedBearingDeg * 10) / 10]));
+    const coarseStartedAt = performance.now();
     const coarseResults = await mapWithConcurrencyLimit(
       coarseCandidates,
       candidateConcurrency,
@@ -835,8 +957,12 @@ export async function optimizeBearingExact(
     for (const candidate of coarseResults) {
       if (candidate && (!best || candidate.exactCost < best.exactCost)) best = candidate;
     }
+    logExactRuntimeProfile(
+      `search scopeId=${context.scopeId} mode=global coarseCandidates=${coarseCandidates.length} coarseMs=${(performance.now() - coarseStartedAt).toFixed(1)} bestBearing=${best?.bearingDeg?.toFixed(2) ?? "none"} bestCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+    );
   } else {
-    const coarseCandidateOffsets = [0, ...coarseOffsets.filter((offset) => offset !== 0 && Math.abs(offset) <= halfWindowDeg + 1e-6)];
+    const coarseCandidateOffsets = coarseOffsets.filter((offset) => Math.abs(offset) <= search.halfWindowDeg + 1e-6);
+    const coarseStartedAt = performance.now();
     const coarseResults = await mapWithConcurrencyLimit(
       coarseCandidateOffsets,
       candidateConcurrency,
@@ -849,15 +975,21 @@ export async function optimizeBearingExact(
         bestOffset = coarseCandidateOffsets[index];
       }
     }
+    logExactRuntimeProfile(
+      `search scopeId=${context.scopeId} mode=local seed=${normalizedSeedBearingDeg.toFixed(2)} coarseCandidates=${coarseCandidateOffsets.length} coarseMs=${(performance.now() - coarseStartedAt).toFixed(1)} bestBearing=${best?.bearingDeg?.toFixed(2) ?? "none"} bestCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+    );
   }
 
   if (best) {
     for (const stepDeg of refineStepsDeg) {
+      const refineStepStartedAt = performance.now();
+      let refineIterations = 0;
       let improved = true;
       while (improved) {
         improved = false;
+        refineIterations += 1;
         const currentBest: ExactBearingCandidate = best;
-        const neighborSpecs: Array<{ offsetDeg: number; promise: Promise<ExactBearingCandidate | null> }> = mode === "global"
+        const neighborSpecs: Array<{ offsetDeg: number; promise: Promise<ExactBearingCandidate | null> }> = search.mode === "global"
           ? [
             { offsetDeg: 0, promise: evaluateBearing(currentBest.bearingDeg - stepDeg) },
             { offsetDeg: 0, promise: evaluateBearing(currentBest.bearingDeg + stepDeg) },
@@ -881,28 +1013,191 @@ export async function optimizeBearingExact(
         }
         if (nextBest && nextBest.candidate.exactCost + minImprovement < currentBest.exactCost) {
           best = nextBest.candidate;
-          if (mode !== "global") bestOffset = nextBest.offsetDeg;
+          if (search.mode !== "global") bestOffset = nextBest.offsetDeg;
           improved = true;
         }
       }
+      logExactRuntimeProfile(
+        `search scopeId=${context.scopeId} mode=${search.mode} stepDeg=${stepDeg} refineIterations=${refineIterations} refineMs=${(performance.now() - refineStepStartedAt).toFixed(1)} bestBearing=${best.bearingDeg.toFixed(2)} bestCost=${best.exactCost.toFixed(4)}`,
+      );
     }
   }
 
-  const evaluated = (await Promise.all(
-    [...context.candidateCache.values()].map(async (entry) => ({
-      requestOrder: entry.requestOrder,
-      candidate: entry.promise ? await entry.promise : null,
-    })),
-  ))
-    .filter((value): value is { requestOrder: number; candidate: ExactBearingCandidate } => value.candidate !== null)
-    .sort((left, right) => {
-      if (left.candidate.exactCost !== right.candidate.exactCost) {
-        return left.candidate.exactCost - right.candidate.exactCost;
-      }
-      return left.requestOrder - right.requestOrder;
-    })
-    .map((value) => value.candidate);
+  const evaluated = await collectEvaluatedCandidates(context);
+  logExactRuntimeProfile(
+    `search scopeId=${context.scopeId} mode=${search.mode} seed=${normalizedSeedBearingDeg.toFixed(2)} totalMs=${(performance.now() - searchStartedAt).toFixed(1)} evaluated=${evaluated.length} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+  );
+  return {
+    best,
+    evaluated,
+    seedBearingDeg: normalizedSeedBearingDeg,
+  };
+}
 
+function getHybridHotspotBearings(
+  context: ExactBearingEvaluationContext,
+  normalizedSeedBearingDeg: number,
+) {
+  if (isLidarParams(context.safeParams)) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=lidar`);
+    return null;
+  }
+  const photoSpacingM = getForwardSpacingForParams(context.safeParams);
+  if (!(photoSpacingM && photoSpacingM > 0)) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=no-photo-spacing`);
+    return null;
+  }
+
+  const coarseBearings = Array.from({ length: Math.ceil(180 / HYBRID_SURROGATE_STEP_DEG) }, (_, index) => index * HYBRID_SURROGATE_STEP_DEG);
+  const prepared = prepareRegionOrientationContext(
+    context.ring,
+    context.geometryTiles,
+    context.safeParams,
+    { tradeoff: 1 - context.timeWeight },
+  );
+
+  let estimatedPoseCount = 0;
+  let surrogateCandidates: SurrogateBasinCandidate[] = [];
+  if (prepared) {
+    const seedObjective = evaluatePreparedRegionOrientation(prepared, normalizedSeedBearingDeg);
+    estimatedPoseCount = estimatePoseCountFromMissionLength(seedObjective?.flightTime.totalFlightLineLengthM ?? 0, photoSpacingM);
+    surrogateCandidates = coarseBearings
+      .map((bearingDeg) => {
+        const objective = evaluatePreparedRegionOrientation(prepared, bearingDeg);
+        if (!objective) return null;
+        return { bearingDeg: objective.bearingDeg, totalCost: objective.totalCost } satisfies SurrogateBasinCandidate;
+      })
+      .filter((candidate): candidate is SurrogateBasinCandidate => candidate !== null);
+  } else {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} fallback=geometry-only`);
+    surrogateCandidates = coarseBearings.map((bearingDeg) => {
+      const geometry = generatePlannedFlightGeometryForPolygon(
+        context.ring,
+        bearingDeg,
+        context.lineSpacingM,
+        context.safeParams,
+      );
+      const summary = summarizePlannedFlightGeometry(geometry);
+      if (axialDistanceDeg(bearingDeg, normalizedSeedBearingDeg) < HYBRID_SURROGATE_STEP_DEG / 2) {
+        estimatedPoseCount = estimatePoseCountFromMissionLength(summary.totalFlightLineLengthM, photoSpacingM);
+      }
+      return {
+        bearingDeg,
+        totalCost: summary.totalConnectedPathLengthM,
+      } satisfies SurrogateBasinCandidate;
+    });
+  }
+
+  if (estimatedPoseCount <= HYBRID_SURROGATE_POSE_THRESHOLD) {
+    logExactRuntimeProfile(
+      `hybrid-search scopeId=${context.scopeId} skipped=below-threshold estimatedPoseCount=${estimatedPoseCount.toFixed(1)}`,
+    );
+    return null;
+  }
+  if (surrogateCandidates.length === 0) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=no-surrogate-candidates`);
+    return null;
+  }
+
+  const localMinima = surrogateCandidates.filter((candidate, index) => {
+    const left = surrogateCandidates[(index + surrogateCandidates.length - 1) % surrogateCandidates.length];
+    const right = surrogateCandidates[(index + 1) % surrogateCandidates.length];
+    return candidate.totalCost <= left.totalCost && candidate.totalCost <= right.totalCost;
+  });
+  const hotspotCandidates = collectBestSurrogateBasins(
+    localMinima.length > 0 ? localMinima : surrogateCandidates,
+    HYBRID_SURROGATE_MAX_HOTSPOTS,
+    HYBRID_SURROGATE_MIN_SEPARATION_DEG,
+    HYBRID_SURROGATE_ADDITIONAL_HOTSPOT_RELATIVE_COST_WINDOW,
+  );
+  const hotspotBearings = hotspotCandidates.map((candidate) => candidate.bearingDeg);
+  if (hotspotBearings.length === 0) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=no-hotspots estimatedPoseCount=${estimatedPoseCount.toFixed(1)}`);
+    return null;
+  }
+
+  logExactRuntimeProfile(
+    `hybrid-search scopeId=${context.scopeId} estimatedPoseCount=${estimatedPoseCount.toFixed(1)} hotspots=${hotspotCandidates.map((candidate) => `${candidate.bearingDeg.toFixed(1)}@${candidate.totalCost.toFixed(4)}`).join(",")} costWindow=${(HYBRID_SURROGATE_ADDITIONAL_HOTSPOT_RELATIVE_COST_WINDOW * 100).toFixed(1)}%`,
+  );
+  return hotspotBearings;
+}
+
+export async function optimizeBearingExact(
+  runtime: ExactRegionRuntime,
+  args: ExactRegionCommonArgs & {
+    seedBearingDeg: number;
+    mode?: ExactSearchMode;
+    halfWindowDeg?: number;
+  },
+): Promise<ExactBearingSearchResult> {
+  const optimizeStartedAt = performance.now();
+  const normalizedSeedBearingDeg = Number.isFinite(args.seedBearingDeg)
+    ? normalizeAxialBearingDeg(args.seedBearingDeg)
+    : 0;
+  const safeParams = { ...args.params, useCustomBearing: false, customBearingDeg: undefined };
+  const contextStartedAt = performance.now();
+  const context = await createExactBearingEvaluationContext(runtime, args, safeParams);
+  logExactRuntimeProfile(
+    `optimize scopeId=${context.scopeId} contextMs=${(performance.now() - contextStartedAt).toFixed(1)} lineSpacingM=${context.lineSpacingM.toFixed(2)} timeWeight=${context.timeWeight.toFixed(3)}`,
+  );
+  const mode = args.mode ?? "local";
+  const halfWindowDeg = Math.max(1, args.halfWindowDeg ?? 30);
+
+  let best: ExactBearingCandidate | null = null;
+  if (mode === "global") {
+    const hotspotStartedAt = performance.now();
+    const hotspotBearings = getHybridHotspotBearings(context, normalizedSeedBearingDeg);
+    logExactRuntimeProfile(
+      `optimize scopeId=${context.scopeId} hotspotSelectionMs=${(performance.now() - hotspotStartedAt).toFixed(1)} hotspotCount=${hotspotBearings?.length ?? 0}`,
+    );
+    if (hotspotBearings && hotspotBearings.length > 0) {
+      const hybridStartedAt = performance.now();
+      for (const hotspotBearingDeg of hotspotBearings) {
+        const localSearchStartedAt = performance.now();
+        const search = await runExactBearingSearchWithContext(context, {
+          seedBearingDeg: hotspotBearingDeg,
+          mode: "local",
+          halfWindowDeg,
+        });
+        logExactRuntimeProfile(
+          `optimize scopeId=${context.scopeId} hotspot=${hotspotBearingDeg.toFixed(2)} localSearchMs=${(performance.now() - localSearchStartedAt).toFixed(1)} bestBearing=${search.best?.bearingDeg?.toFixed(2) ?? "none"} bestCost=${search.best?.exactCost?.toFixed(4) ?? "none"}`,
+        );
+        if (search.best && (!best || search.best.exactCost < best.exactCost)) {
+          best = search.best;
+        }
+      }
+      logExactRuntimeProfile(
+        `optimize scopeId=${context.scopeId} hybridTotalMs=${(performance.now() - hybridStartedAt).toFixed(1)} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+      );
+    } else {
+      const globalSearchStartedAt = performance.now();
+      const search = await runExactBearingSearchWithContext(context, {
+        seedBearingDeg: normalizedSeedBearingDeg,
+        mode: "global",
+        halfWindowDeg,
+      });
+      best = search.best;
+      logExactRuntimeProfile(
+        `optimize scopeId=${context.scopeId} globalSearchMs=${(performance.now() - globalSearchStartedAt).toFixed(1)} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+      );
+    }
+  } else {
+    const localSearchStartedAt = performance.now();
+    const search = await runExactBearingSearchWithContext(context, {
+      seedBearingDeg: normalizedSeedBearingDeg,
+      mode,
+      halfWindowDeg,
+    });
+    best = search.best;
+    logExactRuntimeProfile(
+      `optimize scopeId=${context.scopeId} localSearchMs=${(performance.now() - localSearchStartedAt).toFixed(1)} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+    );
+  }
+
+  const evaluated = await collectEvaluatedCandidates(context);
+  logExactRuntimeProfile(
+    `optimize scopeId=${context.scopeId} mode=${mode} totalMs=${(performance.now() - optimizeStartedAt).toFixed(1)} evaluated=${evaluated.length} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+  );
   return {
     best,
     evaluated,
@@ -1018,25 +1313,32 @@ export async function evaluatePartitionSolutionExact(
 
     const tileMapWithHalo = await runtime.terrainProvider.getTerrainTilesWithHalo(tileRefs, 1);
     const perRegionStats = new Map<string, GSDStats[]>();
-    for (const tileRef of tileRefs) {
-      const tileBundle = tileMapWithHalo.get(tileKey(tileRef));
-      if (!tileBundle) continue;
-      const tileStrips = strips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
-      if (!tileStrips.length) continue;
-      const result = await runtime.tileEvaluator.evaluateLidarTile({
-        tile: tileBundle.tile,
-        demTile: tileBundle.demTile,
-        polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
-        strips: tileStrips,
-        options: { clipInnerBufferM: args.clipInnerBufferM ?? 0 },
-      });
+    const tileResults = await mapWithConcurrencyLimit(
+      tileRefs,
+      getTileConcurrency(runtime),
+      async (tileRef) => {
+        const tileBundle = tileMapWithHalo.get(tileKey(tileRef));
+        if (!tileBundle) return null;
+        const tileStrips = strips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
+        if (!tileStrips.length) return null;
+        return runtime.tileEvaluator.evaluateLidarTile({
+          tile: tileBundle.tile,
+          demTile: tileBundle.demTile,
+          polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
+          strips: tileStrips,
+          options: { clipInnerBufferM: args.clipInnerBufferM ?? 0 },
+        });
+      },
+    );
+    tileResults.forEach((result) => {
+      if (!result) return;
       (result.perPolygon ?? []).forEach((polyStats) => {
         if (!polyStats.densityStats) return;
         const list = perRegionStats.get(polyStats.polygonId) ?? [];
         list.push(polyStats.densityStats);
         perRegionStats.set(polyStats.polygonId, list);
       });
-    }
+    });
     const regionSummaries = Array.from(perRegionStats.values()).map((statsList) => aggregateMetricStats(statsList)).filter((stats) => stats.count > 0);
     if (!regionSummaries.length) {
       throw new Error("No lidar density preview could be computed for this partition.");
@@ -1092,28 +1394,35 @@ export async function evaluatePartitionSolutionExact(
 
   const tileMap = await runtime.terrainProvider.getTerrainTiles(tileRefs);
   const perRegionStats = new Map<string, GSDStats[]>();
-  for (const tileRef of tileRefs) {
-    const tile = tileMap.get(tileKey(tileRef));
-    if (!tile) continue;
-    const result = await runtime.tileEvaluator.evaluateCameraTile({
-      tile,
-      polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
-      poses,
-      cameras: [camera],
-      poseCameraIndices: new Uint16Array(poses.length),
-      camera: undefined,
-      options: {
-        clipInnerBufferM: args.clipInnerBufferM ?? 0,
-        minOverlapForGsd: args.minOverlapForGsd ?? DEFAULT_MIN_OVERLAP_FOR_GSD,
-      },
-    });
+  const tileResults = await mapWithConcurrencyLimit(
+    tileRefs,
+    getTileConcurrency(runtime),
+    async (tileRef) => {
+      const tile = tileMap.get(tileKey(tileRef));
+      if (!tile) return null;
+      return runtime.tileEvaluator.evaluateCameraTile({
+        tile,
+        polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
+        poses,
+        cameras: [camera],
+        poseCameraIndices: new Uint16Array(poses.length),
+        camera: undefined,
+        options: {
+          clipInnerBufferM: args.clipInnerBufferM ?? 0,
+          minOverlapForGsd: args.minOverlapForGsd ?? DEFAULT_MIN_OVERLAP_FOR_GSD,
+        },
+      });
+    },
+  );
+  tileResults.forEach((result) => {
+    if (!result) return;
     (result.perPolygon ?? []).forEach((polyStats) => {
       if (!polyStats.gsdStats) return;
       const list = perRegionStats.get(polyStats.polygonId) ?? [];
       list.push(polyStats.gsdStats);
       perRegionStats.set(polyStats.polygonId, list);
     });
-  }
+  });
   const regionSummaries = Array.from(perRegionStats.values()).map((statsList) => aggregateMetricStats(statsList)).filter((stats) => stats.count > 0);
   if (!regionSummaries.length) {
     throw new Error("No camera GSD preview could be computed for this partition.");
