@@ -19,8 +19,8 @@ from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
-from .debug import write_debug_artifacts
 from .costs import line_spacing_for_params
+from .debug import write_debug_artifacts
 from .dsm_store import create_dsm_dataset_store, derive_descriptor_from_payload
 from .dsm_uploads import (
     finalize_dsm_upload,

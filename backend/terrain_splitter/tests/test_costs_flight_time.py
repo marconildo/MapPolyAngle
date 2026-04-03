@@ -5,7 +5,10 @@ import math
 import pytest
 from shapely.geometry import Polygon
 
-from terrain_splitter.costs import _estimate_region_flight_time_geos_deprecated, estimate_region_flight_time
+from terrain_splitter.costs import (
+    _estimate_region_flight_time_geos_deprecated,
+    estimate_region_flight_time,
+)
 from terrain_splitter.schemas import FlightParamsModel
 
 CAMERA_PARAMS = FlightParamsModel(
