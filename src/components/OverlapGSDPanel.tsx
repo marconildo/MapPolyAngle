@@ -2907,7 +2907,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                             }}
                             title="Auto split this area into a few terrain-aligned faces"
                           >
-                            {!!splittingPolygonIds[polygonId] ? 'Splitting…' : 'Auto Split'}
+                            {!!splittingPolygonIds[polygonId] ? 'Splitting' : 'Auto Split'}
                           </Button>
                         )}
 
