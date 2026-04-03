@@ -65,6 +65,13 @@ type OverallMetricStats = {
   density: GSDStats | null;
 };
 
+type OverlayMetricRange = {
+  min: number;
+  max: number;
+};
+
+type OverlayScaleRanges = Partial<Record<MetricKind, OverlayMetricRange>>;
+
 type ExactPartitionPreview = SharedExactPartitionPreview;
 
 const TERRAIN_SPLIT_DEBUG = true;
@@ -250,6 +257,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const [showFlightParameters, setShowFlightParameters] = useState(false);
   const [showCameraPoints, setShowCameraPoints] = useState(false); // Changed default to false
   const [overallStats, setOverallStats] = useState<OverallMetricStats>({ gsd: null, density: null });
+  const [overlayScaleLocked, setOverlayScaleLocked] = useState(true);
+  const [lockedOverlayRanges, setLockedOverlayRanges] = useState<OverlayScaleRanges>({});
   const [perPolygonStats, setPerPolygonStats] = useState<Map<string, PolygonMetricSummary>>(new Map());
   const [internalSelectedId, setInternalSelectedId] = useState<string | null>(null);
   const [splittingPolygonIds, setSplittingPolygonIds] = useState<Record<string, true>>({});
@@ -296,6 +305,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   const runningRef = useRef(false);
   const showGsdRef = useRef(showGsd);
   const showOverlapRef = useRef(showOverlap);
+  const overlayScaleLockedRef = useRef(overlayScaleLocked);
+  const lockedOverlayRangesRef = useRef<OverlayScaleRanges>(lockedOverlayRanges);
   const pendingComputeRef = useRef<{ polygonId?: string; suppressMapNotReadyToast?: boolean; generation?: number } | null>(null);
   const resetGenerationRef = useRef(0);
   const lastHandledClearAllEpochRef = useRef(clearAllEpoch);
@@ -319,6 +330,14 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   React.useEffect(() => {
     showOverlapRef.current = showOverlap;
   }, [showOverlap]);
+
+  React.useEffect(() => {
+    overlayScaleLockedRef.current = overlayScaleLocked;
+  }, [overlayScaleLocked]);
+
+  React.useEffect(() => {
+    lockedOverlayRangesRef.current = lockedOverlayRanges;
+  }, [lockedOverlayRanges]);
 
   React.useEffect(() => {
     mapRef.current?.setFlightLinesVisible?.(showFlightLines);
@@ -669,7 +688,47 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     return { min, max: Math.max(min + 1e-6, max) };
   }, []);
 
-  const redrawAnalysisOverlays = useCallback((statsOverride?: OverallMetricStats) => {
+  const computeOverlayRanges = useCallback((statsSet: OverallMetricStats): OverlayScaleRanges => {
+    const ranges: OverlayScaleRanges = {};
+    const gsdRange = overlayRangeForStats(statsSet.gsd, 'gsd');
+    const densityRange = overlayRangeForStats(statsSet.density, 'density');
+    if (gsdRange) ranges.gsd = gsdRange;
+    if (densityRange) ranges.density = densityRange;
+    return ranges;
+  }, [overlayRangeForStats]);
+
+  const mergeLockedOverlayRanges = useCallback((currentRanges: OverlayScaleRanges, nextStats: OverallMetricStats) => {
+    const computedRanges = computeOverlayRanges(nextStats);
+    const nextRanges: OverlayScaleRanges = { ...currentRanges };
+    let changed = false;
+    (['gsd', 'density'] as const).forEach((metricKind) => {
+      const currentRange = nextRanges[metricKind];
+      const computedRange = computedRanges[metricKind];
+      if (!currentRange && computedRange) {
+        nextRanges[metricKind] = computedRange;
+        changed = true;
+      }
+    });
+    return {
+      changed,
+      ranges: changed ? nextRanges : currentRanges,
+    };
+  }, [computeOverlayRanges]);
+
+  const resolveOverlayRanges = useCallback((statsSet: OverallMetricStats, options?: {
+    lockEnabled?: boolean;
+    lockedRanges?: OverlayScaleRanges;
+  }) => {
+    const autoRanges = computeOverlayRanges(statsSet);
+    const lockEnabled = options?.lockEnabled ?? overlayScaleLockedRef.current;
+    const lockedRanges = options?.lockedRanges ?? lockedOverlayRangesRef.current;
+    return {
+      gsd: lockEnabled ? (lockedRanges.gsd ?? autoRanges.gsd ?? null) : (autoRanges.gsd ?? null),
+      density: lockEnabled ? (lockedRanges.density ?? autoRanges.density ?? null) : (autoRanges.density ?? null),
+    };
+  }, [computeOverlayRanges]);
+
+  const redrawAnalysisOverlays = useCallback((statsOverride?: OverallMetricStats, rangesOverride?: OverlayScaleRanges) => {
     const map = mapRef.current?.getMap?.();
     const runId = globalRunIdRef.current;
     if (!map || !map.isStyleLoaded?.() || !runId) return;
@@ -677,8 +736,9 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     clearRunOverlays(map, runId);
 
     const nextStats = statsOverride ?? overallStats;
-    const gsdRange = overlayRangeForStats(nextStats.gsd, 'gsd');
-    const densityRange = overlayRangeForStats(nextStats.density, 'density');
+    const { gsd: gsdRange, density: densityRange } = resolveOverlayRanges(nextStats, {
+      lockedRanges: rangesOverride,
+    });
 
     const showOverlapNow = showOverlapRef.current;
     const showGsdNow = showGsdRef.current;
@@ -708,7 +768,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         });
       }
     }
-  }, [mapRef, opacity, overallStats, overlayRangeForStats]);
+  }, [mapRef, opacity, overallStats, resolveOverlayRanges]);
 
   React.useEffect(() => {
     redrawAnalysisOverlaysRef.current = () => {
@@ -2160,10 +2220,19 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       });
 
       const nextOverallStats = aggregateOverallMetricStats(overallMetricGroups, tailAreaAcres);
+      let nextLockedRanges = lockedOverlayRangesRef.current;
+      if (overlayScaleLockedRef.current) {
+        const mergedLockedRanges = mergeLockedOverlayRanges(lockedOverlayRangesRef.current, nextOverallStats);
+        if (mergedLockedRanges.changed) {
+          nextLockedRanges = mergedLockedRanges.ranges;
+          lockedOverlayRangesRef.current = nextLockedRanges;
+          setLockedOverlayRanges(nextLockedRanges);
+        }
+      }
 
       setPerPolygonStats(nextPerPolygon);
       setOverallStats(nextOverallStats);
-      redrawAnalysisOverlays(nextOverallStats);
+      redrawAnalysisOverlays(nextOverallStats, nextLockedRanges);
 
       if (showCameraPoints && poses.length > 0) {
         const importedOnly = poses.filter((pose) => !pose.polygonId);
@@ -2330,6 +2399,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     globalRunIdRef.current = clearedState.runId;
     poseAreaRingRef.current = clearedState.poseAreaRing;
     setImportedPoses(clearedState.importedPoses as PoseMeters[]);
+    lockedOverlayRangesRef.current = {};
+    setLockedOverlayRanges({});
     setOverallStats(clearedState.overallStats);
     setPerPolygonStats(clearedState.perPolygonStats as Map<string, PolygonMetricSummary>);
     setPartitionOptionsByPolygon(clearedState.partitionOptionsByPolygon as Record<string, TerrainPartitionSolutionPreview[]>);
@@ -2543,13 +2614,15 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       rightValue: number;
     }> = [];
 
-    const gsdRange = overlayRangeForStats(overallStats.gsd, 'gsd');
-    const densityRange = overlayRangeForStats(overallStats.density, 'density');
+    const { gsd: gsdRange, density: densityRange } = resolveOverlayRanges(overallStats, {
+      lockEnabled: overlayScaleLocked,
+      lockedRanges: lockedOverlayRanges,
+    });
 
     if (showGsd && gsdRange) {
       legends.push({
         metricKind: 'gsd',
-        title: 'GSD scale (p5-p95)',
+        title: `GSD scale${overlayScaleLocked ? ' (locked)' : ' (p5-p95)'}`,
         leftValue: gsdRange.min,
         rightValue: gsdRange.max,
       });
@@ -2558,14 +2631,27 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     if (showGsd && densityRange) {
       legends.push({
         metricKind: 'density',
-        title: 'Density scale (p5-p95)',
+        title: `Density scale${overlayScaleLocked ? ' (locked)' : ' (p5-p95)'}`,
         leftValue: densityRange.min,
         rightValue: densityRange.max,
       });
     }
 
     return legends;
-  }, [overallStats, overlayRangeForStats, showGsd]);
+  }, [lockedOverlayRanges, overallStats, overlayScaleLocked, resolveOverlayRanges, showGsd]);
+
+  const handleOverlayScaleLockedChange = useCallback((checked: boolean) => {
+    if (checked && !overlayScaleLockedRef.current) {
+      const mergedLockedRanges = mergeLockedOverlayRanges(lockedOverlayRangesRef.current, overallStats);
+      if (mergedLockedRanges.changed) {
+        lockedOverlayRangesRef.current = mergedLockedRanges.ranges;
+        setLockedOverlayRanges(mergedLockedRanges.ranges);
+      }
+    }
+    overlayScaleLockedRef.current = checked;
+    setOverlayScaleLocked(checked);
+    redrawAnalysisOverlays(undefined, checked ? lockedOverlayRangesRef.current : undefined);
+  }, [mergeLockedOverlayRanges, overallStats, redrawAnalysisOverlays]);
 
   React.useEffect(() => {
     redrawAnalysisOverlays();
@@ -2952,15 +3038,23 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
       {overlayLegends.length > 0 && (
         <div className="rounded-md border border-gray-200 bg-gray-50/80 p-2 space-y-2">
-          <div className="flex items-center justify-between text-[11px] text-gray-500">
-            <span className="font-medium text-gray-700">Auto color scale</span>
-            <span>Blue = better, red = worse</span>
+          <div className="flex items-center justify-between gap-3 text-[11px] text-gray-500">
+            <label className="flex items-center gap-2 text-gray-700">
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                checked={overlayScaleLocked}
+                onChange={(event) => handleOverlayScaleLockedChange(event.target.checked)}
+              />
+              <span className="font-medium">Lock color scale</span>
+            </label>
+            <span>{overlayScaleLocked ? 'Fixed from first evaluation' : 'Auto-rescales to current run'}</span>
           </div>
           {overlayLegends.map((legend) => (
             <div key={legend.metricKind} className="space-y-1">
               <div className="flex items-center justify-between text-[11px] text-gray-600">
                 <span>{legend.title}</span>
-                <span>Current run</span>
+                <span>{overlayScaleLocked ? 'Locked' : 'Current run'}</span>
               </div>
               <div
                 className="h-2 rounded-sm border border-gray-200"
