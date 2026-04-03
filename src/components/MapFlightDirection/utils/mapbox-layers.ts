@@ -449,14 +449,15 @@ export function renderFlightLinesForPolygon(
   quality?: string,
   debugBearingDeg?: number,
 ): PlannedFlightGeometry {
-  const { flightLines, lineSpacing, bounds } = geometry;
+  const { flightLines, connectedLines, lineSpacing, bounds } = geometry;
+  const displayLines = connectedLines.length > 0 ? connectedLines : flightLines;
 
   const sourceId = `flight-lines-source-${polygonId}`;
   const layerId = `flight-lines-layer-${polygonId}`;
 
   const data = {
     type: 'FeatureCollection',
-    features: flightLines.map((line) => ({
+    features: displayLines.map((line) => ({
       type: 'Feature',
       geometry: {
         type: 'LineString',
@@ -497,7 +498,7 @@ export function renderFlightLinesForPolygon(
     }, beforeId);
   }
 
-  if (flightLines.length === 0) {
+  if (displayLines.length === 0) {
     try {
       const b = bounds;
       if (!b) {

@@ -92,8 +92,6 @@ const FINETUNE_LOITER_LOOP_DELTA_THRESHOLD_RAD = 1.0;
 const FINETUNE_MIN_YAW_RATE_SPEED_MPS = 1.0;
 const FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M = 5.0;
 const FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M = 5.0;
-const FINETUNE_NEXT_SWEEP_ALIGNMENT_HEADING_DEG = 8.0;
-const FINETUNE_NEXT_SWEEP_ALONG_TRACK_BUFFER_M = 6.0;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -655,26 +653,69 @@ const buildTurnBlockGeometry = (
   };
 };
 
-const distancePointToInfiniteLine = (
-  point: LocalPoint,
-  lineStart: LocalPoint,
-  lineEnd: LocalPoint,
-) => {
-  const lineVector = subtractLocal(lineEnd, lineStart);
-  const pointVector = subtractLocal(point, lineStart);
-  const lineLength = normLocal(lineVector);
-  if (lineLength < 1e-9) {
-    return normLocal(subtractLocal(point, lineStart));
-  }
-  return Math.abs(crossLocal(pointVector, lineVector)) / lineLength;
-};
-
 const extractPreviewLines = (previewPath: LocalPoint[], stageTransitionIndex: number, referenceCoordinate: LngLat) => {
   const safeTransitionIndex = clamp(stageTransitionIndex, 1, previewPath.length - 2);
   const sweepCoordinates = dedupeCoordinates(previewPath.slice(0, safeTransitionIndex + 1).map((point) => fromLocalPoint(point, referenceCoordinate)));
   const turnaroundCoordinates = dedupeCoordinates(previewPath.slice(safeTransitionIndex).map((point) => fromLocalPoint(point, referenceCoordinate)));
   if (sweepCoordinates.length < 2 || turnaroundCoordinates.length < 2) return undefined;
   return { sweepLine: sweepCoordinates, turnaroundLine: turnaroundCoordinates };
+};
+
+const sampleLoiterArcBearings = (
+  startBearingRad: number,
+  endBearingRad: number,
+  loiterDirection: 1 | -1,
+  segmentCount: number,
+) => {
+  const normalizedStartRad = wrapPi(startBearingRad);
+  let deltaRad = wrapPi(endBearingRad - normalizedStartRad);
+  if (loiterDirection > 0 && deltaRad < 0) deltaRad += Math.PI * 2;
+  if (loiterDirection < 0 && deltaRad > 0) deltaRad -= Math.PI * 2;
+
+  const bearingsRad: number[] = [];
+  for (let index = 0; index <= segmentCount; index += 1) {
+    const t = index / segmentCount;
+    bearingsRad.push(normalizedStartRad + deltaRad * t);
+  }
+  return bearingsRad;
+};
+
+const buildMissionTurnFallbackLine = (
+  geometry: TurnBlockGeometry,
+  referenceCoordinate: LngLat,
+) => {
+  const entryBearingRad = bearingRad(geometry.loiterCenter, geometry.turnOff);
+  const entryPoint = advanceLocalPoint(geometry.loiterCenter, geometry.loiterRadiusM, entryBearingRad);
+  const idealCogRad = getBearingLoiterExitRad(
+    geometry.loiterCenter,
+    geometry.nextSweepStart,
+    geometry.loiterRadiusM,
+    geometry.loiterDirection,
+  );
+  const exitBearingRad = idealCogRad + (geometry.loiterDirection > 0 ? -Math.PI / 2 : Math.PI / 2);
+  const exitPoint = advanceLocalPoint(geometry.loiterCenter, geometry.loiterRadiusM, exitBearingRad);
+  const approximateArcLengthM =
+    Math.abs(wrapPi(exitBearingRad - entryBearingRad)) * geometry.loiterRadiusM;
+  const segmentCount = Math.max(16, Math.ceil(approximateArcLengthM / 4));
+  const arcCoordinates = sampleLoiterArcBearings(entryBearingRad, exitBearingRad, geometry.loiterDirection, segmentCount)
+    .map((bearingAngleRad) =>
+      fromLocalPoint(advanceLocalPoint(geometry.loiterCenter, geometry.loiterRadiusM, bearingAngleRad), referenceCoordinate),
+    );
+
+  const turnaroundCoordinates = dedupeCoordinates([
+    fromLocalPoint(geometry.endSweep, referenceCoordinate),
+    fromLocalPoint(geometry.turnOff, referenceCoordinate),
+    fromLocalPoint(entryPoint, referenceCoordinate),
+    ...arcCoordinates.slice(1, -1),
+    fromLocalPoint(exitPoint, referenceCoordinate),
+    fromLocalPoint(geometry.nextSweepStart, referenceCoordinate),
+  ]);
+
+  return {
+    turnaroundLine: turnaroundCoordinates.length >= 2 ? turnaroundCoordinates : undefined,
+    loiterEntryPoint: entryPoint,
+    loiterExitPoint: exitPoint,
+  };
 };
 
 const toPlannedTurnBlock = (
@@ -714,6 +755,7 @@ const runTurnPreviewBlock = (
   let stage: "end" | "turnoff" | "loiter" | "next" = "end";
   let stageTransitionIndex = -1;
   let reachedNextSweep = false;
+  let previousWaypointForNext = geometry.endSweep;
   let loiterEntryPoint: LocalPoint | undefined;
   let loiterExitPoint: LocalPoint | undefined;
   const l1State = createInitialL1State(previewParams);
@@ -757,6 +799,7 @@ const runTurnPreviewBlock = (
         const distanceCurrentToExitM = normLocal(subtractLocal(currentPosition, exitPoint));
         if (distanceCurrentToNextM > distanceExitToNextM && distanceCurrentToExitM < distanceCurrentToLoiterM) {
           stage = "next";
+          previousWaypointForNext = exitPoint;
           loiterExitPoint = exitPoint;
         }
       }
@@ -772,8 +815,8 @@ const runTurnPreviewBlock = (
       }
     } else {
       ({ rollSpRad: rollSetpointRad } = navigateWaypoints(
+        previousWaypointForNext,
         geometry.nextSweepStart,
-        geometry.nextSweepEnd,
         currentPosition,
         groundSpeed,
         l1State,
@@ -809,19 +852,8 @@ const runTurnPreviewBlock = (
     trajectory.push(currentPosition);
 
     if (stage === "next") {
-      const distanceToSweepStart = normLocal(subtractLocal(currentPosition, geometry.nextSweepStart));
-      const nextSweepDirection = unitLocal(subtractLocal(geometry.nextSweepEnd, geometry.nextSweepStart));
-      const sweepHeadingRad = Math.atan2(nextSweepDirection.east, nextSweepDirection.north);
-      const headingErrorDeg = Math.abs((wrapPi(headingRad - sweepHeadingRad) * 180) / Math.PI);
-      const crossTrackDistanceM = distancePointToInfiniteLine(currentPosition, geometry.nextSweepStart, geometry.nextSweepEnd);
-      const alongTrackDistanceM = dotLocal(subtractLocal(currentPosition, geometry.nextSweepStart), nextSweepDirection);
-
-      if (
-        distanceToSweepStart < FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M &&
-        crossTrackDistanceM < FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M &&
-        headingErrorDeg < FINETUNE_NEXT_SWEEP_ALIGNMENT_HEADING_DEG &&
-        alongTrackDistanceM > -FINETUNE_NEXT_SWEEP_ALONG_TRACK_BUFFER_M
-      ) {
+      if (normLocal(subtractLocal(currentPosition, geometry.nextSweepStart)) < FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M) {
+        trajectory[trajectory.length - 1] = geometry.nextSweepStart;
         reachedNextSweep = true;
         break;
       }
@@ -952,34 +984,42 @@ const connectSweepLinesUsingDynamicFlightTurn = (
       flightTurnModel.obliqueTiltFlightPlanDeg,
     );
     if (!turnBlockGeometry) {
-      return {
-        connectedLines: connectSweepLinesFallback(sweepLines),
-        turnaroundRadiusM: missionTurnaroundRadiusM,
-        turnBlocks: [] as PlannedTurnBlock[],
-      };
+      const currentSweepLine =
+        connectedLines.length > 0 ? stitchLineStart(sweepLines[sweepIndex], connectedLines.at(-1)!.at(-1)!) : sweepLines[sweepIndex];
+      const nextSweepStart = sweepLines[sweepIndex + 1]?.[0];
+      connectedLines.push(currentSweepLine);
+      if (nextSweepStart) {
+        connectedLines.push([currentSweepLine.at(-1)!, nextSweepStart]);
+      }
+      continue;
     }
 
     const previewLines = runTurnPreviewBlock(turnBlockGeometry, referenceCoordinate, previewParams);
-    if (!previewLines) {
-      return {
-        connectedLines: connectSweepLinesFallback(sweepLines),
-        turnaroundRadiusM: missionTurnaroundRadiusM,
-        turnBlocks: [] as PlannedTurnBlock[],
-      };
-    }
-
+    const sweepLineForTurn = previewLines?.sweepLine ?? sweepLines[sweepIndex];
     const stitchedSweepLine =
-      connectedLines.length > 0 ? stitchLineStart(previewLines.sweepLine, connectedLines.at(-1)!.at(-1)!) : previewLines.sweepLine;
+      connectedLines.length > 0 ? stitchLineStart(sweepLineForTurn, connectedLines.at(-1)!.at(-1)!) : sweepLineForTurn;
     if (connectedLines.length > 0) {
       const previousTurnaroundLine = connectedLines.at(-1)!;
       const smoothJoin = buildSmoothJoinToLineStart(previousTurnaroundLine, stitchedSweepLine);
       if (smoothJoin.length > 0) previousTurnaroundLine.push(...smoothJoin);
     }
-    connectedLines.push(stitchedSweepLine, previewLines.turnaroundLine);
+
+    let turnaroundLine = previewLines?.turnaroundLine;
+    let loiterEntryPoint = previewLines?.loiterEntryPoint;
+    let loiterExitPoint = previewLines?.loiterExitPoint;
+
+    if (!turnaroundLine) {
+      const fallbackTurn = buildMissionTurnFallbackLine(turnBlockGeometry, referenceCoordinate);
+      turnaroundLine = fallbackTurn.turnaroundLine;
+      loiterEntryPoint = fallbackTurn.loiterEntryPoint;
+      loiterExitPoint = fallbackTurn.loiterExitPoint;
+    }
+
+    connectedLines.push(stitchedSweepLine, turnaroundLine ?? [stitchedSweepLine.at(-1)!, sweepLines[sweepIndex + 1][0]]);
     turnBlocks.push(
       toPlannedTurnBlock(turnBlockGeometry, referenceCoordinate, {
-        loiterEntryPoint: previewLines.loiterEntryPoint,
-        loiterExitPoint: previewLines.loiterExitPoint,
+        loiterEntryPoint,
+        loiterExitPoint,
       }),
     );
   }
