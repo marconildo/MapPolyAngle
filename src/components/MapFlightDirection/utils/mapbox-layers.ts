@@ -6,9 +6,11 @@
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
+import type { FlightParams, PlannedFlightGeometry } from '@/domain/types';
 import type { Map as MapboxMap } from 'mapbox-gl';
 import { haversineDistance } from '@/flight/geometry';
 import { generateFlightLinesForPolygon } from '@/flight/flightLines';
+import { generatePlannedFlightGeometryForPolygon } from '@/flight/plannedGeometry';
 import { destination as geoDestination } from '@/utils/terrainAspectHybrid';
 
 export { generateFlightLinesForPolygon } from '@/flight/flightLines';
@@ -428,9 +430,24 @@ export function addFlightLinesForPolygon(
   ring: number[][],
   bearingDeg: number,
   lineSpacingM: number,
+  params?: FlightParams,
   quality?: string
-): { flightLines: number[][][]; sweepIndices: number[]; lineSpacing: number } {
-  const { flightLines, sweepIndices, lineSpacing, bounds } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
+): PlannedFlightGeometry {
+  const rawGeometry = params ? null : generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
+  const geometry = params
+    ? generatePlannedFlightGeometryForPolygon(ring as [number, number][], bearingDeg, lineSpacingM, params)
+    : {
+        ...rawGeometry!,
+        flightLines: rawGeometry!.flightLines as [number, number][][],
+        sweepLines: [],
+        gridPoints: [],
+        leadInPoints: [],
+        leadOutPoints: [],
+        connectedLines: [],
+        turnaroundRadiusM: 0,
+        turnBlocks: [],
+      };
+  const { flightLines, lineSpacing, bounds } = geometry;
 
   const sourceId = `flight-lines-source-${polygonId}`;
   const layerId = `flight-lines-layer-${polygonId}`;
@@ -489,7 +506,7 @@ export function addFlightLinesForPolygon(
     } catch {}
   }
 
-  return { flightLines, sweepIndices, lineSpacing };
+  return geometry;
 }
 
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {

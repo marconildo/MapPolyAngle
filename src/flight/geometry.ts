@@ -12,7 +12,14 @@ import {
   TerrainTile,
 } from '@/utils/terrainAspectHybrid';
 import * as egm96 from 'egm96-universal';
-import type { CameraModel } from '@/domain/types';
+import type { CameraModel, PlannedFlightGeometry, PlannedTurnBlock } from '@/domain/types';
+
+const TURN_LIFT_ALTITUDE_MARGIN_M = 20;
+const TURN_LIFT_EASING_POWER = 2;
+const TURN_LIFT_ELEVATION_PER_METER = 0.25;
+const TURN_LIFT_LOOP_DEGREES = 360;
+const TURN_LIFT_LOOP_POINT_SPACING_M = 8;
+const TURN_LIFT_CIRCLE_TOLERANCE_M = 5;
 
 function convertElevationToWGS84(lat: number, lng: number, elevationEGM96: number): number {
   return egm96.egm96ToEllipsoid(lat, lng, elevationEGM96);
@@ -76,6 +83,127 @@ export function queryMinMaxElevationAlongPolylineWGS84(
   }
 
   return { min: minElev, max: maxElev };
+}
+
+function normaliseDegrees(angleDeg: number): number {
+  const wrapped = angleDeg % 360;
+  return wrapped >= 0 ? wrapped : wrapped + 360;
+}
+
+function lineLengthMeters(line: [number, number][]): number {
+  let totalDistanceM = 0;
+  for (let index = 1; index < line.length; index += 1) {
+    totalDistanceM += haversineDistance(line[index - 1], line[index]);
+  }
+  return totalDistanceM;
+}
+
+function dedupePolyline2D(line: [number, number][]): [number, number][] {
+  return line.filter((point, index) => {
+    if (index === 0) return true;
+    const previous = line[index - 1];
+    return point[0] !== previous[0] || point[1] !== previous[1];
+  });
+}
+
+function getLastLoiterAnchorIndex(
+  line: [number, number][],
+  turnBlock: PlannedTurnBlock,
+): number {
+  const toleranceM = Math.max(TURN_LIFT_CIRCLE_TOLERANCE_M, turnBlock.loiterRadiusM * 0.15);
+  let anchorIndex = -1;
+
+  for (let index = 0; index < line.length - 1; index += 1) {
+    const distanceToCenterM = haversineDistance(line[index], turnBlock.loiterCenter);
+    if (Math.abs(distanceToCenterM - turnBlock.loiterRadiusM) <= toleranceM) {
+      anchorIndex = index;
+    }
+  }
+
+  return anchorIndex;
+}
+
+function getNearestPointIndex(
+  line: [number, number][],
+  targetPoint: [number, number],
+): number {
+  let bestIndex = -1;
+  let bestDistanceM = Infinity;
+  line.forEach((point, index) => {
+    const distanceM = haversineDistance(point, targetPoint);
+    if (distanceM < bestDistanceM) {
+      bestDistanceM = distanceM;
+      bestIndex = index;
+    }
+  });
+  return bestIndex;
+}
+
+function generateCoilLoopPoints(
+  turnBlock: PlannedTurnBlock,
+  anchorPoint: [number, number],
+  loopCount: number,
+): [number, number][] {
+  if (loopCount <= 0) return [anchorPoint];
+
+  const startBearingDeg = geoBearing(turnBlock.loiterCenter, anchorPoint);
+  const loopCircumferenceM = 2 * Math.PI * turnBlock.loiterRadiusM;
+  const pointsPerLoop = Math.max(36, Math.ceil(loopCircumferenceM / TURN_LIFT_LOOP_POINT_SPACING_M));
+  const totalSteps = pointsPerLoop * loopCount;
+  const coilPoints: [number, number][] = [anchorPoint];
+
+  for (let step = 1; step <= totalSteps; step += 1) {
+    if (step === totalSteps) {
+      coilPoints.push(anchorPoint);
+      break;
+    }
+    const deltaDeg =
+      (TURN_LIFT_LOOP_DEGREES * loopCount * step) / totalSteps * (turnBlock.loiterDirection > 0 ? 1 : -1);
+    const point = geoDestination(
+      turnBlock.loiterCenter,
+      normaliseDegrees(startBearingDeg + deltaDeg),
+      turnBlock.loiterRadiusM,
+    );
+    coilPoints.push([point[0], point[1]]);
+  }
+
+  return coilPoints;
+}
+
+function extendTurnaroundForClimbRate(
+  turnaroundLine: [number, number][],
+  turnBlock: PlannedTurnBlock | undefined,
+  previousSweepAltitudeM: number,
+  nextSweepAltitudeM: number,
+): [number, number][] {
+  if (!turnBlock || turnaroundLine.length < 2) return turnaroundLine;
+
+  const altitudeDeltaM = Math.abs(nextSweepAltitudeM - previousSweepAltitudeM);
+  const existingTurnLengthM = lineLengthMeters(turnaroundLine);
+  const maxLiftM = existingTurnLengthM * TURN_LIFT_ELEVATION_PER_METER;
+  if (altitudeDeltaM <= maxLiftM + 1e-6) return turnaroundLine;
+
+  const loopLengthM = 2 * Math.PI * turnBlock.loiterRadiusM;
+  if (loopLengthM <= 1e-6) return turnaroundLine;
+
+  const extraDistanceNeededM = altitudeDeltaM / TURN_LIFT_ELEVATION_PER_METER - existingTurnLengthM;
+  const requiredLoopCount = Math.max(1, Math.ceil(extraDistanceNeededM / loopLengthM));
+  const loiterExitPoint = turnBlock.loiterExitPoint;
+  const loiterAnchorIndex =
+    loiterExitPoint
+      ? getNearestPointIndex(turnaroundLine, loiterExitPoint)
+      : getLastLoiterAnchorIndex(turnaroundLine, turnBlock);
+  if (loiterAnchorIndex < 0 || loiterAnchorIndex >= turnaroundLine.length - 1) {
+    return turnaroundLine;
+  }
+
+  const loiterAnchor = loiterExitPoint ?? turnaroundLine[loiterAnchorIndex];
+  const coilLoopPoints = generateCoilLoopPoints(turnBlock, loiterAnchor, requiredLoopCount);
+  return dedupePolyline2D([
+    ...turnaroundLine.slice(0, loiterAnchorIndex),
+    ...coilLoopPoints,
+    ...turnaroundLine.slice(loiterAnchorIndex + 1),
+  ]);
 }
 
 export function calculateFlightLineSpacing(
@@ -354,19 +482,228 @@ function buildFillet(
 }
 
 export function build3DFlightPath(
-  lines: number[][][],
+  lines: number[][][] | PlannedFlightGeometry,
   tiles: TerrainTile[],
   lineSpacing: number,
-  opts: { altitudeAGL: number; mode?: 'legacy' | 'min-clearance'; minClearance?: number; turnExtendM?: number } | number = 100,
+  opts:
+    | { altitudeAGL: number; mode?: 'legacy' | 'min-clearance'; minClearance?: number; turnExtendM?: number; preconnected?: boolean }
+    | number = 100,
   sweepIndices?: number[],
 ): [number, number, number][][] {
+  const usingGeometryInput = !Array.isArray(lines);
+  const geometryInput = usingGeometryInput ? (lines as PlannedFlightGeometry) : undefined;
+  const sourceLines = geometryInput?.connectedLines ?? lines;
   const path: [number, number, number][][] = [];
   const usingLegacySig = typeof opts === 'number';
   const altitudeAGL = usingLegacySig ? (opts as number) : (opts as any).altitudeAGL;
   const mode: 'legacy' | 'min-clearance' = usingLegacySig ? 'legacy' : ((opts as any).mode ?? 'legacy');
   const minClearance = usingLegacySig ? 60 : Math.max(0, (opts as any).minClearance ?? 60);
+  const homeAltitude = usingLegacySig ? undefined : ((opts as any).homeAltitude as number | undefined);
   const turnExtendM = usingLegacySig ? 0 : Math.max(0, (opts as any).turnExtendM ?? 0);
-  const sweeps = groupFlightLinesForTraversal(lines, lineSpacing, sweepIndices);
+  const preconnected = usingGeometryInput || (!usingLegacySig && Boolean((opts as any).preconnected));
+
+  const computeLineAltitude = (mergedLine: [number, number][]) => {
+    const { min: lineMinElev, max: lineMaxElev } = queryMinMaxElevationAlongPolylineWGS84(mergedLine as any, tiles, 20);
+    let extendedMax = lineMaxElev;
+    if (!usingLegacySig && (opts as any).turnExtendM && (opts as any).turnExtendM > 0 && mergedLine.length >= 2) {
+      const te = Math.max(0, (opts as any).turnExtendM as number);
+      const L0 = mergedLine[0] as [number, number];
+      const L1 = mergedLine[1] as [number, number];
+      const LN = mergedLine[mergedLine.length - 1] as [number, number];
+      const sweepBrg = geoBearing([L0[0], L0[1]], [L1[0], L1[1]]);
+      const startExt = geoDestination([L0[0], L0[1]], (sweepBrg + 180) % 360, te);
+      const endExt = geoDestination([LN[0], LN[1]], sweepBrg, te);
+      const startMax = queryMaxElevationAlongLineWGS84(startExt[0], startExt[1], L0[0], L0[1], tiles, 20);
+      const endMax = queryMaxElevationAlongLineWGS84(LN[0], LN[1], endExt[0], endExt[1], tiles, 20);
+      if (Number.isFinite(startMax)) extendedMax = Math.max(extendedMax, startMax);
+      if (Number.isFinite(endMax)) extendedMax = Math.max(extendedMax, endMax);
+    }
+
+    if (mode === 'legacy') {
+      const refElev = Number.isFinite(extendedMax) ? extendedMax : 0;
+      return refElev + altitudeAGL;
+    }
+
+    const a1 = Number.isFinite(lineMinElev) ? (lineMinElev + altitudeAGL) : altitudeAGL;
+    const a2 = Number.isFinite(extendedMax) ? (extendedMax + minClearance) : altitudeAGL;
+    return Math.max(a1, a2);
+  };
+
+  const createEaseInOut = (min: number, max: number, ease = TURN_LIFT_EASING_POWER) => {
+    const range = max - min;
+    return (value: number) => {
+      const normalizedValue = Math.max(0, Math.min(1, value));
+      return (
+        min +
+        range *
+          (normalizedValue < 0.5
+            ? 0.5 * (2 * normalizedValue) ** ease
+            : 1 - 0.5 * (2 * (1 - normalizedValue)) ** ease)
+      );
+    };
+  };
+
+  const setLineAltitudeSmooth = (
+    line: [number, number][],
+    altitudeA: number,
+    altitudeB: number = altitudeA,
+  ): [number, number, number][] => {
+    if (line.length === 0) return [];
+    if (altitudeA === altitudeB) {
+      return line.map(([lng, lat]) => [lng, lat, altitudeA] as [number, number, number]);
+    }
+
+    const reversed = altitudeA > altitudeB;
+    const orientedLine = reversed ? [...line].reverse() : line;
+    const ease = createEaseInOut(Math.min(altitudeA, altitudeB), Math.max(altitudeA, altitudeB));
+
+    const stepLengths = orientedLine.map((point, index) =>
+      index > 0 ? haversineDistance(orientedLine[index - 1] as [number, number], point as [number, number]) : 0,
+    );
+    const totalDistance = Math.max(stepLengths.reduce((sum, value) => sum + value, 0), 1e-9);
+    let traversedDistance = 0;
+
+    const lifted = orientedLine.map(([lng, lat], index) => {
+      if (index > 0) traversedDistance += stepLengths[index];
+      return [lng, lat, ease(traversedDistance / totalDistance)] as [number, number, number];
+    });
+
+    return reversed ? lifted.reverse() : lifted;
+  };
+
+  const getLineMaxElevation = (line: [number, number][]) => queryMinMaxElevationAlongPolylineWGS84(line, tiles, 20).max;
+
+  const calculateSweepAltitudeWithAdjacentTurnarounds = (
+    sweepLine: [number, number][],
+    adjacentLines: [number, number][][],
+  ) => {
+    const { min: sweepMinElevation, max: sweepMaxElevation } = queryMinMaxElevationAlongPolylineWGS84(sweepLine, tiles, 20);
+    const adjacentMaxElevation = adjacentLines.reduce((maxElevation, line) => {
+      if (!Array.isArray(line) || line.length < 2) return maxElevation;
+      return Math.max(maxElevation, getLineMaxElevation(line));
+    }, -Infinity);
+    const pathMaxElevation = Math.max(sweepMaxElevation, adjacentMaxElevation);
+
+    if (mode === 'legacy') {
+      return Number.isFinite(pathMaxElevation) ? pathMaxElevation + altitudeAGL : altitudeAGL;
+    }
+
+    const hagAltitude = Number.isFinite(sweepMinElevation) ? sweepMinElevation + altitudeAGL : altitudeAGL;
+    const turnaroundSafeAltitude = Number.isFinite(pathMaxElevation)
+      ? pathMaxElevation + minClearance + TURN_LIFT_ALTITUDE_MARGIN_M
+      : altitudeAGL;
+    return Math.max(hagAltitude, turnaroundSafeAltitude);
+  };
+
+  const computeConnectorPointAltitude = (
+    point: [number, number],
+    interpolationRatio: number,
+    startAltitude: number,
+    endAltitude: number,
+  ) => {
+    const interpolatedAltitude = startAltitude + (endAltitude - startAltitude) * interpolationRatio;
+    const terrainElevationEGM96 = queryElevationAtPoint(point[0], point[1], tiles);
+    if (!Number.isFinite(terrainElevationEGM96)) return interpolatedAltitude;
+
+    const terrainElevationWGS84 = convertElevationToWGS84(point[1], point[0], terrainElevationEGM96);
+    const clearanceMargin = mode === 'legacy' ? altitudeAGL : minClearance;
+    return Math.max(interpolatedAltitude, terrainElevationWGS84 + clearanceMargin);
+  };
+
+  if (preconnected && geometryInput) {
+    const connectedSegments = geometryInput.connectedLines
+      .map((line) => (line as [number, number][]).filter((point) => Array.isArray(point) && point.length >= 2))
+      .filter((line) => line.length >= 2);
+
+    if (homeAltitude !== undefined) {
+      return connectedSegments.map((segment) =>
+        segment.map(([lng, lat]) => [lng, lat, homeAltitude + altitudeAGL] as [number, number, number]),
+      );
+    }
+
+    const leadInLine =
+      geometryInput.leadInPoints.length > 1 ? (geometryInput.leadInPoints.slice(1) as [number, number][]) : undefined;
+    const leadOutLine =
+      geometryInput.leadOutPoints.length > 1
+        ? (geometryInput.leadOutPoints.slice(0, -1) as [number, number][])
+        : undefined;
+
+    const calculateSweepAltitudes = (turnaroundSegments: [number, number][][]) => geometryInput.sweepLines.map((sweepLine, sweepIndex) => {
+      const adjacentLines: [number, number][][] = [];
+      const previousTurnaround = turnaroundSegments[sweepIndex * 2 - 1];
+      const nextTurnaround = turnaroundSegments[sweepIndex * 2 + 1];
+
+      if (previousTurnaround) adjacentLines.push(previousTurnaround as [number, number][]);
+      if (nextTurnaround) adjacentLines.push(nextTurnaround as [number, number][]);
+      if (sweepIndex === 0 && leadInLine) adjacentLines.push(leadInLine);
+      if (sweepIndex === geometryInput.sweepLines.length - 1 && leadOutLine) adjacentLines.push(leadOutLine);
+
+      return calculateSweepAltitudeWithAdjacentTurnarounds(sweepLine as [number, number][], adjacentLines);
+    });
+
+    const buildTurnaroundSegments = (sweepAltitudes: number[]) =>
+      connectedSegments.map((segment, segmentIndex) => {
+        if (segmentIndex % 2 === 0) return segment;
+        return extendTurnaroundForClimbRate(
+          segment as [number, number][],
+          geometryInput.turnBlocks[Math.floor(segmentIndex / 2)],
+          sweepAltitudes[Math.floor((segmentIndex - 1) / 2)] ?? altitudeAGL,
+          sweepAltitudes[Math.floor((segmentIndex + 1) / 2)] ?? altitudeAGL,
+        );
+      });
+
+    const provisionalSweepAltitudes = calculateSweepAltitudes(connectedSegments);
+    const expandedTurnaroundSegments = buildTurnaroundSegments(provisionalSweepAltitudes);
+    const finalSweepAltitudes = calculateSweepAltitudes(expandedTurnaroundSegments);
+    const finalConnectedSegments = buildTurnaroundSegments(finalSweepAltitudes);
+    const resolvedSweepAltitudes = calculateSweepAltitudes(finalConnectedSegments);
+
+    return finalConnectedSegments.map((segment, segmentIndex) => {
+      if (segmentIndex % 2 === 0) {
+        const sweepAltitude = resolvedSweepAltitudes[Math.floor(segmentIndex / 2)] ?? altitudeAGL;
+        return segment.map(([lng, lat]) => [lng, lat, sweepAltitude] as [number, number, number]);
+      }
+
+      const previousSweepAltitude = resolvedSweepAltitudes[Math.floor((segmentIndex - 1) / 2)] ?? altitudeAGL;
+      const nextSweepAltitude = resolvedSweepAltitudes[Math.floor((segmentIndex + 1) / 2)] ?? previousSweepAltitude;
+      return setLineAltitudeSmooth(segment as [number, number][], previousSweepAltitude, nextSweepAltitude);
+    });
+  }
+
+  if (preconnected) {
+    const mergedSegments = (sourceLines as number[][][])
+      .map((line) => (line as [number, number][]).filter((point) => Array.isArray(point) && point.length >= 2))
+      .filter((line) => line.length >= 2);
+
+    const baseAltitudes = mergedSegments.map((segment) => computeLineAltitude(segment));
+
+    mergedSegments.forEach((mergedLine, segmentIndex) => {
+      const segmentAltitude = baseAltitudes[segmentIndex];
+      if (segmentIndex % 2 === 1) {
+        const previousSweepAltitude = baseAltitudes[Math.max(0, segmentIndex - 1)] ?? segmentAltitude;
+        const nextSweepAltitude = baseAltitudes[Math.min(baseAltitudes.length - 1, segmentIndex + 1)] ?? segmentAltitude;
+        const pointCount = Math.max(mergedLine.length - 1, 1);
+        path.push(
+          mergedLine.map(([lng, lat], pointIndex) => {
+            const interpolationRatio = pointIndex / pointCount;
+            const connectorAltitude = computeConnectorPointAltitude(
+              [lng, lat],
+              interpolationRatio,
+              previousSweepAltitude,
+              nextSweepAltitude,
+            );
+            return [lng, lat, connectorAltitude] as [number, number, number];
+          }),
+        );
+        return;
+      }
+      path.push(mergedLine.map(([lng, lat]) => [lng, lat, segmentAltitude] as [number, number, number]));
+    });
+
+    return path;
+  }
+
+  const sweeps = groupFlightLinesForTraversal(sourceLines as number[][][], lineSpacing, sweepIndices);
 
   sweeps.forEach((sweep) => {
     const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
@@ -391,31 +728,7 @@ export function build3DFlightPath(
     });
     if (mergedLine.length < 2) return;
 
-    const { min: lineMinElev, max: lineMaxElev } = queryMinMaxElevationAlongPolylineWGS84(mergedLine as any, tiles, 20);
-    let extendedMax = lineMaxElev;
-    if (!usingLegacySig && (opts as any).turnExtendM && (opts as any).turnExtendM > 0 && mergedLine.length >= 2) {
-      const te = Math.max(0, (opts as any).turnExtendM as number);
-      const L0 = mergedLine[0] as [number, number];
-      const L1 = mergedLine[1] as [number, number];
-      const LN = mergedLine[mergedLine.length - 1] as [number, number];
-      const sweepBrg = geoBearing([L0[0], L0[1]], [L1[0], L1[1]]);
-      const startExt = geoDestination([L0[0], L0[1]], (sweepBrg + 180) % 360, te);
-      const endExt = geoDestination([LN[0], LN[1]], sweepBrg, te);
-      const startMax = queryMaxElevationAlongLineWGS84(startExt[0], startExt[1], L0[0], L0[1], tiles, 20);
-      const endMax = queryMaxElevationAlongLineWGS84(LN[0], LN[1], endExt[0], endExt[1], tiles, 20);
-      if (Number.isFinite(startMax)) extendedMax = Math.max(extendedMax, startMax);
-      if (Number.isFinite(endMax)) extendedMax = Math.max(extendedMax, endMax);
-    }
-
-    let flightAltitude: number;
-    if (mode === 'legacy') {
-      const refElev = Number.isFinite(extendedMax) ? extendedMax : 0;
-      flightAltitude = refElev + altitudeAGL;
-    } else {
-      const a1 = Number.isFinite(lineMinElev) ? (lineMinElev + altitudeAGL) : altitudeAGL;
-      const a2 = Number.isFinite(extendedMax) ? (extendedMax + minClearance) : altitudeAGL;
-      flightAltitude = Math.max(a1, a2);
-    }
+    const flightAltitude = computeLineAltitude(mergedLine);
     const coords = mergedLine.map(([lng, lat]) => [lng, lat, flightAltitude] as [number, number, number]);
 
     if (path.length > 0) {

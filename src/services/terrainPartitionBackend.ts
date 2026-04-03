@@ -10,7 +10,7 @@ export interface TerrainPartitionBackendRequest {
   terrainSource: TerrainSourceSelection;
   altitudeMode: 'legacy' | 'min-clearance';
   minClearanceM: number;
-  turnExtendM: number;
+  turnExtendM: number; // deprecated compatibility field; backend keeps accepting it while ignoring it
   tradeoff?: number;
   debug?: boolean;
 }

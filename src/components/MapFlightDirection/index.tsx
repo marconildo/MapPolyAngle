@@ -29,6 +29,7 @@ import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, calculateGSD, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from '@/domain/lidar';
+import type { PlannedFlightGeometry } from '@/domain/types';
 import type { BearingOverride, MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
@@ -461,7 +462,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     // Flight lines + spacing + altitude actually used to build 3D path.
     const [polygonFlightLines, setPolygonFlightLines] = useState<
-      Map<string, { flightLines: number[][][]; sweepIndices?: number[]; lineSpacing: number; altitudeAGL: number }>
+      Map<string, PlannedFlightGeometry & { altitudeAGL: number }>
     >(new Map());
 
     // Per‑polygon parameters provided by user (or by importer).
@@ -747,6 +748,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         res.polygon.coordinates,
         bearingDeg,
         spacing,
+        safeParams,
         res.result.fitQuality
       );
 
@@ -762,11 +764,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
         const path3d = build3DFlightPath(
-          fl.flightLines,
+          fl,
           tiles,
           fl.lineSpacing,
-          { altitudeAGL: safeParams.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-          fl.sweepIndices,
+          { altitudeAGL: safeParams.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
         );
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
         const spacingForward = getForwardSpacingForParams(safeParams);
@@ -799,7 +800,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
         return rest;
       });
-    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, syncFlightLinesVisibility, turnExtendM]);
+    }, [polygonResults, polygonTiles, onFlightLinesUpdated, altitudeMode, minClearanceM, syncFlightLinesVisibility]);
 
     const applyPolygonParamsBatch = useCallback((updates: Array<{ polygonId: string; params: PolygonParams }>) => {
       const latestByPolygon = new Map<string, PolygonParams>();
@@ -1035,7 +1036,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       turnExtendM,
     ]);
 
-    // Rebuild 3D paths when altitude mode, minimum clearance, or turn extension changes
+    // Rebuild 3D paths when altitude mode or minimum clearance changes
     useEffect(() => {
       if (!deckOverlayRef.current) return;
       const overlay = deckOverlayRef.current;
@@ -1044,16 +1045,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         const tiles = polygonTiles.get(pid) || [];
         if (!tiles || fl.flightLines.length === 0) return;
         const path3d = build3DFlightPath(
-          fl.flightLines,
+          fl,
           tiles,
           fl.lineSpacing,
-          { altitudeAGL: fl.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-          fl.sweepIndices,
+          { altitudeAGL: fl.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
         );
         update3DPathLayer(overlay, pid, path3d, setDeckLayers);
       });
       syncFlightLinesVisibility(flightLinesVisibleRef.current);
-    }, [altitudeMode, minClearanceM, syncFlightLinesVisibility, turnExtendM]);
+    }, [altitudeMode, minClearanceM, syncFlightLinesVisibility]);
     // ---------- helpers ----------
     const fitMapToRings = useCallback((rings: [number, number][][]) => {
       if (!mapRef.current || rings.length === 0) return;
@@ -1157,6 +1157,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           result.polygon.coordinates,
           bearingDeg,
           spacing,
+          safeParams,
           result.result.fitQuality
         );
 
@@ -1176,11 +1177,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
         if (deckOverlayRef.current && lines.flightLines.length > 0) {
           const path3d = build3DFlightPath(
-            lines.flightLines,
+            lines,
             tiles,
             lines.lineSpacing,
-            { altitudeAGL: safeParams.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-            lines.sweepIndices,
+            { altitudeAGL: safeParams.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
           );
           update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
           const spacingForward = getForwardSpacingForParams(safeParams);
@@ -1835,6 +1835,19 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             item.ring as number[][],
             item.angleDeg,
             item.lineSpacingM,
+            {
+              payloadKind,
+              altitudeAGL: item.altitudeAGL,
+              frontOverlap: item.frontOverlap,
+              sideOverlap: item.sideOverlap,
+              cameraKey: payloadKind === 'camera' ? cameraKey : undefined,
+              lidarKey: payloadKind === 'lidar' ? lidarKey : undefined,
+              cameraYawOffsetDeg,
+              speedMps: payloadKind === 'lidar' ? item.speedMps : undefined,
+              lidarReturnMode: payloadKind === 'lidar' ? item.lidarReturnMode : undefined,
+              mappingFovDeg: payloadKind === 'lidar' ? item.mappingFovDeg : undefined,
+              maxLidarRangeM: payloadKind === 'lidar' ? item.maxLidarRangeM : undefined,
+            },
             undefined
           );
           flightLinesToUpdate.set(id, { ...lines, altitudeAGL: item.altitudeAGL });
@@ -1908,11 +1921,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const altitudeAGL = polygonsToUpdate.get(polygonId)?.params.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
           if (deckOverlayRef.current && flEntry?.flightLines?.length) {
             const path3d = build3DFlightPath(
-              flEntry.flightLines,
+              flEntry,
               tiles,
               lineSpacing,
-              { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-              flEntry.sweepIndices,
+              { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
             );
             update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
           }
@@ -2127,6 +2139,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         res.polygon.coordinates,
         original.bearingDeg,
         original.lineSpacingM,
+        params,
         res.result.fitQuality
       );
       setPolygonFlightLines((prev) => {
@@ -2137,11 +2150,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const tiles = polygonTiles.get(polygonId) || [];
       if (deckOverlayRef.current && fl.flightLines.length > 0) {
         const path3d = build3DFlightPath(
-          fl.flightLines,
+          fl,
           tiles,
           fl.lineSpacing,
-          { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-          fl.sweepIndices,
+          { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
         );
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
       }

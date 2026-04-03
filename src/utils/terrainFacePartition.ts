@@ -16,6 +16,7 @@ import {
   type Polygon as TerrainPolygon,
   queryElevationAtPoint,
 } from "@/utils/terrainAspectHybrid";
+import { generatePlannedFlightGeometryForPolygon, summarizePlannedFlightGeometry } from "@/flight/plannedGeometry";
 
 // Turf typings are noisy in this repo. Keep usage narrow and geometry-centric.
 // @ts-ignore
@@ -663,58 +664,23 @@ function estimateFlightPatternMetrics(
   bearingDeg: number,
   lineSpacingM: number,
   shortLineThresholdM: number,
+  params: FlightParams,
 ): FlightPatternMetrics {
-  const lons = ring.map((point) => point[0]);
-  const lats = ring.map((point) => point[1]);
-  const minLng = Math.min(...lons);
-  const maxLng = Math.max(...lons);
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const center: [number, number] = [(minLng + maxLng) / 2, (minLat + maxLat) / 2];
-  const diagonal = haversineDistance([minLng, minLat], [maxLng, maxLat]);
-  const perpBearing = (bearingDeg + 90) % 360;
-  const numLines = Math.max(1, Math.ceil(diagonal / Math.max(1, lineSpacingM)));
-  const lengths: number[] = [];
-  let fragmentedLineCount = 0;
-
-  for (let i = -numLines; i <= numLines; i++) {
-    const distance = i * lineSpacingM;
-    const [centerLng, centerLat] = geoDestination(center, perpBearing, distance);
-    const extendDistance = diagonal * 0.75;
-    const p1 = geoDestination([centerLng, centerLat], bearingDeg, extendDistance);
-    const p2 = geoDestination([centerLng, centerLat], (bearingDeg + 180) % 360, extendDistance);
-
-    let currentSegment: [number, number][] = [];
-    let segments = 0;
-    const samples = 64;
-    for (let sample = 0; sample <= samples; sample++) {
-      const t = sample / samples;
-      const lng = p2[0] + t * (p1[0] - p2[0]);
-      const lat = p2[1] + t * (p1[1] - p2[1]);
-      if (pointInPolygon(lng, lat, ring)) {
-        currentSegment.push([lng, lat]);
-      } else if (currentSegment.length > 0) {
-        segments += 1;
-        const startPoint = currentSegment[0];
-        const endPoint = currentSegment[currentSegment.length - 1];
-        lengths.push(haversineDistance(startPoint, endPoint));
-        currentSegment = [];
-      }
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacingM, params);
+  const summary = summarizePlannedFlightGeometry(geometry);
+  const lengths = geometry.sweepLines.map((sweepLine) => {
+    let sweepLengthM = 0;
+    for (let index = 1; index < sweepLine.length; index += 1) {
+      sweepLengthM += haversineDistance(sweepLine[index - 1], sweepLine[index]);
     }
-    if (currentSegment.length > 0) {
-      segments += 1;
-      const startPoint = currentSegment[0];
-      const endPoint = currentSegment[currentSegment.length - 1];
-      lengths.push(haversineDistance(startPoint, endPoint));
-    }
-    if (segments > 1) fragmentedLineCount += segments - 1;
-  }
+    return sweepLengthM;
+  });
 
   const shortLineCount = lengths.filter((length) => length < shortLineThresholdM).length;
 
   return {
-    lineCount: lengths.length,
-    fragmentedLineCount,
+    lineCount: summary.lineCount,
+    fragmentedLineCount: summary.fragmentedLineCount,
     meanLineLengthM: mean(lengths),
     medianLineLengthM: median(lengths),
     shortLineCount,
@@ -764,7 +730,7 @@ function evaluatePolygon(
   const shortLineThresholdM = mode === "forced"
     ? Math.max(90, 4 * lineSpacingM)
     : Math.max(120, 6 * lineSpacingM);
-  const flight = estimateFlightPatternMetrics(normalized, terrainResult.contourDirDeg, lineSpacingM, shortLineThresholdM);
+  const flight = estimateFlightPatternMetrics(normalized, terrainResult.contourDirDeg, lineSpacingM, shortLineThresholdM, params);
 
   if (crossTrackWidthM < minWidthM * (mode === "forced" ? 0.55 : 0.75)) return null;
   if (flight.lineCount === 0) return null;

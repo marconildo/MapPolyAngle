@@ -94,7 +94,7 @@ class PartitionSolveRequest(BaseModel):
     terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
     altitudeMode: AltitudeMode = "legacy"
     minClearanceM: float = Field(60, ge=0)
-    turnExtendM: float = Field(96, ge=0)
+    turnExtendM: float = Field(96, ge=0)  # deprecated compatibility field; solver ignores it
     tradeoff: float | None = Field(default=None, ge=0, le=1)
     debug: bool = False
 
@@ -254,7 +254,7 @@ class ExactOptimizeBearingRequest(BaseModel):
     terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
     altitudeMode: AltitudeMode = "legacy"
     minClearanceM: float = Field(60, ge=0)
-    turnExtendM: float = Field(96, ge=0)
+    turnExtendM: float = Field(96, ge=0)  # deprecated compatibility field; solver ignores it
     seedBearingDeg: float = 0
     mode: Literal["local", "global"] = "global"
     halfWindowDeg: float | None = Field(default=None, gt=0, le=180)

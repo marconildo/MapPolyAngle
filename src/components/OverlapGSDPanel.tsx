@@ -7,8 +7,8 @@ import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import { sampleCameraPositionsOnFlightPath, build3DFlightPath, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
-import { generateFlightLinesForPolygon } from "@/components/MapFlightDirection/utils/mapbox-layers";
+import { sampleCameraPositionsOnFlightPath, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -783,7 +783,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     const poses: PoseMeters[] = [];
     let poseId = 0;
 
-    for (const [polygonId, { flightLines, sweepIndices, lineSpacing, altitudeAGL }] of Array.from(flightLinesMap.entries())) {
+    for (const [polygonId, lineData] of Array.from(flightLinesMap.entries())) {
+      const { flightLines, lineSpacing, altitudeAGL } = lineData;
       const tiles = tilesMap.get(polygonId) || [];
       if (flightLines.length === 0 || tiles.length === 0) continue;
 
@@ -796,13 +797,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
       const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
       const minClr = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
-      const turnExtend = (api as any)?.getTurnExtend ? Math.max(0, (api as any).getTurnExtend()) : turnExtendUI;
       const path3D = build3DFlightPath(
-        flightLines,
+        lineData,
         tiles,
         lineSpacing,
-        { altitudeAGL: altForThisPoly, mode, minClearance: minClr, turnExtendM: turnExtend },
-        sweepIndices,
+        { altitudeAGL: altForThisPoly, mode, minClearance: minClr, preconnected: true },
       );
 
       const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward, { includeTurns: false });
@@ -834,7 +833,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       });
     }
     return poses;
-  }, [getMergedParamsMap, mapRef, photoSpacingFor, turnExtendUI]);
+  }, [getMergedParamsMap, mapRef, photoSpacingFor]);
 
   const parsePosesMeters = useCallback((): PoseMeters[] | null => {
     const api = mapRef.current;
@@ -870,8 +869,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     let globalPassIndex = 0;
     const altitudeMode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
     const minClearance = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
-    const turnExtend = (api as any)?.getTurnExtend ? Math.max(0, (api as any).getTurnExtend()) : turnExtendUI;
-
     for (const [polygonId, lineData] of Array.from(flightLinesMap.entries())) {
       if (polygonFilter && !polygonFilter.has(polygonId)) continue;
       if (!isLidarPayload(polygonId, paramsMap)) continue;
@@ -895,23 +892,32 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       const effectivePointRate = model.effectivePointRates[returnMode];
       if (!(swathWidth > 0) || !(densityPerPass > 0)) continue;
 
-      const sourceLines = lineData.flightLines ?? [];
-      const sweeps = groupFlightLinesForTraversal(sourceLines, lineData.lineSpacing, lineData.sweepIndices);
+      const sweeps = lineData.sweepLines?.length
+        ? lineData.sweepLines
+        : groupFlightLinesForTraversal(lineData.flightLines ?? [], lineData.lineSpacing, lineData.sweepIndices)
+          .map((sweep) => {
+            const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
+            const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
+            const mergedLine: [number, number][] = [];
+            orientedFragments.forEach((fragment, fragmentIndex) => {
+              if (fragmentIndex === 0) {
+                mergedLine.push(...fragment as [number, number][]);
+                return;
+              }
+              const typedFragment = fragment as [number, number][];
+              const previous = mergedLine[mergedLine.length - 1];
+              const first = typedFragment[0];
+              if (!previous || previous[0] !== first[0] || previous[1] !== first[1]) {
+                mergedLine.push(first);
+              }
+              mergedLine.push(...typedFragment.slice(1));
+            });
+            return mergedLine;
+          });
       for (let lineIndex = 0; lineIndex < sweeps.length; lineIndex++) {
-        const sweep = sweeps[lineIndex];
-        const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
-        const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
-        const firstFragment = orientedFragments[0];
-        const lastFragment = orientedFragments[orientedFragments.length - 1];
-        if (!Array.isArray(firstFragment) || firstFragment.length < 2 || !Array.isArray(lastFragment) || lastFragment.length < 2) continue;
         const passIndex = globalPassIndex++;
-        const activeSweepLine = [
-          extendFlightLineForTurnRunout(firstFragment, turnExtend)[0],
-          ...orientedFragments.flatMap((fragment, fragmentIndex) => (
-            fragmentIndex === 0 ? fragment : fragment.slice(1)
-          )),
-          extendFlightLineForTurnRunout(lastFragment, turnExtend).slice(-1)[0],
-        ];
+        const activeSweepLine = sweeps[lineIndex];
+        if (!Array.isArray(activeSweepLine) || activeSweepLine.length < 2) continue;
         const sweepPath3d = build3DFlightPath(
           [activeSweepLine],
           tiles,
@@ -966,7 +972,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     }
 
     return { strips };
-  }, [altitude, isLidarPayload, mapRef, turnExtendUI]);
+  }, [altitude, isLidarPayload, mapRef]);
 
   const evaluatePartitionOptionExact = useCallback(async (
     polygonId: string,
@@ -982,7 +988,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
     const altitudeMode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : altitudeModeUI;
     const minClearance = (api as any)?.getMinClearance ? (api as any).getMinClearance() : minClearanceUI;
-    const turnExtend = (api as any)?.getTurnExtend ? Math.max(0, (api as any).getTurnExtend()) : turnExtendUI;
     const refinedSolution = api?.refineTerrainPartitionPreview
       ? await api.refineTerrainPartitionPreview(polygonId, solution)
       : solution;
@@ -1108,23 +1113,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       const strips: LidarStripMeters[] = [];
       let passIndex = 0;
 
-      for (const region of virtualPolygons) {
-        const { flightLines, sweepIndices } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
-        const sweeps = groupFlightLinesForTraversal(flightLines, lineSpacing, sweepIndices);
-        for (let lineIndex = 0; lineIndex < sweeps.length; lineIndex++) {
-          const sweep = sweeps[lineIndex];
-          const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
-          const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
-          const firstFragment = orientedFragments[0];
-          const lastFragment = orientedFragments[orientedFragments.length - 1];
-          if (!Array.isArray(firstFragment) || firstFragment.length < 2 || !Array.isArray(lastFragment) || lastFragment.length < 2) continue;
-          const activeSweepLine = [
-            extendFlightLineForTurnRunout(firstFragment, turnExtend)[0],
-            ...orientedFragments.flatMap((fragment, fragmentIndex) => (
-              fragmentIndex === 0 ? fragment : fragment.slice(1)
-            )),
-            extendFlightLineForTurnRunout(lastFragment, turnExtend).slice(-1)[0],
-          ];
+    for (const region of virtualPolygons) {
+      const geometry = generatePlannedFlightGeometryForPolygon(region.ring, region.bearingDeg, lineSpacing, params);
+        for (let lineIndex = 0; lineIndex < geometry.sweepLines.length; lineIndex++) {
+          const activeSweepLine = geometry.sweepLines[lineIndex];
+          if (!Array.isArray(activeSweepLine) || activeSweepLine.length < 2) continue;
           const sweepPath3d = build3DFlightPath(
             [activeSweepLine],
             parentTiles,
@@ -1220,13 +1213,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     let poseId = 0;
 
     for (const region of virtualPolygons) {
-      const { flightLines, sweepIndices } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
+      const geometry = generatePlannedFlightGeometryForPolygon(region.ring, region.bearingDeg, lineSpacing, params);
       const path3d = build3DFlightPath(
-        flightLines,
+        geometry,
         parentTiles,
         lineSpacing,
-        { altitudeAGL, mode: altitudeMode, minClearance, turnExtendM: turnExtend },
-        sweepIndices,
+        { altitudeAGL, mode: altitudeMode, minClearance, preconnected: true },
       );
       const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false });
       const filtered = region.ring.length >= 3

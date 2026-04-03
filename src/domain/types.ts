@@ -85,6 +85,32 @@ export interface FlightLines {
   lines: LngLat[][];   // array of flight lines (each line is an array of LngLat points)
 }
 
+export interface PlannedTurnBlock {
+  startSweep: LngLat;
+  endSweep: LngLat;
+  turnOff: LngLat;
+  loiterCenter: LngLat;
+  nextSweepStart: LngLat;
+  loiterRadiusM: number;
+  loiterDirection: 1 | -1;
+  turnOffAcceptanceRadiusM: number;
+  loiterEntryPoint?: LngLat;
+  loiterExitPoint?: LngLat;
+}
+
+export interface PlannedFlightGeometry {
+  lineSpacing: number;
+  flightLines: LngLat[][]; // raw clipped sweep fragments kept for backward compatibility
+  sweepIndices: number[];
+  sweepLines: LngLat[][]; // ordered per-sweep lines after fragment grouping/merging
+  gridPoints: LngLat[];
+  leadInPoints: LngLat[];
+  leadOutPoints: LngLat[];
+  connectedLines: LngLat[][]; // sweep/turn segments in flown order
+  turnaroundRadiusM: number;
+  turnBlocks: PlannedTurnBlock[];
+}
+
 export interface PolygonAnalysisResult {
   polygonId: string;
   ring: LngLat[];

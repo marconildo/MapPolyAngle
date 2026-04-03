@@ -5,7 +5,8 @@
 
 import type { Map as MapboxMap } from 'mapbox-gl';
 import type {
-  FlightParams
+  FlightParams,
+  PlannedFlightGeometry,
 } from '@/domain/types';
 import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { PolygonAnalysisResult } from './types';
@@ -71,12 +72,7 @@ export interface MapFlightDirectionAPI {
   applyPolygonParams(polygonId: string, params: FlightParams): void;
   applyPolygonParamsBatch(updates: Array<{ polygonId: string; params: FlightParams }>): void;
   applyParamsToAllPending(params: FlightParams): void; // bulk apply same params to queued polygons
-  getFlightLines(): Map<string, {
-    flightLines: number[][][];
-    sweepIndices?: number[];
-    lineSpacing: number;
-    altitudeAGL: number
-  }>;
+  getFlightLines(): Map<string, PlannedFlightGeometry & { altitudeAGL: number }>;
   getPerPolygonParams(): Record<string, FlightParams>;
 
   // Altitude strategy and clearance controls

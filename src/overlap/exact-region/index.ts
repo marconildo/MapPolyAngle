@@ -1,8 +1,8 @@
 import { DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, forwardSpacingRotated, lineSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
 import type { FlightParams, TerrainTile } from "@/domain/types";
-import { build3DFlightPath, calculateOptimalTerrainZoom, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
-import { generateFlightLinesForPolygon } from "@/flight/flightLines";
+import { build3DFlightPath, calculateOptimalTerrainZoom, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
+import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
 import type {
   ExactCameraTileInput,
   ExactCameraTileOutput,
@@ -330,10 +330,9 @@ function estimateMissionBreakdown(
   params: FlightParams,
   altitudeMode: "legacy" | "min-clearance",
   minClearanceM: number,
-  turnExtendM: number,
 ) {
-  const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
-  if (!flightLines.length) {
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacing, params);
+  if (!geometry.flightLines.length) {
     return {
       missionTimeSec: 0,
       totalLengthM: 0,
@@ -344,11 +343,10 @@ function estimateMissionBreakdown(
     };
   }
   const path3d = build3DFlightPath(
-    flightLines,
+    geometry,
     terrainTiles,
     lineSpacing,
-    { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-    sweepIndices,
+    { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
   );
   const totalLengthM = path3dLengthMeters(path3d);
   const speedMps = isLidarParams(params)
@@ -358,7 +356,7 @@ function estimateMissionBreakdown(
     missionTimeSec: totalLengthM / Math.max(0.1, speedMps),
     totalLengthM,
     speedMps,
-    lineCount: flightLines.length,
+    lineCount: geometry.sweepLines.length,
   };
 }
 
@@ -370,7 +368,6 @@ async function buildCameraPosesForBearing(
   geometryTiles: TerrainTile[],
   altitudeMode: "legacy" | "min-clearance",
   minClearanceM: number,
-  turnExtendM: number,
 ) {
   const lineSpacing = getLineSpacingForParams(params);
   const photoSpacing = getForwardSpacingForParams(params);
@@ -379,13 +376,12 @@ async function buildCameraPosesForBearing(
   }
   const yawOffset = params.cameraYawOffsetDeg ?? 0;
   const normalizeDeg = (value: number) => ((value % 360) + 360) % 360;
-  const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacing, params);
   const path3d = build3DFlightPath(
-    flightLines,
+    geometry,
     geometryTiles,
     lineSpacing,
-    { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-    sweepIndices,
+    { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
   );
   const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false });
   const filtered = ring.length >= 3
@@ -415,7 +411,6 @@ async function buildLidarStripsForBearing(
   geometryTiles: TerrainTile[],
   altitudeMode: "legacy" | "min-clearance",
   minClearanceM: number,
-  turnExtendM: number,
 ) {
   const lineSpacing = getLineSpacingForParams(params);
   const model = getLidarModel(params.lidarKey);
@@ -433,20 +428,11 @@ async function buildLidarStripsForBearing(
   const densityPerPass = lidarSinglePassDensity(model, altitudeAGL, speedMps, returnMode, mappingFovDeg);
   const halfFovTan = Math.tan((mappingFovDeg * Math.PI) / 360);
   const strips: LidarStripMeters[] = [];
-  const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
-  const sweeps = groupFlightLinesForTraversal(flightLines, lineSpacing, sweepIndices);
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacing, params);
+  const sweeps = geometry.sweepLines;
   let passIndex = 0;
-  for (const sweep of sweeps) {
-    const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
-    const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
-    const firstFragment = orientedFragments[0];
-    const lastFragment = orientedFragments[orientedFragments.length - 1];
-    if (!Array.isArray(firstFragment) || firstFragment.length < 2 || !Array.isArray(lastFragment) || lastFragment.length < 2) continue;
-    const activeSweepLine = [
-      extendFlightLineForTurnRunout(firstFragment, turnExtendM)[0],
-      ...orientedFragments.flatMap((fragment, fragmentIndex) => fragmentIndex === 0 ? fragment : fragment.slice(1)),
-      extendFlightLineForTurnRunout(lastFragment, turnExtendM).slice(-1)[0],
-    ];
+  for (const activeSweepLine of sweeps) {
+    if (!Array.isArray(activeSweepLine) || activeSweepLine.length < 2) continue;
     const sweepPath3d = build3DFlightPath(
       [activeSweepLine],
       geometryTiles,
@@ -527,16 +513,15 @@ export async function evaluateRegionBearingExact(
   }
 
   if (isLidarParams(safeParams)) {
-    const { strips } = await buildLidarStripsForBearing(
-      args.scopeId,
-      args.ring,
-      safeParams,
-      normalizedBearingDeg,
-      geometryTiles,
-      args.altitudeMode,
-      args.minClearanceM,
-      args.turnExtendM,
-    );
+      const { strips } = await buildLidarStripsForBearing(
+        args.scopeId,
+        args.ring,
+        safeParams,
+        normalizedBearingDeg,
+        geometryTiles,
+        args.altitudeMode,
+        args.minClearanceM,
+      );
     if (!strips.length) return null;
     const tileMapWithHalo = await runtime.terrainProvider.getTerrainTilesWithHalo(tileRefs, 1);
     const perTileStats: GSDStats[] = [];
@@ -566,7 +551,6 @@ export async function evaluateRegionBearingExact(
       safeParams,
       args.altitudeMode,
       args.minClearanceM,
-      args.turnExtendM,
     );
     const normalizedTimeCost = mission.missionTimeSec / 180;
     const costBreakdown = buildExactCostBreakdown(
@@ -616,7 +600,6 @@ export async function evaluateRegionBearingExact(
     geometryTiles,
     args.altitudeMode,
     args.minClearanceM,
-    args.turnExtendM,
   );
   if (!poses.length) return null;
   const camera = getCameraForParams(safeParams);
@@ -651,7 +634,6 @@ export async function evaluateRegionBearingExact(
     safeParams,
     args.altitudeMode,
     args.minClearanceM,
-    args.turnExtendM,
   );
   const normalizedTimeCost = mission.missionTimeSec / 180;
   const costBreakdown = buildExactCostBreakdown(
@@ -842,20 +824,10 @@ export async function evaluatePartitionSolutionExact(
     let passIndex = 0;
 
     for (const region of virtualPolygons) {
-      const { flightLines, sweepIndices } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
-      const sweeps = groupFlightLinesForTraversal(flightLines, lineSpacing, sweepIndices);
-      for (let lineIndex = 0; lineIndex < sweeps.length; lineIndex++) {
-        const sweep = sweeps[lineIndex];
-        const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
-        const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
-        const firstFragment = orientedFragments[0];
-        const lastFragment = orientedFragments[orientedFragments.length - 1];
-        if (!Array.isArray(firstFragment) || firstFragment.length < 2 || !Array.isArray(lastFragment) || lastFragment.length < 2) continue;
-        const activeSweepLine = [
-          extendFlightLineForTurnRunout(firstFragment, args.turnExtendM)[0],
-          ...orientedFragments.flatMap((fragment, fragmentIndex) => fragmentIndex === 0 ? fragment : fragment.slice(1)),
-          extendFlightLineForTurnRunout(lastFragment, args.turnExtendM).slice(-1)[0],
-        ];
+      const geometry = generatePlannedFlightGeometryForPolygon(region.ring, region.bearingDeg, lineSpacing, params);
+      for (let lineIndex = 0; lineIndex < geometry.sweepLines.length; lineIndex++) {
+        const activeSweepLine = geometry.sweepLines[lineIndex];
+        if (!Array.isArray(activeSweepLine) || activeSweepLine.length < 2) continue;
         const sweepPath3d = build3DFlightPath(
           [activeSweepLine],
           geometryTiles,
@@ -951,13 +923,12 @@ export async function evaluatePartitionSolutionExact(
   const poses: PoseMeters[] = [];
   let poseId = 0;
   for (const region of virtualPolygons) {
-    const { flightLines, sweepIndices } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
+    const geometry = generatePlannedFlightGeometryForPolygon(region.ring, region.bearingDeg, lineSpacing, params);
     const path3d = build3DFlightPath(
-      flightLines,
+      geometry,
       geometryTiles,
       lineSpacing,
-      { altitudeAGL, mode: args.altitudeMode, minClearance: args.minClearanceM, turnExtendM: args.turnExtendM },
-      sweepIndices,
+      { altitudeAGL, mode: args.altitudeMode, minClearance: args.minClearanceM, preconnected: true },
     );
     const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing ?? 0, { includeTurns: false });
     const filtered = region.ring.length >= 3
@@ -1053,7 +1024,6 @@ function scoreLidarPartitionPreview(
   const relativeTimePenalty = fastestMissionTimeSec > 0
     ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
     : 0;
-  const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.035;
   const breakdown = buildScoreBreakdown(
     "lidar-partition-v1",
     {
@@ -1104,7 +1074,6 @@ function scoreCameraPartitionPreview(
   const relativeTimePenalty = fastestMissionTimeSec > 0
     ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
     : 0;
-  const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.12;
   const breakdown = buildScoreBreakdown(
     "camera-partition-v1",
     {
@@ -1261,7 +1230,6 @@ export async function rerankPartitionSolutionsExact(
   },
 ): Promise<ExactPartitionRerankResult> {
   if (args.solutions.length === 0) return { bestIndex: 0, solutions: [], previewsBySignature: {} };
-  const rankingSource = args.rankingSource ?? "frontend-exact";
   const fastestMissionTimeSec = args.solutions.reduce(
     (best, solution) => Math.min(best, solution.totalMissionTimeSec),
     Number.POSITIVE_INFINITY,
