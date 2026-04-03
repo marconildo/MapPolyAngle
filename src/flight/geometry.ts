@@ -501,9 +501,93 @@ export function build3DFlightPath(
   const homeAltitude = usingLegacySig ? undefined : ((opts as any).homeAltitude as number | undefined);
   const turnExtendM = usingLegacySig ? 0 : Math.max(0, (opts as any).turnExtendM ?? 0);
   const preconnected = usingGeometryInput || (!usingLegacySig && Boolean((opts as any).preconnected));
+  const pointElevationWgs84Cache = new Map<string, number>();
+  const polylineElevationExtremaCache = new WeakMap<readonly [number, number][], Map<number, { min: number; max: number }>>();
+  const segmentElevationMaxCache = new Map<string, number>();
+
+  const getPointElevationWGS84 = (lng: number, lat: number) => {
+    const key = `${lng},${lat}`;
+    if (pointElevationWgs84Cache.has(key)) {
+      return pointElevationWgs84Cache.get(key)!;
+    }
+    const elevationEGM96 = queryElevationAtPoint(lng, lat, tiles);
+    const elevationWGS84 = Number.isFinite(elevationEGM96) ? convertElevationToWGS84(lat, lng, elevationEGM96) : NaN;
+    pointElevationWgs84Cache.set(key, elevationWGS84);
+    return elevationWGS84;
+  };
+
+  const getPolylineElevationExtrema = (
+    line: [number, number][],
+    samplesPerSegment: number,
+  ): { min: number; max: number } => {
+    let samplesCache = polylineElevationExtremaCache.get(line);
+    if (!samplesCache) {
+      samplesCache = new Map<number, { min: number; max: number }>();
+      polylineElevationExtremaCache.set(line, samplesCache);
+    }
+    const cached = samplesCache.get(samplesPerSegment);
+    if (cached) return cached;
+
+    let minElev = +Infinity;
+    let maxElev = -Infinity;
+    if (Array.isArray(line) && line.length > 0) {
+      for (let i = 0; i < line.length - 1; i++) {
+        const [startLng, startLat] = line[i];
+        const [endLng, endLat] = line[i + 1];
+        for (let s = 0; s <= samplesPerSegment; s++) {
+          const t = s / samplesPerSegment;
+          const lng = startLng + t * (endLng - startLng);
+          const lat = startLat + t * (endLat - startLat);
+          const elevW = getPointElevationWGS84(lng, lat);
+          if (!Number.isFinite(elevW)) continue;
+          if (elevW < minElev) minElev = elevW;
+          if (elevW > maxElev) maxElev = elevW;
+        }
+      }
+
+      for (const [lng, lat] of line) {
+        const elevW = getPointElevationWGS84(lng, lat);
+        if (!Number.isFinite(elevW)) continue;
+        if (elevW < minElev) minElev = elevW;
+        if (elevW > maxElev) maxElev = elevW;
+      }
+    }
+
+    const result = { min: minElev, max: maxElev };
+    samplesCache.set(samplesPerSegment, result);
+    return result;
+  };
+
+  const getMaxElevationAlongLineCached = (
+    startLng: number,
+    startLat: number,
+    endLng: number,
+    endLat: number,
+    samples: number,
+  ) => {
+    const key = `${startLng},${startLat}|${endLng},${endLat}|${samples}`;
+    if (segmentElevationMaxCache.has(key)) {
+      return segmentElevationMaxCache.get(key)!;
+    }
+
+    let maxElevationWGS84 = -Infinity;
+    for (let i = 0; i <= samples; i++) {
+      const t = i / samples;
+      const lng = startLng + t * (endLng - startLng);
+      const lat = startLat + t * (endLat - startLat);
+      const elevationWGS84 = getPointElevationWGS84(lng, lat);
+      if (Number.isFinite(elevationWGS84)) {
+        maxElevationWGS84 = Math.max(maxElevationWGS84, elevationWGS84);
+      }
+    }
+
+    const result = Number.isFinite(maxElevationWGS84) ? maxElevationWGS84 : -Infinity;
+    segmentElevationMaxCache.set(key, result);
+    return result;
+  };
 
   const computeLineAltitude = (mergedLine: [number, number][]) => {
-    const { min: lineMinElev, max: lineMaxElev } = queryMinMaxElevationAlongPolylineWGS84(mergedLine as any, tiles, 20);
+    const { min: lineMinElev, max: lineMaxElev } = getPolylineElevationExtrema(mergedLine, 20);
     let extendedMax = lineMaxElev;
     if (!usingLegacySig && (opts as any).turnExtendM && (opts as any).turnExtendM > 0 && mergedLine.length >= 2) {
       const te = Math.max(0, (opts as any).turnExtendM as number);
@@ -513,8 +597,8 @@ export function build3DFlightPath(
       const sweepBrg = geoBearing([L0[0], L0[1]], [L1[0], L1[1]]);
       const startExt = geoDestination([L0[0], L0[1]], (sweepBrg + 180) % 360, te);
       const endExt = geoDestination([LN[0], LN[1]], sweepBrg, te);
-      const startMax = queryMaxElevationAlongLineWGS84(startExt[0], startExt[1], L0[0], L0[1], tiles, 20);
-      const endMax = queryMaxElevationAlongLineWGS84(LN[0], LN[1], endExt[0], endExt[1], tiles, 20);
+      const startMax = getMaxElevationAlongLineCached(startExt[0], startExt[1], L0[0], L0[1], 20);
+      const endMax = getMaxElevationAlongLineCached(LN[0], LN[1], endExt[0], endExt[1], 20);
       if (Number.isFinite(startMax)) extendedMax = Math.max(extendedMax, startMax);
       if (Number.isFinite(endMax)) extendedMax = Math.max(extendedMax, endMax);
     }
@@ -571,13 +655,13 @@ export function build3DFlightPath(
     return reversed ? lifted.reverse() : lifted;
   };
 
-  const getLineMaxElevation = (line: [number, number][]) => queryMinMaxElevationAlongPolylineWGS84(line, tiles, 20).max;
+  const getLineMaxElevation = (line: [number, number][]) => getPolylineElevationExtrema(line, 20).max;
 
   const calculateSweepAltitudeWithAdjacentTurnarounds = (
     sweepLine: [number, number][],
     adjacentLines: [number, number][][],
   ) => {
-    const { min: sweepMinElevation, max: sweepMaxElevation } = queryMinMaxElevationAlongPolylineWGS84(sweepLine, tiles, 20);
+    const { min: sweepMinElevation, max: sweepMaxElevation } = getPolylineElevationExtrema(sweepLine, 20);
     const adjacentMaxElevation = adjacentLines.reduce((maxElevation, line) => {
       if (!Array.isArray(line) || line.length < 2) return maxElevation;
       return Math.max(maxElevation, getLineMaxElevation(line));
@@ -602,13 +686,26 @@ export function build3DFlightPath(
     endAltitude: number,
   ) => {
     const interpolatedAltitude = startAltitude + (endAltitude - startAltitude) * interpolationRatio;
-    const terrainElevationEGM96 = queryElevationAtPoint(point[0], point[1], tiles);
-    if (!Number.isFinite(terrainElevationEGM96)) return interpolatedAltitude;
-
-    const terrainElevationWGS84 = convertElevationToWGS84(point[1], point[0], terrainElevationEGM96);
+    const terrainElevationWGS84 = getPointElevationWGS84(point[0], point[1]);
+    if (!Number.isFinite(terrainElevationWGS84)) return interpolatedAltitude;
     const clearanceMargin = mode === 'legacy' ? altitudeAGL : minClearance;
     return Math.max(interpolatedAltitude, terrainElevationWGS84 + clearanceMargin);
   };
+
+  const liftConnectedSegments = (
+    connectedSegments: [number, number][][],
+    sweepAltitudes: number[],
+  ) =>
+    connectedSegments.map((segment, segmentIndex) => {
+      if (segmentIndex % 2 === 0) {
+        const sweepAltitude = sweepAltitudes[Math.floor(segmentIndex / 2)] ?? altitudeAGL;
+        return segment.map(([lng, lat]) => [lng, lat, sweepAltitude] as [number, number, number]);
+      }
+
+      const previousSweepAltitude = sweepAltitudes[Math.floor((segmentIndex - 1) / 2)] ?? altitudeAGL;
+      const nextSweepAltitude = sweepAltitudes[Math.floor((segmentIndex + 1) / 2)] ?? previousSweepAltitude;
+      return setLineAltitudeSmooth(segment as [number, number][], previousSweepAltitude, nextSweepAltitude);
+    });
 
   if (preconnected && geometryInput) {
     const connectedSegments = geometryInput.connectedLines
@@ -654,20 +751,17 @@ export function build3DFlightPath(
 
     const provisionalSweepAltitudes = calculateSweepAltitudes(connectedSegments);
     const expandedTurnaroundSegments = buildTurnaroundSegments(provisionalSweepAltitudes);
+    const turnaroundsChanged = expandedTurnaroundSegments.some(
+      (segment, segmentIndex) => segmentIndex % 2 === 1 && segment !== connectedSegments[segmentIndex],
+    );
+    if (!turnaroundsChanged) {
+      return liftConnectedSegments(connectedSegments, provisionalSweepAltitudes);
+    }
     const finalSweepAltitudes = calculateSweepAltitudes(expandedTurnaroundSegments);
     const finalConnectedSegments = buildTurnaroundSegments(finalSweepAltitudes);
     const resolvedSweepAltitudes = calculateSweepAltitudes(finalConnectedSegments);
 
-    return finalConnectedSegments.map((segment, segmentIndex) => {
-      if (segmentIndex % 2 === 0) {
-        const sweepAltitude = resolvedSweepAltitudes[Math.floor(segmentIndex / 2)] ?? altitudeAGL;
-        return segment.map(([lng, lat]) => [lng, lat, sweepAltitude] as [number, number, number]);
-      }
-
-      const previousSweepAltitude = resolvedSweepAltitudes[Math.floor((segmentIndex - 1) / 2)] ?? altitudeAGL;
-      const nextSweepAltitude = resolvedSweepAltitudes[Math.floor((segmentIndex + 1) / 2)] ?? previousSweepAltitude;
-      return setLineAltitudeSmooth(segment as [number, number][], previousSweepAltitude, nextSweepAltitude);
-    });
+    return liftConnectedSegments(finalConnectedSegments, resolvedSweepAltitudes);
   }
 
   if (preconnected) {
