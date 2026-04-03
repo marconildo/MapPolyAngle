@@ -22,6 +22,7 @@ export interface CameraModel {
 }
 
 export type PayloadKind = 'camera' | 'lidar';
+export type PlaneHardwareVersion = '4' | '5';
 export type LidarReturnMode = 'single' | 'dual' | 'triple';
 export type LidarComparisonMode = 'first-return' | 'all-returns';
 
@@ -49,6 +50,7 @@ export interface LidarModel {
 
 export interface FlightParams {
   payloadKind?: PayloadKind; // defaults to 'camera' for legacy polygons
+  planeHardwareVersion?: PlaneHardwareVersion; // WingtraOne(v4) vs WingtraRay(v5) for export compatibility
   altitudeAGL: number;  // altitude above ground level in meters
   frontOverlap: number; // front overlap percentage (0–95); 0 for lidar payloads
   sideOverlap: number;  // side overlap percentage (0–95)

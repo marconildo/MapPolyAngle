@@ -3,6 +3,9 @@ import type { BearingOverride, MapFlightDirectionAPI } from '@/components/MapFli
 import type { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Map, Trash2, AlertCircle, Upload, Download } from 'lucide-react';
@@ -64,6 +67,33 @@ function DeferredMapFallback() {
   );
 }
 
+function downloadFlightplanBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url);
+    anchor.remove();
+  }, 1000);
+}
+
+function stripFlightplanExtension(filename: string | undefined): string {
+  if (!filename) return 'exported';
+  return filename.replace(/\.flightplan$/i, '') || 'exported';
+}
+
+function normalizeFlightplanFilename(name: string | undefined): string {
+  const base = (name ?? '')
+    .trim()
+    .replace(/\.flightplan$/i, '')
+    .replace(/[\\/:"*?<>|]+/g, '-')
+    .replace(/\s+/g, ' ');
+  return `${base.length > 0 ? base : 'exported'}.flightplan`;
+}
+
 export default function Home() {
   const isMobile = useIsMobile();
   const imageryOverlayImportEnabled = false;
@@ -93,6 +123,8 @@ export default function Home() {
     phase: 'uploading' | 'applying';
     targetKey: string | null;
   }>(null);
+  const [exportNameDialogOpen, setExportNameDialogOpen] = useState(false);
+  const [exportNameDraft, setExportNameDraft] = useState('exported');
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
   const [clearAllEpoch, setClearAllEpoch] = useState(0);
@@ -479,7 +511,12 @@ export default function Home() {
     } finally {
       if (dsmInputRef.current) dsmInputRef.current.value = '';
     }
-  }, [fitMapToGeoTiffDescriptor, terrainSourceState.source.datasetId, terrainSourceState.source.mode]);
+  }, [
+    fitMapToGeoTiffDescriptor,
+    scheduleTerrainSourceReapplyAfterViewportSettle,
+    terrainSourceState.source.datasetId,
+    terrainSourceState.source.mode,
+  ]);
 
   const handleApplyRememberedTerrainSource = useCallback(async () => {
     const rememberedDescriptor = terrainSourceState.rememberedDescriptor;
@@ -560,17 +597,31 @@ export default function Home() {
     return `${value >= 100 || unitIdx === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIdx]}`;
   }, []);
 
-  // helper to export Wingtra flight plan
   const handleExportWingtra = useCallback(() => {
-    const api = mapRef.current; if (!api?.exportWingtraFlightPlan) return;
-    const { blob } = api.exportWingtraFlightPlan();
-    const original = api.getLastImportedFlightplanName?.();
-    const fn = (original && /\.flightplan$/.test(original)) ? original.replace(/\.flightplan$/, '-exported.flightplan') : 'exported.flightplan';
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = fn; document.body.appendChild(a); a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+    const api = mapRef.current;
+    if (!api?.exportWingtraFlightPlan) return;
+
+    const suggestedName = stripFlightplanExtension(api.getLastImportedFlightplanName?.());
+    setExportNameDraft(suggestedName);
+    setExportNameDialogOpen(true);
   }, []);
+
+  const handleConfirmWingtraExport = useCallback(() => {
+    const api = mapRef.current;
+    if (!api?.exportWingtraFlightPlan) return;
+
+    try {
+      const { blob } = api.exportWingtraFlightPlan();
+      downloadFlightplanBlob(blob, normalizeFlightplanFilename(exportNameDraft));
+      setExportNameDialogOpen(false);
+    } catch (error) {
+      toast({
+        variant: 'destructive',
+        title: 'Export failed',
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [exportNameDraft]);
 
   if (!mapboxToken) {
     return (
@@ -721,6 +772,40 @@ export default function Home() {
           </div>
         )}
 
+        <Dialog open={exportNameDialogOpen} onOpenChange={setExportNameDialogOpen}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Export Wingtra Flightplan</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-2">
+              <Label htmlFor="flightplan-export-name">Flightplan name</Label>
+              <Input
+                id="flightplan-export-name"
+                value={exportNameDraft}
+                onChange={(event) => setExportNameDraft(event.target.value)}
+                placeholder="exported"
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    handleConfirmWingtraExport();
+                  }
+                }}
+              />
+              <div className="text-xs text-slate-500">
+                Saved as <span className="font-mono">{normalizeFlightplanFilename(exportNameDraft)}</span>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setExportNameDialogOpen(false)}>
+                Cancel
+              </Button>
+              <Button onClick={handleConfirmWingtraExport}>
+                Export
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         <input
           ref={dsmInputRef}
           type="file"
@@ -758,6 +843,7 @@ export default function Home() {
           }}
           defaults={{
             payloadKind: current.payloadKind ?? 'camera',
+            planeHardwareVersion: current.planeHardwareVersion,
             altitudeAGL: current.altitudeAGL ?? 100,
             frontOverlap: current.frontOverlap ?? ((current.payloadKind ?? 'camera') === 'lidar' ? 0 : 70),
             sideOverlap: current.sideOverlap ?? 70,

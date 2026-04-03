@@ -30,7 +30,7 @@ import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, calculateGSD, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from '@/domain/lidar';
 import type { PlannedFlightGeometry } from '@/domain/types';
-import type { BearingOverride, MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview } from './api';
+import type { BearingOverride, MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview, WingtraFreshExportConfig } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
 import { buildPartitionFrontier } from '@/utils/terrainPartitionGraph';
@@ -47,7 +47,13 @@ import * as turf from '@turf/turf';
 
 // NEW: Wingtra import helpers
 import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
-import { exportToWingtraFlightPlan, areasFromState } from '@/interop/wingtra/convert';
+import {
+  exportToWingtraFlightPlan,
+  replaceAreaItemsInWingtraFlightPlan,
+  areasFromState,
+  isWingtraFlightPlanTemplateExportReady,
+  resolveFreshWingtraExportPayloadOptionFromAreas,
+} from '@/interop/wingtra/convert';
 import { shouldApplyAsyncPolygonUpdate, shouldRunAsyncGeneration } from '@/state/asyncUpdateGuard';
 import { shouldConsumeClearAllEpoch } from '@/state/clearAllState';
 
@@ -1793,6 +1799,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const payloadKind = item.payloadKind ?? imported.payloadKind ?? DEFAULT_PAYLOAD_KIND;
           const lidarKey = item.lidarKey || imported.payloadLidarKey || DEFAULT_LIDAR.key;
           const cameraKey = item.cameraKey || imported.payloadCameraKey || 'SONY_RX1R2';
+          const planeHardwareVersion = item.planeHardwareVersion ?? imported.planeHardwareVersion;
           let cameraYawOffsetDeg = 0;
 
           if (payloadKind === 'camera') {
@@ -1811,6 +1818,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const polygonState = {
             params: {
               payloadKind,
+              planeHardwareVersion,
               altitudeAGL: item.altitudeAGL,
               frontOverlap: item.frontOverlap,
               sideOverlap: item.sideOverlap,
@@ -1837,6 +1845,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             item.lineSpacingM,
             {
               payloadKind,
+              planeHardwareVersion,
               altitudeAGL: item.altitudeAGL,
               frontOverlap: item.frontOverlap,
               sideOverlap: item.sideOverlap,
@@ -1856,6 +1865,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             polygonId: id,
             params: {
               payloadKind,
+              planeHardwareVersion,
               altitudeAGL: item.altitudeAGL,
               frontOverlap: item.frontOverlap,
               sideOverlap: item.sideOverlap,
@@ -2757,6 +2767,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       bearingOverridesRef.current = new Map();
       setImportedOriginals(new Map());
       importedOriginalsRef.current = new Map();
+      setLastImportedFlightplan(null);
+      lastImportedFlightplanNameRef.current = undefined;
       setPendingParamPolygons([]);
       pendingOptimizeRef.current.clear();
       pendingProgrammaticDeletesRef.current.clear();
@@ -2878,7 +2890,8 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 	      getBearingOverrides: () => Object.fromEntries(bearingOverridesRef.current),
 	      getImportedOriginals: () => Object.fromEntries(importedOriginalsRef.current),
 	      getLastImportedFlightplanName: () => lastImportedFlightplanNameRef.current,
-	      exportWingtraFlightPlan: () => {
+	      canExportWingtraFlightPlanDirectly: () => isWingtraFlightPlanTemplateExportReady(lastImportedFlightplan),
+	      exportWingtraFlightPlan: (config?: WingtraFreshExportConfig) => {
         // Build area list from current state
         const polys: Array<{ ring:[number,number][]; params: PolygonParams; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
         polygonParams.forEach((params, pid) => {
@@ -2893,14 +2906,44 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           polys.push({ ring: ring as any, params, bearingDeg, lineSpacingM, triggerDistanceM: params.triggerDistanceM });
         });
         const areas = areasFromState(polys);
-        const payloadKind = areas[0]?.payloadKind ?? 'camera';
+        if (areas.length === 0) {
+          throw new Error('Draw or import at least one area before exporting a Wingtra flightplan.');
+        }
+        const payloadKind = config?.payloadKind ?? areas[0]?.payloadKind ?? 'camera';
+        const resolvedPayloadOption =
+          config?.payloadUniqueString
+            ? {
+                payloadKind: config.payloadKind,
+                payloadUniqueString: config.payloadUniqueString,
+                payloadName: config.payloadName ?? config.payloadUniqueString,
+              }
+            : resolveFreshWingtraExportPayloadOptionFromAreas(areas);
+        if (!resolvedPayloadOption) {
+          throw new Error(
+            'Wingtra export requires all current areas to use the same analysis payload and a compatible drone version.',
+          );
+        }
+        const canUseImportedTemplate = isWingtraFlightPlanTemplateExportReady(lastImportedFlightplan);
         let fp;
-        if (lastImportedFlightplan) {
+        if (canUseImportedTemplate) {
           // Deep clone original
             fp = JSON.parse(JSON.stringify(lastImportedFlightplan));
-          // Replace flightPlan.items only (preserve metadata/stats; some tools may recalc them)
-          fp.flightPlan.items = exportToWingtraFlightPlan(areas, { payloadKind }).flightPlan.items;
-          // Optionally update payload fields if camera changed (skipped for now)
+          // Replace only area items and preserve non-area mission items like takeoff, loiter, and landing.
+          fp = replaceAreaItemsInWingtraFlightPlan(fp, areas, {
+            payloadKind,
+            payloadUniqueString: resolvedPayloadOption.payloadUniqueString,
+            payloadName: resolvedPayloadOption.payloadName,
+          });
+          fp.flightPlan.payload = resolvedPayloadOption.payloadName;
+          fp.flightPlan.payloadUniqueString = resolvedPayloadOption.payloadUniqueString;
+          const hwVersion =
+            resolvedPayloadOption.payloadUniqueString.endsWith('_v4') ? '4' : '5';
+          fp.flightPlan.planeHardware = {
+            ...(typeof fp.flightPlan.planeHardware === 'object' && fp.flightPlan.planeHardware ? fp.flightPlan.planeHardware : {}),
+            hwVersion,
+            displayName: hwVersion === '5' ? 'WingtraRay (any)' : 'WingtraOne (any)',
+            isGenericPlane: true,
+          };
           // Reset derived stats that may be stale
           fp.flightPlan.numberOfImages = 0;
           fp.flightPlan.totalArea = 0;
@@ -2911,7 +2954,11 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           fp.flightPlan.resumeGridPointIndex = -1;
           fp.flightPlan.lastModifiedTime = Date.now();
         } else {
-          fp = exportToWingtraFlightPlan(areas, { payloadKind });
+          fp = exportToWingtraFlightPlan(areas, {
+            payloadKind,
+            payloadUniqueString: resolvedPayloadOption.payloadUniqueString,
+            payloadName: resolvedPayloadOption.payloadName,
+          });
         }
         const json = JSON.stringify(fp, null, 2);
         const blob = new Blob([json], { type: 'application/json' });

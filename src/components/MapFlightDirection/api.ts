@@ -7,6 +7,7 @@ import type { Map as MapboxMap } from 'mapbox-gl';
 import type {
   FlightParams,
   PlannedFlightGeometry,
+  PayloadKind,
 } from '@/domain/types';
 import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { PolygonAnalysisResult } from './types';
@@ -34,6 +35,12 @@ export interface ImportedFlightplanArea {
     triggerDistanceM: number;
     source: 'wingtra';
   };
+}
+
+export interface WingtraFreshExportConfig {
+  payloadKind: PayloadKind;
+  payloadUniqueString: string;
+  payloadName?: string;
 }
 
 export interface MapFlightDirectionAPI {
@@ -102,7 +109,8 @@ export interface MapFlightDirectionAPI {
   getBearingOverrides(): Record<string, BearingOverride>;
   getImportedOriginals(): Record<string, { bearingDeg: number; lineSpacingM: number }>;
   getLastImportedFlightplanName(): string | undefined;
+  canExportWingtraFlightPlanDirectly(): boolean;
 
   // Export current (possibly optimized/edited) plan as Wingtra .flightplan JSON
-  exportWingtraFlightPlan(): { json: string; blob: Blob };
+  exportWingtraFlightPlan(config?: WingtraFreshExportConfig): { json: string; blob: Blob };
 }
