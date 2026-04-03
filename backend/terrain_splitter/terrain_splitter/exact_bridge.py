@@ -80,6 +80,7 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
         self._repo_root = repo_root
         self._candidate_max_inflight = _resolve_exact_candidate_max_inflight()
         self._states_lock = threading.Lock()
+        self._build_lock = threading.Lock()
         self._default_state = _LocalSidecarState()
         self._batch_states: dict[object, dict[int, _LocalSidecarState]] = {}
         atexit.register(self.close)
@@ -116,11 +117,35 @@ class LocalExactRuntimeSidecarBridge(ExactRuntimeBridge):
                 batch_states[thread_id] = state
         return state
 
+    def _ensure_local_exact_runtime_worker_bundle(self, env: dict[str, str]) -> None:
+        worker_bundle_path = self._repo_root / "backend" / "terrain_splitter" / "exact-runtime" / "tileWorker.node.mjs"
+        if worker_bundle_path.exists():
+            env.setdefault("EXACT_RUNTIME_TILE_WORKER_PATH", str(worker_bundle_path))
+            return
+
+        with self._build_lock:
+            if not worker_bundle_path.exists():
+                build = subprocess.run(
+                    ["node", "scripts/build-exact-runtime.mjs"],
+                    cwd=self._repo_root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if build.returncode != 0:
+                    stderr = build.stderr.strip()
+                    stdout = build.stdout.strip()
+                    details = stderr or stdout or "unknown build failure"
+                    raise RuntimeError(f"Failed to build exact runtime worker bundle: {details}")
+            env.setdefault("EXACT_RUNTIME_TILE_WORKER_PATH", str(worker_bundle_path))
+
     def _spawn(self, state: _LocalSidecarState) -> subprocess.Popen[str]:
         env = os.environ.copy()
         env.setdefault("EXACT_RUNTIME_PROVIDER_MODE", "local-http")
         env.setdefault("EXACT_RUNTIME_INTERNAL_BASE_URL", os.environ.get("TERRAIN_SPLITTER_INTERNAL_BASE_URL", "http://127.0.0.1:8090"))
         env.setdefault("NODE_NO_WARNINGS", "1")
+        self._ensure_local_exact_runtime_worker_bundle(env)
         tsx_bin = self._repo_root / "node_modules" / ".bin" / "tsx"
         if tsx_bin.exists():
             command = [str(tsx_bin), "src/overlap/exact-runtime/sidecar.ts"]
