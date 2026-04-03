@@ -2938,7 +2938,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                             }}
                             title="Delete polygon"
                           >
-                            Delete area
+                            Delete
                           </Button>
                         )}
                       </div>
