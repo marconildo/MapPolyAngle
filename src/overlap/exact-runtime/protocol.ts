@@ -47,7 +47,7 @@ export type ExactRuntimeCommonRequest = {
   ring: [number, number][];
   altitudeMode: "legacy" | "min-clearance";
   minClearanceM: number;
-  turnExtendM: number;
+  turnExtendM: number; // deprecated compatibility field; shared survey geometry ignores it
   exactOptimizeZoom?: number;
   clipInnerBufferM?: number;
   minOverlapForGsd?: number;

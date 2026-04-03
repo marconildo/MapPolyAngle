@@ -71,6 +71,7 @@ logger = logging.getLogger("uvicorn.error")
 _LAMBDA_CLIENT: Any | None = None
 _LAMBDA_CLIENT_MAX_POOL_CONNECTIONS = 0
 _LAMBDA_CLIENT_READ_TIMEOUT_SEC = 0
+MAX_PERF_HOTSPOTS = 8
 
 
 @dataclass(slots=True)
@@ -220,6 +221,55 @@ def _make_perf() -> defaultdict[str, float]:
 def _merge_perf(target: dict[str, float], source: dict[str, float]) -> None:
     for key, value in source.items():
         target[key] += value
+
+
+def _perf_hotspot_summary(
+    entries: list[dict[str, Any]] | None,
+    *,
+    label_key: str,
+    limit: int = 4,
+) -> str:
+    if not entries:
+        return "none"
+    parts: list[str] = []
+    for entry in entries[:limit]:
+        label = entry.get(label_key, "<unknown>")
+        elapsed_ms = float(entry.get("elapsedMs", 0.0) or 0.0)
+        cell_count = int(entry.get("cellCount", 0) or 0)
+        candidate_count = int(entry.get("candidateBearingCount", 0) or 0)
+        parts.append(
+            f"{label}@{elapsed_ms:.1f}ms cells={cell_count} bearings={candidate_count}"
+        )
+    return ", ".join(parts)
+
+
+def _record_perf_hotspot(
+    hotspots: dict[str, list[dict[str, Any]]] | None,
+    category: str,
+    entry: dict[str, Any],
+) -> None:
+    if hotspots is None:
+        return
+    bucket = hotspots.setdefault(category, [])
+    bucket.append(entry)
+    bucket.sort(key=lambda item: float(item.get("elapsedMs", 0.0) or 0.0), reverse=True)
+    del bucket[MAX_PERF_HOTSPOTS:]
+
+
+def _log_perf_hotspots(
+    request_id: str | None,
+    polygon_id: str | None,
+    hotspots: dict[str, list[dict[str, Any]]] | None,
+) -> None:
+    if not hotspots:
+        return
+    logger.info(
+        "[terrain-split-backend][%s] coarse profiling polygonId=%s buildRegion=%s objective=%s",
+        request_id or "<none>",
+        polygon_id or "<none>",
+        _perf_hotspot_summary(hotspots.get("buildRegion"), label_key="regionSignature"),
+        _perf_hotspot_summary(hotspots.get("objective"), label_key="regionSignature"),
+    )
 
 
 def _resolve_root_parallel_workers(requested: int | None) -> int:
@@ -692,6 +742,7 @@ def _populate_solver_debug_output(
     practical_plan_rejection_summary: dict[str, Any],
     practical_region_rejection_summary: dict[str, Any],
     relaxed_fallback: list[RelaxedFallbackCandidate] | None = None,
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     if debug_output is None:
         return
@@ -729,6 +780,7 @@ def _populate_solver_debug_output(
                     "defaultNestedLambdaMaxInflight": DEFAULT_NESTED_LAMBDA_MAX_INFLIGHT,
                 },
                 "performance": _rounded_debug_mapping(dict(perf)),
+                "performanceHotspots": perf_hotspots or {},
             },
             "rejectionDiagnostics": _rejection_debug_payload(
                 caches=caches,
@@ -1139,6 +1191,7 @@ def _solve_region_recursive_child(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
     *,
     allow_nested_lambda_fanout: bool,
 ) -> list[PartitionPlan]:
@@ -1150,6 +1203,7 @@ def _solve_region_recursive_child(
             context,
             caches,
             perf,
+            perf_hotspots,
             allow_nested_lambda_fanout=allow_nested_lambda_fanout,
         ) or []
     finally:
@@ -1373,6 +1427,7 @@ def _build_region(
     heading_candidates_cache: dict[tuple[int, ...], list[float]],
     polygon_cache: dict[tuple[int, ...], Polygon | None],
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
 ) -> EvaluatedRegion | None:
     cached_region = region_cache.get(cell_ids)
     if cached_region is not None or cell_ids in region_cache:
@@ -1390,6 +1445,7 @@ def _build_region(
     perf["build_region_calls"] += 1
     build_started_at = time.perf_counter()
     static_region = region_static_cache.get(cell_ids)
+    reused_static_region = static_region is not None or cell_ids in region_static_cache
     if static_region is not None or cell_ids in region_static_cache:
         perf["region_static_hits"] += 1
         if static_region is None:
@@ -1451,6 +1507,8 @@ def _build_region(
 
     best_objective: RegionObjective | None = None
     best_score = float("inf")
+    objective_elapsed_total_ms = 0.0
+    region_signature = hash_signature({"cellIds": list(cell_ids)})[:16]
     for bearing_deg in candidate_bearings:
         bearing_key = (cell_ids, _bearing_cache_key(bearing_deg))
         cached_core = region_bearing_core_cache.get(bearing_key)
@@ -1480,10 +1538,26 @@ def _build_region(
                 precomputed_static_inputs=static_region.static_inputs,
             )
             objective_elapsed_ms = (time.perf_counter() - objective_started_at) * 1000.0
+            objective_elapsed_total_ms += objective_elapsed_ms
             perf["objective_ms"] += objective_elapsed_ms
             perf["region_bearing_core_ms"] += objective_elapsed_ms
             score = _region_score(objective)
             region_bearing_core_cache[bearing_key] = RegionBearingCore(objective=objective, score=score)
+            _record_perf_hotspot(
+                perf_hotspots,
+                "objective",
+                {
+                    "regionSignature": region_signature,
+                    "elapsedMs": round(objective_elapsed_ms, 3),
+                    "cellCount": len(cell_ids),
+                    "candidateBearingCount": len(candidate_bearings),
+                    "bearingDeg": round(float(bearing_deg), 4),
+                    "areaM2": round(float(static_region.area_m2), 3),
+                    "flightLineCount": int(objective.flight_line_count),
+                    "missionTimeSec": round(float(objective.total_mission_time_sec), 3),
+                    "normalizedQualityCost": round(float(objective.normalized_quality_cost), 6),
+                },
+            )
             if abs(boundary_alignment) > 1e-9:
                 perf["region_bearing_rewraps"] += 1
                 objective = replace(objective, boundary_break_alignment=boundary_alignment)
@@ -1504,7 +1578,23 @@ def _build_region(
         score=best_score,
         hard_invalid=False,
     )
-    perf["build_region_ms"] += (time.perf_counter() - build_started_at) * 1000.0
+    build_region_elapsed_ms = (time.perf_counter() - build_started_at) * 1000.0
+    perf["build_region_ms"] += build_region_elapsed_ms
+    _record_perf_hotspot(
+        perf_hotspots,
+        "buildRegion",
+        {
+            "regionSignature": region_signature,
+            "elapsedMs": round(build_region_elapsed_ms, 3),
+            "cellCount": len(cell_ids),
+            "candidateBearingCount": len(candidate_bearings),
+            "areaM2": round(float(static_region.area_m2), 3),
+            "bestBearingDeg": round(float(best_objective.bearing_deg), 4),
+            "bestScore": round(float(best_score), 6),
+            "objectiveMs": round(objective_elapsed_total_ms, 3),
+            "reusedStaticRegion": bool(reused_static_region and static_region is not None),
+        },
+    )
     region_cache[cell_ids] = region
     return region
 
@@ -1827,6 +1917,7 @@ def _generate_split_candidates(
     basic_split_rejection_summary: dict[str, Any],
     line_length_scale: float,
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[SplitCandidate]:
     enumerate_started_at = time.perf_counter()
     try:
@@ -1885,6 +1976,7 @@ def _generate_split_candidates(
                     heading_candidates_cache,
                     polygon_cache,
                     perf,
+                    perf_hotspots,
                 )
                 right_region = _build_region(
                     right_ids,
@@ -1902,6 +1994,7 @@ def _generate_split_candidates(
                     heading_candidates_cache,
                     polygon_cache,
                     perf,
+                    perf_hotspots,
                 )
                 if left_region is None or right_region is None:
                     perf["split_region_build_rejections"] += 1
@@ -1963,6 +2056,7 @@ def _build_region_for_context(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
 ) -> EvaluatedRegion | None:
     return _build_region(
         cell_ids,
@@ -1980,6 +2074,7 @@ def _build_region_for_context(
         caches.heading_candidates_cache,
         caches.polygon_cache,
         perf,
+        perf_hotspots,
     )
 
 
@@ -1990,6 +2085,7 @@ def _generate_split_candidates_for_context(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[SplitCandidate]:
     return _generate_split_candidates(
         baseline_region,
@@ -2012,6 +2108,7 @@ def _generate_split_candidates_for_context(
         caches.basic_split_rejection_summary,
         context.basic_line_length_scale,
         perf,
+        perf_hotspots,
     )
 
 
@@ -2022,6 +2119,7 @@ def _generate_relaxed_root_fallback_candidates(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[RelaxedFallbackCandidate]:
     parent_area = max(1.0, baseline_region.objective.area_m2)
     seen: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
@@ -2056,8 +2154,8 @@ def _generate_relaxed_root_fallback_candidates(
             if boundary.shared_boundary_m <= context.grid.grid_step_m * 0.8:
                 continue
             boundary_alignment = _boundary_alignment(boundary)
-            left_region = _build_region_for_context(left_ids, boundary_alignment, context, caches, perf)
-            right_region = _build_region_for_context(right_ids, boundary_alignment, context, caches, perf)
+            left_region = _build_region_for_context(left_ids, boundary_alignment, context, caches, perf, perf_hotspots)
+            right_region = _build_region_for_context(right_ids, boundary_alignment, context, caches, perf, perf_hotspots)
             if left_region is None or right_region is None:
                 continue
 
@@ -2146,6 +2244,7 @@ def _solve_region_recursive(
     context: SolverContext,
     caches: SolverCaches,
     perf: dict[str, float],
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = None,
     *,
     allow_nested_lambda_fanout: bool = False,
 ) -> list[PartitionPlan]:
@@ -2156,7 +2255,7 @@ def _solve_region_recursive(
         perf["solve_region_cache_hits"] += 1
         return cached
 
-    baseline_region = _build_region_for_context(cell_ids, 0.0, context, caches, perf)
+    baseline_region = _build_region_for_context(cell_ids, 0.0, context, caches, perf, perf_hotspots)
     if baseline_region is None:
         caches.frontier_cache[key] = []
         return []
@@ -2176,6 +2275,7 @@ def _solve_region_recursive(
         context,
         caches,
         perf,
+        perf_hotspots,
     )
     if allow_nested_lambda_fanout and _should_use_nested_lambda_fanout(cell_ids, depth, split_candidates):
         try:
@@ -2202,6 +2302,7 @@ def _solve_region_recursive(
                     context,
                     caches,
                     perf,
+                    perf_hotspots,
                     allow_nested_lambda_fanout=allow_nested_lambda_fanout,
                 )
                 right_frontier = _solve_region_recursive_child(
@@ -2210,6 +2311,7 @@ def _solve_region_recursive(
                     context,
                     caches,
                     perf,
+                    perf_hotspots,
                     allow_nested_lambda_fanout=allow_nested_lambda_fanout,
                 )
                 if not left_frontier or not right_frontier:
@@ -2230,6 +2332,7 @@ def _solve_region_recursive(
                 context,
                 caches,
                 perf,
+                perf_hotspots,
                 allow_nested_lambda_fanout=allow_nested_lambda_fanout,
             )
             right_frontier = _solve_region_recursive_child(
@@ -2238,6 +2341,7 @@ def _solve_region_recursive(
                 context,
                 caches,
                 perf,
+                perf_hotspots,
                 allow_nested_lambda_fanout=allow_nested_lambda_fanout,
             )
             if not left_frontier or not right_frontier:
@@ -2905,6 +3009,12 @@ def solve_partition_hierarchy(
     cell_lookup = _cell_lookup(grid)
     neighbors = _neighbor_lookup(grid)
     perf = _make_perf()
+    profile_hotspots_enabled = debug_output is not None or (
+        os.environ.get("TERRAIN_SPLITTER_PROFILE_HOTSPOTS", "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    perf_hotspots: dict[str, list[dict[str, Any]]] | None = (
+        {"buildRegion": [], "objective": []} if profile_hotspots_enabled else None
+    )
     caches = _make_solver_caches()
     root_area_m2 = max(1.0, grid.area_m2)
     context = SolverContext(
@@ -2927,9 +3037,9 @@ def solve_partition_hierarchy(
     lambda_max_inflight = _resolve_root_parallel_max_inflight(root_parallel_max_inflight)
     all_plans: list[PartitionPlan]
     if requested_workers <= 1:
-        all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
+        all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf, perf_hotspots)
     else:
-        baseline_region = _build_region_for_context(root_cell_ids, 0.0, context, caches, perf)
+        baseline_region = _build_region_for_context(root_cell_ids, 0.0, context, caches, perf, perf_hotspots)
         if baseline_region is None:
             all_plans = []
         else:
@@ -2948,7 +3058,7 @@ def solve_partition_hierarchy(
                 )
                 usable_workers = min(requested_workers, len(root_splits))
                 if usable_workers <= 1 or not root_splits:
-                    all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
+                    all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf, perf_hotspots)
                 else:
                     perf["root_parallel_requested_workers"] = requested_workers
                     perf["root_parallel_workers_used"] = usable_workers
@@ -3064,7 +3174,7 @@ def solve_partition_hierarchy(
                             parallel_granularity,
                         )
                         perf["root_parallel_failures"] += 1
-                        all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf)
+                        all_plans = _solve_region_recursive(root_cell_ids, max_depth, context, caches, perf, perf_hotspots)
                     else:
                         perf["root_parallel_ms"] += (time.perf_counter() - branch_started_at) * 1000.0
                         all_plans = _pareto_frontier_with_perf(
@@ -3118,7 +3228,9 @@ def solve_partition_hierarchy(
             returned_previews=[],
             practical_plan_rejection_summary={},
             practical_region_rejection_summary={},
+            perf_hotspots=perf_hotspots,
         )
+        _log_perf_hotspots(request_id, polygon_id, perf_hotspots)
         return []
 
     baseline = min(
@@ -3258,7 +3370,9 @@ def solve_partition_hierarchy(
                 practical_plan_rejection_summary=practical_plan_rejection_summary,
                 practical_region_rejection_summary=practical_region_rejection_summary,
                 relaxed_fallback=relaxed_fallback,
+                perf_hotspots=perf_hotspots,
             )
+            _log_perf_hotspots(request_id, polygon_id, perf_hotspots)
             return previews
         rejection_payload = _rejection_debug_payload(
             caches=caches,
@@ -3349,7 +3463,9 @@ def solve_partition_hierarchy(
             returned_previews=[],
             practical_plan_rejection_summary=practical_plan_rejection_summary,
             practical_region_rejection_summary=practical_region_rejection_summary,
+            perf_hotspots=perf_hotspots,
         )
+        _log_perf_hotspots(request_id, polygon_id, perf_hotspots)
         return []
 
     comparison_pool = practical[:]
@@ -3379,7 +3495,9 @@ def solve_partition_hierarchy(
             returned_previews=[],
             practical_plan_rejection_summary=practical_plan_rejection_summary,
             practical_region_rejection_summary=practical_region_rejection_summary,
+            perf_hotspots=perf_hotspots,
         )
+        _log_perf_hotspots(request_id, polygon_id, perf_hotspots)
         return []
 
     best_two_region = min(
@@ -3552,5 +3670,7 @@ def solve_partition_hierarchy(
         returned_previews=previews,
         practical_plan_rejection_summary=practical_plan_rejection_summary,
         practical_region_rejection_summary=practical_region_rejection_summary,
+        perf_hotspots=perf_hotspots,
     )
+    _log_perf_hotspots(request_id, polygon_id, perf_hotspots)
     return previews

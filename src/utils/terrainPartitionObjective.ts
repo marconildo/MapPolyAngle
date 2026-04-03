@@ -24,6 +24,7 @@ import {
   destination as geoDestination,
   queryElevationAtPoint,
 } from "@/utils/terrainAspectHybrid";
+import { generatePlannedFlightGeometryForPolygon, summarizePlannedFlightGeometry } from "@/flight/plannedGeometry";
 
 // @ts-ignore Turf typings are inconsistent in this repo.
 import * as turf from "@turf/turf";
@@ -562,91 +563,44 @@ function estimateRegionFlightTime(
 ): RegionFlightTimeEstimate {
   const lineSpacingM = Math.max(1, lineSpacingForParams(params));
   const forwardSpacingM = forwardSpacingForParams(params);
-  const lons = ring.map((point) => point[0]);
-  const lats = ring.map((point) => point[1]);
-  const minLng = Math.min(...lons);
-  const maxLng = Math.max(...lons);
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const center: [number, number] = [(minLng + maxLng) / 2, (minLat + maxLat) / 2];
-  const diagonal = haversineDistance([minLng, minLat], [maxLng, maxLat]);
-  const perpBearing = (bearingDeg + 90) % 360;
-  const numLines = Math.max(1, Math.ceil(diagonal / Math.max(1, lineSpacingM)));
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacingM, params);
+  const geometrySummary = summarizePlannedFlightGeometry(geometry);
   const lengths: number[] = [];
   const terrainReliefs: number[] = [];
-  const interSegmentGaps: number[] = [];
-  let fragmentedLineCount = 0;
-
-  for (let i = -numLines; i <= numLines; i++) {
-    const distance = i * lineSpacingM;
-    const [centerLng, centerLat] = geoDestination(center, perpBearing, distance);
-    const extendDistance = diagonal * 0.75;
-    const p1 = geoDestination([centerLng, centerLat], bearingDeg, extendDistance);
-    const p2 = geoDestination([centerLng, centerLat], (bearingDeg + 180) % 360, extendDistance);
-
-    let currentSegment: [number, number][] = [];
-    const completedSegments: Array<[[number, number], [number, number]]> = [];
-    let segments = 0;
-    const samples = 80;
-    for (let sample = 0; sample <= samples; sample++) {
-      const t = sample / samples;
-      const lng = p2[0] + t * (p1[0] - p2[0]);
-      const lat = p2[1] + t * (p1[1] - p2[1]);
-      if (pointInPolygon(lng, lat, ring)) {
-        currentSegment.push([lng, lat]);
-      } else if (currentSegment.length > 0) {
-        segments += 1;
-        const startPoint = currentSegment[0];
-        const endPoint = currentSegment[currentSegment.length - 1];
-        completedSegments.push([startPoint, endPoint]);
-        lengths.push(haversineDistance(startPoint, endPoint));
-        const relief = sampleTerrainReliefAlongSegment(startPoint, endPoint, tiles);
-        if (Number.isFinite(relief)) terrainReliefs.push(relief);
-        currentSegment = [];
-      }
+  geometry.sweepLines.forEach((sweepLine) => {
+    let sweepLengthM = 0;
+    for (let pointIndex = 1; pointIndex < sweepLine.length; pointIndex += 1) {
+      sweepLengthM += haversineDistance(sweepLine[pointIndex - 1], sweepLine[pointIndex]);
     }
-    if (currentSegment.length > 0) {
-      segments += 1;
-      const startPoint = currentSegment[0];
-      const endPoint = currentSegment[currentSegment.length - 1];
-      completedSegments.push([startPoint, endPoint]);
-      lengths.push(haversineDistance(startPoint, endPoint));
-      const relief = sampleTerrainReliefAlongSegment(startPoint, endPoint, tiles);
-      if (Number.isFinite(relief)) terrainReliefs.push(relief);
-    }
-    if (segments > 1) {
-      fragmentedLineCount += segments - 1;
-      for (let segmentIndex = 1; segmentIndex < completedSegments.length; segmentIndex++) {
-        const previous = completedSegments[segmentIndex - 1];
-        const current = completedSegments[segmentIndex];
-        interSegmentGaps.push(haversineDistance(previous[1], current[0]));
-      }
-    }
-  }
+    lengths.push(sweepLengthM);
+    const relief = sampleTerrainReliefAlongSegment(
+      sweepLine[0],
+      sweepLine[sweepLine.length - 1],
+      tiles,
+    );
+    if (Number.isFinite(relief)) terrainReliefs.push(relief);
+  });
 
   const shortLineThresholdM = Math.max(80, options.shortLineThresholdFactor * lineSpacingM);
-  const lineCount = lengths.length;
-  const totalInterSegmentGapLengthM = interSegmentGaps.reduce((sum, value) => sum + value, 0);
-  const turnCount = Math.max(0, lineCount - 1) + fragmentedLineCount;
-  const totalFlightLineLengthM = lengths.reduce((sum, value) => sum + value, 0);
+  const lineCount = geometrySummary.lineCount;
+  const totalInterSegmentGapLengthM = geometrySummary.interSegmentGapLengthM;
+  const turnCount = geometrySummary.turnCount;
+  const totalFlightLineLengthM = geometrySummary.totalFlightLineLengthM;
   const cruiseSpeedMps = defaultCruiseSpeedMps(params, options);
-  const effectiveSweepLengthM = totalFlightLineLengthM + totalInterSegmentGapLengthM;
-  const sweepTimeSec = cruiseSpeedMps > 0 ? effectiveSweepLengthM / cruiseSpeedMps : 0;
-  const turnTimeSec = turnCount * options.avgTurnSeconds + fragmentedLineCount * 4;
+  const sweepTimeSec = cruiseSpeedMps > 0 ? totalFlightLineLengthM / cruiseSpeedMps : 0;
+  const turnTimeSec = cruiseSpeedMps > 0 ? geometrySummary.connectorLengthM / cruiseSpeedMps : 0;
   const overheadTimeSec = options.perRegionOverheadSec;
 
   return {
     lineSpacingM,
     forwardSpacingM,
     lineCount,
-    fragmentedLineCount,
-    fragmentedLineFraction: lineCount > 0 ? fragmentedLineCount / lineCount : 0,
+    fragmentedLineCount: geometrySummary.fragmentedLineCount,
+    fragmentedLineFraction: geometrySummary.fragmentedLineFraction,
     interSegmentGapLengthM: totalInterSegmentGapLengthM,
-    meanInterSegmentGapM: mean(interSegmentGaps),
-    maxInterSegmentGapM: interSegmentGaps.length > 0 ? Math.max(...interSegmentGaps) : 0,
-    overflightTransitFraction: (totalFlightLineLengthM + totalInterSegmentGapLengthM) > 0
-      ? totalInterSegmentGapLengthM / (totalFlightLineLengthM + totalInterSegmentGapLengthM)
-      : 0,
+    meanInterSegmentGapM: geometrySummary.fragmentedLineCount > 0 ? totalInterSegmentGapLengthM / geometrySummary.fragmentedLineCount : 0,
+    maxInterSegmentGapM: totalInterSegmentGapLengthM,
+    overflightTransitFraction: geometrySummary.overflightTransitFraction,
     turnCount,
     totalFlightLineLengthM,
     meanLineLengthM: mean(lengths),

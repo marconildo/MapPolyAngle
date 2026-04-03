@@ -19,6 +19,7 @@ from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
+from .costs import line_spacing_for_params
 from .debug import write_debug_artifacts
 from .dsm_store import create_dsm_dataset_store, derive_descriptor_from_payload
 from .dsm_uploads import (
@@ -129,6 +130,10 @@ def _should_enable_internal_http() -> bool:
     return _env_flag("TERRAIN_SPLITTER_ENABLE_INTERNAL_HTTP", default_enabled)
 
 
+def _should_use_python_exact_optimize_fanout() -> bool:
+    return _env_flag("TERRAIN_SPLITTER_USE_PYTHON_EXACT_OPTIMIZE_FANOUT", False)
+
+
 CACHE_DIR = _runtime_dir("TERRAIN_SPLITTER_CACHE_DIR", ".cache")
 DEBUG_DIR = _runtime_dir("TERRAIN_SPLITTER_DEBUG_DIR", ".debug")
 DSM_DIR = _runtime_dir("TERRAIN_SPLITTER_DSM_DIR", ".dsm")
@@ -140,6 +145,10 @@ EXACT_POSTPROCESS_TOP_K = max(1, int(os.environ.get("TERRAIN_SPLITTER_EXACT_TOP_
 EXACT_POSTPROCESS_OPTIMIZE_ZOOM = 14
 EXACT_POSTPROCESS_TIME_WEIGHT = 0.1
 EXACT_POSTPROCESS_QUALITY_WEIGHT = 1.0 - EXACT_POSTPROCESS_TIME_WEIGHT
+EXACT_OPTIMIZE_GLOBAL_COARSE_BEARINGS = (0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0, 135.0, 150.0, 165.0)
+EXACT_OPTIMIZE_LOCAL_COARSE_OFFSETS = (-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0)
+EXACT_OPTIMIZE_REFINE_STEPS_DEG = (8.0, 4.0, 2.0, 1.0)
+EXACT_OPTIMIZE_MIN_IMPROVEMENT = 1e-4
 ENABLE_INTERNAL_TERRAIN_BATCH_HTTP = _should_enable_internal_http()
 logger = logging.getLogger("uvicorn.error")
 
@@ -147,6 +156,155 @@ logger = logging.getLogger("uvicorn.error")
 def _safe_artifact_component(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip())
     return cleaned.strip("_") or "value"
+
+
+def _normalize_axial_bearing_deg(value: float) -> float:
+    normalized = ((value % 180.0) + 180.0) % 180.0
+    return normalized if math.isfinite(normalized) else 0.0
+
+
+def _rounded_tenths(value: float) -> float:
+    return math.floor(value * 10.0 + 0.5) / 10.0
+
+
+def _candidate_cache_key(bearing_deg: float) -> int:
+    return int(round(_normalize_axial_bearing_deg(bearing_deg) * 1000.0))
+
+
+def _candidate_exact_cost(candidate: dict[str, Any] | None) -> float:
+    if not isinstance(candidate, dict):
+        return math.inf
+    exact_cost = candidate.get("exactCost")
+    return float(exact_cost) if isinstance(exact_cost, (int, float)) and math.isfinite(exact_cost) else math.inf
+
+
+def _build_exact_optimize_request_payload(request: ExactOptimizeBearingRequest) -> dict[str, Any]:
+    return {
+        "polygonId": request.polygonId,
+        "scopeId": request.polygonId or "optimize-bearing",
+        "ring": request.ring,
+        "payloadKind": request.payloadKind,
+        "params": request.params.model_dump(mode="json"),
+        "terrainSource": request.terrainSource.model_dump(mode="json"),
+        "altitudeMode": request.altitudeMode,
+        "minClearanceM": request.minClearanceM,
+        "turnExtendM": request.turnExtendM,
+        "exactOptimizeZoom": EXACT_POSTPROCESS_OPTIMIZE_ZOOM,
+        "timeWeight": EXACT_POSTPROCESS_TIME_WEIGHT,
+    }
+
+
+def _optimize_bearing_exact_with_bridge_fanout(
+    bridge,
+    request: ExactOptimizeBearingRequest,
+) -> dict[str, Any]:
+    request_payload = _build_exact_optimize_request_payload(request)
+    normalized_seed_bearing_deg = _normalize_axial_bearing_deg(request.seedBearingDeg)
+    half_window_deg = max(1.0, float(request.halfWindowDeg if request.halfWindowDeg is not None else 30.0))
+    refine_steps_deg = [step for step in EXACT_OPTIMIZE_REFINE_STEPS_DEG if step <= half_window_deg]
+    mode = request.mode
+    line_spacing_m = float(line_spacing_for_params(request.params))
+    max_inflight = max(1, bridge.candidate_max_inflight())
+    candidate_cache: dict[int, tuple[int, Any]] = {}
+    next_request_order = 0
+
+    def _register_candidate(executor: ThreadPoolExecutor, bearing_deg: float):
+        nonlocal next_request_order
+        normalized_bearing_deg = _normalize_axial_bearing_deg(bearing_deg)
+        cache_key = _candidate_cache_key(normalized_bearing_deg)
+        cached = candidate_cache.get(cache_key)
+        if cached is None:
+            request_order = next_request_order
+            next_request_order += 1
+            future = executor.submit(_evaluate_candidate, normalized_bearing_deg)
+            cached = (request_order, future)
+            candidate_cache[cache_key] = cached
+        return normalized_bearing_deg, cached
+
+    def _evaluate_candidate(bearing_deg: float) -> dict[str, Any] | None:
+        response_payload = bridge.evaluate_region(
+            {**request_payload, "bearingDeg": bearing_deg},
+            batch_handle=batch_handle,
+        )
+        candidate = response_payload.get("candidate")
+        return candidate if isinstance(candidate, dict) else None
+
+    def _evaluate_bearings(executor: ThreadPoolExecutor, bearing_degs: list[float]) -> list[dict[str, Any] | None]:
+        futures: list[Any] = []
+        for bearing_deg in bearing_degs:
+            _, cached = _register_candidate(executor, bearing_deg)
+            futures.append(cached[1])
+        return [future.result() for future in futures]
+
+    batch_handle = bridge.begin_candidate_batch()
+    try:
+        with ThreadPoolExecutor(max_workers=max_inflight) as executor:
+            best: dict[str, Any] | None = None
+            best_offset = 0.0
+
+            if mode == "global":
+                coarse_bearings = list(dict.fromkeys([*EXACT_OPTIMIZE_GLOBAL_COARSE_BEARINGS, _rounded_tenths(normalized_seed_bearing_deg)]))
+                coarse_results = _evaluate_bearings(executor, coarse_bearings)
+                for candidate in coarse_results:
+                    if candidate is not None and (best is None or _candidate_exact_cost(candidate) < _candidate_exact_cost(best)):
+                        best = candidate
+            else:
+                coarse_offsets = [0.0, *[offset for offset in EXACT_OPTIMIZE_LOCAL_COARSE_OFFSETS if offset != 0.0 and abs(offset) <= half_window_deg + 1e-6]]
+                coarse_results = _evaluate_bearings(executor, [normalized_seed_bearing_deg + offset for offset in coarse_offsets])
+                for index, candidate in enumerate(coarse_results):
+                    if candidate is not None and (best is None or _candidate_exact_cost(candidate) < _candidate_exact_cost(best)):
+                        best = candidate
+                        best_offset = coarse_offsets[index]
+
+            if best is not None:
+                for step_deg in refine_steps_deg:
+                    improved = True
+                    while improved:
+                        improved = False
+                        current_best = best
+                        if mode == "global":
+                            neighbor_specs = [
+                                (0.0, float(current_best["bearingDeg"]) - step_deg),
+                                (0.0, float(current_best["bearingDeg"]) + step_deg),
+                            ]
+                        else:
+                            neighbor_specs = [
+                                (best_offset - step_deg, normalized_seed_bearing_deg + (best_offset - step_deg)),
+                                (best_offset + step_deg, normalized_seed_bearing_deg + (best_offset + step_deg)),
+                            ]
+                        valid_neighbor_specs = [
+                            (offset_deg, bearing_deg)
+                            for offset_deg, bearing_deg in neighbor_specs
+                            if mode == "global" or abs(offset_deg) <= half_window_deg + 1e-6
+                        ]
+                        neighbor_results = _evaluate_bearings(executor, [bearing_deg for _, bearing_deg in valid_neighbor_specs])
+                        next_best: tuple[float, dict[str, Any]] | None = None
+                        for index, candidate in enumerate(neighbor_results):
+                            if candidate is None:
+                                continue
+                            if next_best is None or _candidate_exact_cost(candidate) < _candidate_exact_cost(next_best[1]):
+                                next_best = (valid_neighbor_specs[index][0], candidate)
+                        if next_best is not None and _candidate_exact_cost(next_best[1]) + EXACT_OPTIMIZE_MIN_IMPROVEMENT < _candidate_exact_cost(current_best):
+                            best = next_best[1]
+                            if mode != "global":
+                                best_offset = next_best[0]
+                            improved = True
+
+            evaluated_payloads: list[tuple[int, dict[str, Any]]] = []
+            for request_order, future in candidate_cache.values():
+                candidate = future.result()
+                if candidate is not None:
+                    evaluated_payloads.append((request_order, candidate))
+    finally:
+        bridge.end_candidate_batch(batch_handle)
+
+    evaluated_payloads.sort(key=lambda item: (_candidate_exact_cost(item[1]), item[0]))
+    return {
+        "best": best,
+        "evaluated": [candidate for _, candidate in evaluated_payloads],
+        "seedBearingDeg": normalized_seed_bearing_deg,
+        "lineSpacingM": line_spacing_m,
+    }
 
 
 def _solution_debug_summary(
@@ -794,7 +952,10 @@ def optimize_bearing_exact(request: ExactOptimizeBearingRequest) -> ExactOptimiz
     if EXACT_RUNTIME_BRIDGE is None:
         raise HTTPException(status_code=503, detail="Backend exact optimization is not available.")
     try:
-        payload = EXACT_RUNTIME_BRIDGE.optimize_bearing(request.model_dump(mode="json"))
+        if EXACT_RUNTIME_BRIDGE.supports_candidate_fanout() and _should_use_python_exact_optimize_fanout():
+            payload = _optimize_bearing_exact_with_bridge_fanout(EXACT_RUNTIME_BRIDGE, request)
+        else:
+            payload = EXACT_RUNTIME_BRIDGE.optimize_bearing(request.model_dump(mode="json"))
         best = payload.get("best") or {}
         return ExactOptimizeBearingResponse(
             bearingDeg=best.get("bearingDeg"),
@@ -887,7 +1048,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         if solver_perf_summary is not None and isinstance(solver_debug_payload, dict):
             solver_summary_payload = solver_debug_payload.get("solverSummary")
             if isinstance(solver_summary_payload, dict):
-                solver_summary_payload["performanceHotspots"] = solver_perf_summary
+                solver_summary_payload["performanceSummary"] = solver_perf_summary
         if EXACT_RUNTIME_BRIDGE is not None and len(surrogate_solutions) > 1:
             try:
                 exact_status = "executed"

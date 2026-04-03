@@ -1,6 +1,14 @@
 // src/interop/wingtra/convert.ts
 
-import type { CameraModel, FlightParams, LidarModel, LidarReturnMode, LngLat, PayloadKind } from "@/domain/types";
+import type {
+  CameraModel,
+  FlightParams,
+  LidarModel,
+  LidarReturnMode,
+  LngLat,
+  PayloadKind,
+  PlaneHardwareVersion,
+} from "@/domain/types";
 import { forwardSpacing, lineSpacing as computeLineSpacing, calculateGSD, SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, DJI_ZENMUSE_P1_24MM } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, WINGTRA_LIDAR_XT32M2X, lidarDeliverableDensity, lidarLineSpacing } from "@/domain/lidar";
 import type {
@@ -11,6 +19,144 @@ import type {
   ImportedWingtraPlan,
   ImportedArea,
 } from "./types";
+
+export type WingtraPlaneHardwareVersion = PlaneHardwareVersion;
+
+export interface WingtraFreshExportPayloadOption {
+  payloadKind: PayloadKind;
+  payloadUniqueString: string;
+  payloadName: string;
+  planeHardwareVersion: WingtraPlaneHardwareVersion;
+  label: string;
+}
+
+const WICTopLevelDefaults = {
+  fileVersion: 1,
+  flightPlanVersion: 6,
+  groundStation: "WingtraPilot" as const,
+  creationLocation: "",
+  geofenceType: 0,
+  geofenceRadius: 1200,
+  safety: {
+    rthMode: 0,
+    version: 2,
+    maxGroundClearance: 200,
+    minGroundClearance: 60,
+    ceilingAboveTakeOff: 2000,
+    connectionLossTimeout: 60,
+    minRTHHeightAboveHome: 60,
+  },
+  elevationData: {
+    enabled: true,
+    name: "SRTM",
+    type: "Auto",
+  },
+  cruiseSpeed: 15.375008,
+  hoverSpeed: 3,
+  plannedHomePosition: [0, 0, 0] as [number, number, number],
+  vehicleLastFlownCoordinate: [null, null] as [null, null],
+};
+
+export const WINGTRA_FRESH_EXPORT_PAYLOAD_OPTIONS: WingtraFreshExportPayloadOption[] = [
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "MAPSTARNadir_v5",
+    payloadName: "MAPSTARNadir",
+    planeHardwareVersion: "5",
+    label: "MAPSTAR Nadir (WingtraRay)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "RX1R2_v4",
+    payloadName: "RX1RII 42MP",
+    planeHardwareVersion: "4",
+    label: "RX1RII 42MP (WingtraOne)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "RX1R2_v5",
+    payloadName: "RX1RII 42MP",
+    planeHardwareVersion: "5",
+    label: "RX1RII 42MP (WingtraRay)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "RX1R3_v5",
+    payloadName: "SURVEY61",
+    planeHardwareVersion: "5",
+    label: "SURVEY61 (WingtraRay)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "A6100_v5",
+    payloadName: "SURVEY24",
+    planeHardwareVersion: "5",
+    label: "SURVEY24 (WingtraRay)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "MAPSTARHighRes_v4",
+    payloadName: "MAPSTARHighRes",
+    planeHardwareVersion: "4",
+    label: "MAPSTAR HighRes (WingtraOne)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "MAPSTARHighRes_v5",
+    payloadName: "MAPSTARHighRes",
+    planeHardwareVersion: "5",
+    label: "MAPSTAR HighRes (WingtraRay)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "MAPSTAROblique_v4",
+    payloadName: "MAPSTAROblique",
+    planeHardwareVersion: "4",
+    label: "MAPSTAR Oblique (WingtraOne)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "MAPSTAROblique_v5",
+    payloadName: "MAPSTAROblique",
+    planeHardwareVersion: "5",
+    label: "MAPSTAR Oblique (WingtraRay)",
+  },
+  {
+    payloadKind: "camera",
+    payloadUniqueString: "RGB61_v4",
+    payloadName: "RGB61",
+    planeHardwareVersion: "4",
+    label: "RGB61 (WingtraOne)",
+  },
+  {
+    payloadKind: "lidar",
+    payloadUniqueString: "LIDAR_v4",
+    payloadName: "LIDAR",
+    planeHardwareVersion: "4",
+    label: "LIDAR (WingtraOne)",
+  },
+  {
+    payloadKind: "lidar",
+    payloadUniqueString: "LIDAR_v5",
+    payloadName: "LIDAR",
+    planeHardwareVersion: "5",
+    label: "LIDAR (WingtraRay)",
+  },
+];
+
+const CAMERA_KEY_TO_WINGTRA_PAYLOADS: Record<string, string[]> = {
+  SONY_RX1R2: ["RX1R2_v4", "RX1R2_v5"],
+  SONY_RX1R3: ["RX1R3_v5"],
+  SONY_A6100_20MM: ["A6100_v5"],
+  ILX_LR1_INSPECT_85MM: ["MAPSTARHighRes_v4", "MAPSTARHighRes_v5"],
+  MAP61_17MM: ["MAPSTAROblique_v4", "MAPSTAROblique_v5"],
+  RGB61_24MM: ["RGB61_v4"],
+  DJI_ZENMUSE_P1_24MM: ["MAPSTARNadir_v5"],
+};
+
+const LIDAR_KEY_TO_WINGTRA_PAYLOADS: Record<string, string[]> = {
+  WINGTRA_LIDAR_XT32M2X: ["LIDAR_v4", "LIDAR_v5"],
+};
 
 // ---------------------------
 // Small helpers
@@ -38,6 +184,168 @@ function isWingtraFlightPlan(value: unknown): value is WingtraFlightPlan {
   const maybePlan = (value as { flightPlan?: unknown }).flightPlan;
   if (!maybePlan || typeof maybePlan !== "object") return false;
   return Array.isArray((maybePlan as { items?: unknown }).items);
+}
+
+function isWingtraAreaItem(value: unknown): value is WingtraAreaItem {
+  if (!value || typeof value !== "object") return false;
+  const maybeItem = value as { type?: unknown; complexItemType?: unknown };
+  return maybeItem.type === "ComplexItem" && maybeItem.complexItemType === "area";
+}
+
+export function getWingtraFreshExportPayloadOptions(
+  payloadKind?: PayloadKind,
+  planeHardwareVersion?: WingtraPlaneHardwareVersion,
+): WingtraFreshExportPayloadOption[] {
+  return WINGTRA_FRESH_EXPORT_PAYLOAD_OPTIONS.filter((option) => {
+    if (payloadKind && option.payloadKind !== payloadKind) return false;
+    if (planeHardwareVersion && option.planeHardwareVersion !== planeHardwareVersion) return false;
+    return true;
+  });
+}
+
+export function getWingtraFreshExportPayloadOption(
+  payloadUniqueString: string | undefined,
+): WingtraFreshExportPayloadOption | undefined {
+  if (!payloadUniqueString) return undefined;
+  return WINGTRA_FRESH_EXPORT_PAYLOAD_OPTIONS.find((option) => option.payloadUniqueString === payloadUniqueString);
+}
+
+export function getPlaneHardwareVersionFromWingtraPayloadUniqueString(
+  payloadUniqueString: string | undefined,
+): WingtraPlaneHardwareVersion | undefined {
+  if (!payloadUniqueString) return undefined;
+  const explicit = getWingtraFreshExportPayloadOption(payloadUniqueString)?.planeHardwareVersion;
+  if (explicit) return explicit;
+  if (payloadUniqueString.endsWith("_v4")) return "4";
+  if (payloadUniqueString.endsWith("_v5")) return "5";
+  return undefined;
+}
+
+export function getSuggestedFreshWingtraExportPayloadOption(
+  areas: ExportedArea[],
+): WingtraFreshExportPayloadOption {
+  const firstArea = areas[0];
+  if (!firstArea) {
+    return getWingtraFreshExportPayloadOption("MAPSTARNadir_v5")!;
+  }
+
+  const payloadKind = firstArea.payloadKind ?? "camera";
+  const payloadUniqueString =
+    payloadKind === "lidar"
+      ? (LIDAR_KEY_TO_WINGTRA_PAYLOADS[firstArea.lidarKey ?? DEFAULT_LIDAR.key] ?? ["LIDAR_v5"]).at(-1) ?? "LIDAR_v5"
+      : (CAMERA_KEY_TO_WINGTRA_PAYLOADS[firstArea.cameraKey ?? ""] ?? ["MAPSTARNadir_v5"]).at(-1) ?? "MAPSTARNadir_v5";
+
+  return (
+    getWingtraFreshExportPayloadOption(payloadUniqueString) ??
+    getWingtraFreshExportPayloadOptions(payloadKind)[0] ??
+    getWingtraFreshExportPayloadOption("MAPSTARNadir_v5")!
+  );
+}
+
+export interface WingtraFreshExportResolution {
+  payloadKind: PayloadKind;
+  payloadLabel: string;
+  analysisKey: string;
+  options: WingtraFreshExportPayloadOption[];
+}
+
+export function getCompatibleWingtraPayloadOptionsForAnalysisParams(
+  params: Pick<FlightParams, "payloadKind" | "cameraKey" | "lidarKey">,
+): WingtraFreshExportPayloadOption[] {
+  const payloadKind = params.payloadKind ?? "camera";
+  const payloadUniqueStrings =
+    payloadKind === "lidar"
+      ? LIDAR_KEY_TO_WINGTRA_PAYLOADS[params.lidarKey ?? DEFAULT_LIDAR.key] ?? []
+      : CAMERA_KEY_TO_WINGTRA_PAYLOADS[params.cameraKey ?? ""] ?? [];
+
+  return payloadUniqueStrings
+    .map((payloadUniqueString) => getWingtraFreshExportPayloadOption(payloadUniqueString))
+    .filter((option): option is WingtraFreshExportPayloadOption => !!option);
+}
+
+export function getPreferredWingtraPlaneHardwareVersionForAnalysisParams(
+  params: Pick<FlightParams, "payloadKind" | "cameraKey" | "lidarKey">,
+): WingtraPlaneHardwareVersion | undefined {
+  return getCompatibleWingtraPayloadOptionsForAnalysisParams(params).at(-1)?.planeHardwareVersion;
+}
+
+export function resolveFreshWingtraExportOptionsFromAreas(
+  areas: ExportedArea[],
+): WingtraFreshExportResolution | undefined {
+  const firstArea = areas[0];
+  if (!firstArea) return undefined;
+
+  const payloadKind = firstArea.payloadKind ?? "camera";
+  const analysisKeys = new Set(
+    areas.map((area) =>
+      payloadKind === "lidar" ? area.lidarKey ?? DEFAULT_LIDAR.key : area.cameraKey ?? "DJI_ZENMUSE_P1_24MM",
+    ),
+  );
+
+  if (analysisKeys.size !== 1) {
+    return undefined;
+  }
+
+  const analysisKey = Array.from(analysisKeys)[0];
+  const options = getCompatibleWingtraPayloadOptionsForAnalysisParams({
+    payloadKind,
+    cameraKey: payloadKind === "camera" ? analysisKey : undefined,
+    lidarKey: payloadKind === "lidar" ? analysisKey : undefined,
+  });
+
+  if (options.length === 0) {
+    return undefined;
+  }
+
+  return {
+    payloadKind,
+    analysisKey,
+    payloadLabel: options[0].payloadName,
+    options,
+  };
+}
+
+export function resolveFreshWingtraExportPayloadOptionFromAreas(
+  areas: ExportedArea[],
+): WingtraFreshExportPayloadOption | undefined {
+  const resolution = resolveFreshWingtraExportOptionsFromAreas(areas);
+  if (!resolution) return undefined;
+
+  const explicitVersions = new Set(
+    areas
+      .map((area) => area.planeHardwareVersion)
+      .filter((version): version is WingtraPlaneHardwareVersion => version === "4" || version === "5"),
+  );
+  if (explicitVersions.size > 1) return undefined;
+
+  const requestedVersion =
+    explicitVersions.size === 1
+      ? Array.from(explicitVersions)[0]
+      : getPreferredWingtraPlaneHardwareVersionForAnalysisParams({
+          payloadKind: resolution.payloadKind,
+          cameraKey: resolution.payloadKind === "camera" ? resolution.analysisKey : undefined,
+          lidarKey: resolution.payloadKind === "lidar" ? resolution.analysisKey : undefined,
+        });
+
+  return (
+    resolution.options.find((option) => option.planeHardwareVersion === requestedVersion) ??
+    resolution.options.at(-1) ??
+    resolution.options[0]
+  );
+}
+
+export function isWingtraFlightPlanTemplateExportReady(value: unknown): value is WingtraFlightPlan {
+  if (!isWingtraFlightPlan(value)) return false;
+  const payloadUniqueString = value.flightPlan?.payloadUniqueString;
+  const planeHardwareVersion = (value.flightPlan as { planeHardware?: { hwVersion?: unknown } })?.planeHardware?.hwVersion;
+
+  if (typeof payloadUniqueString !== "string" || payloadUniqueString.length === 0) return false;
+  if (planeHardwareVersion !== "4" && planeHardwareVersion !== "5") return false;
+  if (getPlaneHardwareVersionFromWingtraPayloadUniqueString(payloadUniqueString) !== planeHardwareVersion) return false;
+  if (!value.geofence || typeof value.geofence !== "object") return false;
+  if (!value.safety || typeof value.safety !== "object") return false;
+  if (typeof (value.flightPlan as { creationTime?: unknown }).creationTime !== "number") return false;
+  return true;
 }
 
 /**
@@ -250,6 +558,12 @@ export function importWingtraFlightPlan(
   const angleConv = opts?.angleConvention ?? "northCW";
   const payloadName = fp.flightPlan.payload;
   const payloadKey  = (fp.flightPlan as any).payloadUniqueString as string | undefined;
+  const planeHardwareVersion =
+    ((fp.flightPlan as { planeHardware?: { hwVersion?: unknown } }).planeHardware?.hwVersion === "4" ||
+    (fp.flightPlan as { planeHardware?: { hwVersion?: unknown } }).planeHardware?.hwVersion === "5"
+      ? (fp.flightPlan as { planeHardware?: { hwVersion?: WingtraPlaneHardwareVersion } }).planeHardware?.hwVersion
+      : undefined) ??
+    getPlaneHardwareVersionFromWingtraPayloadUniqueString(payloadKey);
   const cruiseSpeedMps = Number(fp.flightPlan.cruiseSpeed);
   const payloadInfo = resolvePayloadInfoFromWingtra(payloadName, payloadKey);
 
@@ -278,6 +592,7 @@ export function importWingtraFlightPlan(
         angleDeg,
         terrainFollowing: !!area.terrainFollowing,
         lidarKey: payloadInfo.lidarKey,
+        planeHardwareVersion,
         speedMps: params.speedMps,
         lidarReturnMode: params.lidarReturnMode,
         mappingFovDeg: params.mappingFovDeg,
@@ -299,6 +614,7 @@ export function importWingtraFlightPlan(
         angleDeg,
         terrainFollowing: !!area.terrainFollowing,
         cameraKey: payloadInfo.cameraKey,
+        planeHardwareVersion,
         wingtraRaw: area,
       });
     }
@@ -311,6 +627,7 @@ export function importWingtraFlightPlan(
     payloadKey,
     payloadCameraKey: payloadInfo.payloadKind === 'camera' ? payloadInfo.cameraKey : undefined,
     payloadLidarKey: payloadInfo.payloadKind === 'lidar' ? payloadInfo.lidarKey : undefined,
+    planeHardwareVersion,
     meta: {
       version: fp.version,
       fileType: fp.fileType,
@@ -358,23 +675,32 @@ export function exportToWingtraFlightPlan(
   opts?: ExportToWingtraOptions
 ): WingtraFlightPlan {
   const angleConv = opts?.angleConvention ?? "northCW";
-  const payloadKind = opts?.payloadKind ?? areas[0]?.payloadKind ?? 'camera';
   const camera = opts?.camera ?? SONY_RX1R2;
   const lidar = opts?.lidar ?? DEFAULT_LIDAR;
+  const selectedPayloadOption =
+    getWingtraFreshExportPayloadOption(opts?.payloadUniqueString) ??
+    getSuggestedFreshWingtraExportPayloadOption(areas);
+  const selectedPayloadKind = selectedPayloadOption.payloadKind;
+  const effectivePayloadKind = opts?.payloadKind ?? areas[0]?.payloadKind ?? selectedPayloadKind;
+  const planeHardwareVersion =
+    getPlaneHardwareVersionFromWingtraPayloadUniqueString(selectedPayloadOption.payloadUniqueString) ?? "5";
+  const now = Date.now();
 
   // Optional safety defaults
   const safety = {
-    rthMode: opts?.defaults?.rthMode ?? 0,
-    version: 2,
-    maxGroundClearance: opts?.defaults?.maxGroundClearance ?? 200,
-    minGroundClearance: opts?.defaults?.minGroundClearance ?? 60,
-    ceilingAboveTakeOff: opts?.defaults?.ceilingAboveTakeOff ?? 2000,
-    connectionLossTimeout: opts?.defaults?.connectionLossTimeout ?? 60,
-    minRTHHeightAboveHome: opts?.defaults?.minRTHHeightAboveHome ?? 60,
+    rthMode: opts?.defaults?.rthMode ?? WICTopLevelDefaults.safety.rthMode,
+    version: WICTopLevelDefaults.safety.version,
+    maxGroundClearance: opts?.defaults?.maxGroundClearance ?? WICTopLevelDefaults.safety.maxGroundClearance,
+    minGroundClearance: opts?.defaults?.minGroundClearance ?? WICTopLevelDefaults.safety.minGroundClearance,
+    ceilingAboveTakeOff: opts?.defaults?.ceilingAboveTakeOff ?? WICTopLevelDefaults.safety.ceilingAboveTakeOff,
+    connectionLossTimeout:
+      opts?.defaults?.connectionLossTimeout ?? WICTopLevelDefaults.safety.connectionLossTimeout,
+    minRTHHeightAboveHome:
+      opts?.defaults?.minRTHHeightAboveHome ?? WICTopLevelDefaults.safety.minRTHHeightAboveHome,
   };
 
   const items = areas.map((a) => {
-    const areaPayloadKind = a.payloadKind ?? payloadKind;
+    const areaPayloadKind = a.payloadKind ?? effectivePayloadKind;
     const spacing = typeof a.lineSpacingM === "number"
       ? a.lineSpacingM
       : areaPayloadKind === 'lidar'
@@ -440,39 +766,106 @@ export function exportToWingtraFlightPlan(
     locked: false,
     safety,
     siteId: cryptoRandomUuid(),
-    version: 1,
+    version: WICTopLevelDefaults.fileVersion,
     fileType: "Plan",
     flightId: cryptoRandomUuid(),
+    flightPlanOrigin: {
+      location: WICTopLevelDefaults.creationLocation,
+      coordinate: [...WICTopLevelDefaults.plannedHomePosition],
+    },
     geofence: {
       version: 1,
-      geofenceType: 0,
-      geofenceRadius: opts?.geofenceRadius ?? 1200,
+      geofenceType: WICTopLevelDefaults.geofenceType,
+      geofenceRadius: opts?.geofenceRadius ?? WICTopLevelDefaults.geofenceRadius,
       terminationSettings: null,
     },
     flightPlan: {
       items,
-      payload: opts?.payloadName ?? (payloadKind === 'lidar' ? "LIDAR" : "RX1RII 42MP"),
-      payloadUniqueString: opts?.payloadUniqueString ?? (payloadKind === 'lidar' ? "LIDAR_v5" : "RX1R2_v4"),
-      version: 6,
+      payload: opts?.payloadName ?? selectedPayloadOption.payloadName,
+      payloadUniqueString: selectedPayloadOption.payloadUniqueString,
+      version: WICTopLevelDefaults.flightPlanVersion,
       gisItems: [],
-      hoverSpeed: opts?.defaults?.hoverSpeed ?? 3,
-      cruiseSpeed: opts?.defaults?.cruiseSpeed ?? 16,
+      activeMaxTelemetryDistance: 0,
+      activeNumberOfImages: 0,
+      activeTotalArea: 0,
+      activeTotalFlightCruiseDistance: 0,
+      activeTotalFlightCruiseTime: 0,
+      activeTotalFlightDistance: 0,
+      activeTotalFlightHoverDistance: 0,
+      activeTotalFlightHoverTime: 0,
+      activeTotalFlightTime: 0,
+      creationTime: now,
+      hoverSpeed: opts?.defaults?.hoverSpeed ?? WICTopLevelDefaults.hoverSpeed,
+      cruiseSpeed: opts?.defaults?.cruiseSpeed ?? WICTopLevelDefaults.cruiseSpeed,
+      elevationData: { ...WICTopLevelDefaults.elevationData },
+      flightNumber: 0,
       missionStatus: 0,
+      flownPercentage: 0,
       planeHardware: {
-        hwVersion: "4",
+        hwVersion: planeHardwareVersion,
         vehicleId: -1,
-        displayName: "WingtraOne (any)",
+        displayName: planeHardwareVersion === "5" ? "WingtraRay (any)" : "WingtraOne (any)",
         isGenericPlane: true,
       },
       numberOfImages: 0,
       totalArea: 0,
-      // the rest can be filled by WingtraPilot when opening
+      totalFlightCruiseDistance: 0,
+      totalFlightCruiseTime: 0,
+      totalFlightDistance: 0,
+      totalFlightHoverDistance: 0,
+      totalFlightHoverTime: 0,
+      totalFlightTime: 0,
+      maxTelemetryDistance: 0,
+      lastModifiedTime: now,
+      plannedHomePosition: [...WICTopLevelDefaults.plannedHomePosition],
+      resumeMissionIndex: 0,
+      resumeGridPointIndex: -1,
+      vehicleLastFlownCoordinate: [...WICTopLevelDefaults.vehicleLastFlownCoordinate],
     } as any,
-    groundStation: "WingtraPilot",
+    groundStation: WICTopLevelDefaults.groundStation,
     flightPlanHistory: [],
   };
 
   return fp;
+}
+
+export function replaceAreaItemsInWingtraFlightPlan(
+  template: WingtraFlightPlan,
+  areas: ExportedArea[],
+  opts?: ExportToWingtraOptions,
+): WingtraFlightPlan {
+  const exportedAreaItems = exportToWingtraFlightPlan(areas, opts).flightPlan.items;
+  const originalItems = Array.isArray(template.flightPlan?.items) ? template.flightPlan.items : [];
+  const mergedItems: Array<WingtraAreaItem | Record<string, unknown>> = [];
+  let nextExportedAreaIndex = 0;
+  let lastInsertedAreaIndex = -1;
+
+  for (const item of originalItems) {
+    if (!isWingtraAreaItem(item)) {
+      mergedItems.push(item);
+      continue;
+    }
+
+    if (nextExportedAreaIndex < exportedAreaItems.length) {
+      mergedItems.push(exportedAreaItems[nextExportedAreaIndex] as WingtraAreaItem | Record<string, unknown>);
+      lastInsertedAreaIndex = mergedItems.length - 1;
+      nextExportedAreaIndex += 1;
+    }
+  }
+
+  if (nextExportedAreaIndex < exportedAreaItems.length) {
+    const remainingAreas = exportedAreaItems.slice(nextExportedAreaIndex) as Array<WingtraAreaItem | Record<string, unknown>>;
+    const insertIndex = lastInsertedAreaIndex >= 0 ? lastInsertedAreaIndex + 1 : mergedItems.length;
+    mergedItems.splice(insertIndex, 0, ...remainingAreas);
+  }
+
+  return {
+    ...template,
+    flightPlan: {
+      ...template.flightPlan,
+      items: mergedItems,
+    },
+  };
 }
 
 // Use crypto if available; otherwise fallback to a very simple ID.
@@ -492,6 +885,7 @@ export function areasFromState(polys: Array<{ring:[number,number][]; params:Flig
   return polys.map(p => ({
     ring: p.ring,
     payloadKind: p.params.payloadKind ?? 'camera',
+    planeHardwareVersion: p.params.planeHardwareVersion,
     altitudeAGL: p.params.altitudeAGL,
     frontOverlap: p.params.frontOverlap,
     sideOverlap: p.params.sideOverlap,

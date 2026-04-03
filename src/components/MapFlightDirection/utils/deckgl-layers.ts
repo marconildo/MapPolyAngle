@@ -10,6 +10,46 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import { PathLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { COORDINATE_SYSTEM } from '@deck.gl/core';
 
+function areSamePoint3D(
+  left: [number, number, number],
+  right: [number, number, number],
+  epsilon: number = 1e-9,
+) {
+  return (
+    Math.abs(left[0] - right[0]) <= epsilon &&
+    Math.abs(left[1] - right[1]) <= epsilon &&
+    Math.abs(left[2] - right[2]) <= epsilon
+  );
+}
+
+function mergeConnectedPathSegments(
+  path3d: [number, number, number][][],
+): [number, number, number][][] {
+  const mergedPaths: [number, number, number][][] = [];
+
+  for (const segment of path3d) {
+    if (!Array.isArray(segment) || segment.length === 0) continue;
+
+    const currentMergedPath = mergedPaths.at(-1);
+    if (!currentMergedPath || currentMergedPath.length === 0) {
+      mergedPaths.push([...segment]);
+      continue;
+    }
+
+    const previousEndPoint = currentMergedPath[currentMergedPath.length - 1];
+    const currentStartPoint = segment[0];
+
+    if (areSamePoint3D(previousEndPoint, currentStartPoint)) {
+      currentMergedPath.push(...segment.slice(1));
+      continue;
+    }
+
+    mergedPaths.push([...segment]);
+  }
+
+  return mergedPaths;
+}
+
 export function update3DPathLayer(
   overlay: MapboxOverlay,
   polygonId: string,
@@ -17,11 +57,12 @@ export function update3DPathLayer(
   setLayers: React.Dispatch<React.SetStateAction<any[]>>
 ) {
   const layers: any[] = [];
+  const mergedPaths = mergeConnectedPathSegments(path3d);
 
   // Create a simple 3D path layer for each flight line segment
   const pathLayer = new PathLayer({
     id: `drone-path-${polygonId}`,
-    data: path3d,
+    data: mergedPaths,
     getPath: (d: any) => d,
     getColor: [100, 200, 255, 240], // thin light blue line
     getWidth: 2,

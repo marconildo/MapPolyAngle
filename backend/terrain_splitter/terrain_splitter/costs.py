@@ -40,6 +40,9 @@ LIDAR_DEFAULTS = {
     "effective_point_rates": {"single": 160_000.0, "dual": 320_000.0, "triple": 480_000.0},
 }
 
+MISSION_DEFAULT_TURNAROUND_DISTANCE_M = 80.0
+MISSION_DEFAULT_TURNAROUND_SIDE_OFFSET_M = 70.0
+
 
 @dataclass(slots=True)
 class NodeCost:
@@ -156,6 +159,99 @@ def forward_spacing_for_params(params: FlightParamsModel) -> float | None:
             rotate_90=rotate,
         ),
     )
+
+
+def _flight_turn_model(params: FlightParamsModel) -> tuple[float, float]:
+    key = f"{params.cameraKey or ''} {params.lidarKey or ''}".lower()
+    explicit_v4 = "v4" in key or "rx1r2" in key
+    explicit_v5 = (
+        "v5" in key
+        or "survey61" in key
+        or "survey24" in key
+        or "a6100" in key
+        or "rx1r3" in key
+        or "zenmuse" in key
+        or "p1" in key
+        or "lidar" in key
+    )
+    is_v5 = explicit_v5 or not explicit_v4
+    return (40.0, 0.3) if is_v5 else (35.0, 0.2)
+
+
+def _mission_turnaround_radius(line_spacing: float, default_turnaround_radius: float) -> float:
+    radius = MISSION_DEFAULT_TURNAROUND_DISTANCE_M / 2.0
+    max_side_offset = max(MISSION_DEFAULT_TURNAROUND_SIDE_OFFSET_M - line_spacing, 0.0)
+    radius = min((max_side_offset / 2.0 + line_spacing) / 2.0, radius)
+    return max(radius, default_turnaround_radius)
+
+
+def _connector_length_between_sweeps(
+    prev_sweep: tuple[float, float, float],
+    next_sweep: tuple[float, float, float],
+    turnaround_radius: float,
+) -> float:
+    _, prev_end_along, prev_cross = prev_sweep
+    next_start_along, _, next_cross = next_sweep
+    along_delta = abs(next_start_along - prev_end_along)
+    cross_delta = abs(next_cross - prev_cross)
+    straight_span = max(0.0, cross_delta - 2.0 * turnaround_radius)
+    return math.pi * turnaround_radius + math.hypot(along_delta, straight_span)
+
+
+def _scanline_sweep_metrics(
+    edges: list[_ScanlineEdge],
+    line_count_est: int,
+    line_spacing: float,
+    params: FlightParamsModel,
+    *,
+    short_line_factor: float = 5.0,
+) -> dict[str, float]:
+    sweeps: list[tuple[float, float, float]] = []
+    lengths: list[float] = []
+    gaps: list[float] = []
+    fragmented = 0
+
+    for i in range(-line_count_est - 1, line_count_est + 2):
+        offset = i * line_spacing
+        intervals = _scanline_intervals(edges, offset)
+        if not intervals:
+            continue
+        if len(intervals) > 1:
+            fragmented += len(intervals) - 1
+            for j in range(1, len(intervals)):
+                gap = intervals[j][0] - intervals[j - 1][1]
+                if gap > 1e-9:
+                    gaps.append(gap)
+        direction_forward = len(sweeps) % 2 == 0
+        sweep_start = intervals[0][0] if direction_forward else intervals[-1][1]
+        sweep_end = intervals[-1][1] if direction_forward else intervals[0][0]
+        sweep_length = abs(sweep_end - sweep_start)
+        lengths.append(sweep_length)
+        sweeps.append((sweep_start, sweep_end, offset))
+
+    default_turnaround_radius, _ = _flight_turn_model(params)
+    turnaround_radius = _mission_turnaround_radius(line_spacing, default_turnaround_radius)
+    connector_length = 0.0
+    for idx in range(1, len(sweeps)):
+        connector_length += _connector_length_between_sweeps(sweeps[idx - 1], sweeps[idx], turnaround_radius)
+
+    total_length = sum(lengths)
+    total_gap = sum(gaps)
+    total_connected = total_length + connector_length
+    return {
+        "line_count": float(len(lengths)),
+        "fragmented_line_count": float(fragmented),
+        "fragmented_line_fraction": (fragmented / len(lengths)) if lengths else 0.0,
+        "inter_segment_gap_length_m": total_gap,
+        "overflight_transit_fraction": connector_length / max(1.0, total_connected),
+        "turn_count": float(max(0, len(lengths) - 1)),
+        "total_flight_line_length_m": total_length,
+        "connected_path_length_m": total_connected,
+        "connector_length_m": connector_length,
+        "mean_line_length_m": float(np.mean(lengths)) if lengths else 0.0,
+        "median_line_length_m": float(np.median(lengths)) if lengths else 0.0,
+        "short_line_fraction": (sum(1 for length in lengths if length < max(80.0, line_spacing * short_line_factor)) / len(lengths)) if lengths else 1.0,
+    }
 
 
 def lidar_target_density(params: FlightParamsModel) -> float:
@@ -374,9 +470,6 @@ def _estimate_region_flight_time_geos_deprecated(
 ) -> dict[str, float]:
     line_spacing = line_spacing_for_params(params)
     along_len, cross_width = project_extents(polygon, bearing_deg)
-    lengths: list[float] = []
-    gaps: list[float] = []
-    fragmented = 0
     center = polygon.centroid
     perp_rad = deg_to_rad((bearing_deg + 90.0) % 360.0)
     along_rad = deg_to_rad(bearing_deg)
@@ -384,8 +477,12 @@ def _estimate_region_flight_time_geos_deprecated(
     px, py = math.sin(perp_rad), math.cos(perp_rad)
     line_count_est = max(1, int(math.ceil(cross_width / max(1.0, line_spacing))))
     half_span = max(along_len, cross_width) * 0.75
+    sweeps: list[tuple[float, float, float]] = []
+    lengths: list[float] = []
+    gaps: list[float] = []
+    fragmented = 0
 
-    for i in range(-line_count_est - 1, line_count_est + 2):
+    for offset_index, i in enumerate(range(-line_count_est - 1, line_count_est + 2)):
         offset = i * line_spacing
         cx = center.x + px * offset
         cy = center.y + py * offset
@@ -408,26 +505,37 @@ def _estimate_region_flight_time_geos_deprecated(
             fragmented += len(segments) - 1
             for j in range(1, len(segments)):
                 gaps.append(segments[j].distance(segments[j - 1]))
-        lengths.extend(segment.length for segment in segments)
+        direction_forward = len(sweeps) % 2 == 0
+        start_along = segments[0].bounds[0] if direction_forward else segments[-1].bounds[2]
+        end_along = segments[-1].bounds[2] if direction_forward else segments[0].bounds[0]
+        lengths.append(abs(end_along - start_along))
+        sweeps.append((start_along, end_along, offset))
+
+    default_turnaround_radius, _ = _flight_turn_model(params)
+    turnaround_radius = _mission_turnaround_radius(line_spacing, default_turnaround_radius)
+    connector_length = 0.0
+    for idx in range(1, len(sweeps)):
+        connector_length += _connector_length_between_sweeps(sweeps[idx - 1], sweeps[idx], turnaround_radius)
 
     total_length = sum(lengths)
     total_gap = sum(gaps)
+    total_connected = total_length + connector_length
     speed = params.speedMps or (LIDAR_DEFAULTS["default_speed_mps"] if params.payloadKind == "lidar" else 12.0)
-    turn_count = max(0, len(lengths) - 1) + fragmented
+    turn_count = max(0, len(lengths) - 1)
     return {
         "line_spacing_m": line_spacing,
         "line_count": float(len(lengths)),
         "fragmented_line_count": float(fragmented),
         "fragmented_line_fraction": (fragmented / len(lengths)) if lengths else 0.0,
         "inter_segment_gap_length_m": total_gap,
-        "overflight_transit_fraction": total_gap / max(1.0, total_length + total_gap),
+        "overflight_transit_fraction": connector_length / max(1.0, total_connected),
         "turn_count": float(turn_count),
         "total_flight_line_length_m": total_length,
         "mean_line_length_m": float(np.mean(lengths)) if lengths else 0.0,
         "median_line_length_m": float(np.median(lengths)) if lengths else 0.0,
         "short_line_fraction": (sum(1 for length in lengths if length < max(80.0, line_spacing * 5.0)) / len(lengths)) if lengths else 1.0,
         "cruise_speed_mps": speed,
-        "total_mission_time_sec": (total_length + total_gap) / max(1.0, speed) + turn_count * 8.0 + 25.0,
+        "total_mission_time_sec": total_connected / max(1.0, speed) + 25.0,
     }
 
 
@@ -440,9 +548,6 @@ def estimate_region_flight_time(
 ) -> dict[str, float]:
     line_spacing = line_spacing_for_params(params)
     along_len, cross_width = project_extents(polygon, bearing_deg)
-    lengths: list[float] = []
-    gaps: list[float] = []
-    fragmented = 0
     center = polygon.centroid
     center_x = float(center.x)
     center_y = float(center.y)
@@ -452,38 +557,22 @@ def estimate_region_flight_time(
     px, py = math.sin(perp_rad), math.cos(perp_rad)
     line_count_est = max(1, int(math.ceil(cross_width / max(1.0, line_spacing))))
     edges = _scanline_edges(polygon, center_x=center_x, center_y=center_y, ux=ux, uy=uy, px=px, py=py)
-
-    for i in range(-line_count_est - 1, line_count_est + 2):
-        offset = i * line_spacing
-        intervals = _scanline_intervals(edges, offset)
-        if not intervals:
-            continue
-        if len(intervals) > 1:
-            fragmented += len(intervals) - 1
-            for j in range(1, len(intervals)):
-                gap = intervals[j][0] - intervals[j - 1][1]
-                if gap > 1e-9:
-                    gaps.append(gap)
-        lengths.extend(end_x - start_x for start_x, end_x in intervals)
-
-    total_length = sum(lengths)
-    total_gap = sum(gaps)
+    summary = _scanline_sweep_metrics(edges, line_count_est, line_spacing, params)
     speed = params.speedMps or (LIDAR_DEFAULTS["default_speed_mps"] if params.payloadKind == "lidar" else 12.0)
-    turn_count = max(0, len(lengths) - 1) + fragmented
     return {
         "line_spacing_m": line_spacing,
-        "line_count": float(len(lengths)),
-        "fragmented_line_count": float(fragmented),
-        "fragmented_line_fraction": (fragmented / len(lengths)) if lengths else 0.0,
-        "inter_segment_gap_length_m": total_gap,
-        "overflight_transit_fraction": total_gap / max(1.0, total_length + total_gap),
-        "turn_count": float(turn_count),
-        "total_flight_line_length_m": total_length,
-        "mean_line_length_m": float(np.mean(lengths)) if lengths else 0.0,
-        "median_line_length_m": float(np.median(lengths)) if lengths else 0.0,
-        "short_line_fraction": (sum(1 for length in lengths if length < max(80.0, line_spacing * 5.0)) / len(lengths)) if lengths else 1.0,
+        "line_count": summary["line_count"],
+        "fragmented_line_count": summary["fragmented_line_count"],
+        "fragmented_line_fraction": summary["fragmented_line_fraction"],
+        "inter_segment_gap_length_m": summary["inter_segment_gap_length_m"],
+        "overflight_transit_fraction": summary["overflight_transit_fraction"],
+        "turn_count": summary["turn_count"],
+        "total_flight_line_length_m": summary["total_flight_line_length_m"],
+        "mean_line_length_m": summary["mean_line_length_m"],
+        "median_line_length_m": summary["median_line_length_m"],
+        "short_line_fraction": summary["short_line_fraction"],
         "cruise_speed_mps": speed,
-        "total_mission_time_sec": (total_length + total_gap) / max(1.0, speed) + turn_count * 8.0 + 25.0,
+        "total_mission_time_sec": summary["connected_path_length_m"] / max(1.0, speed) + 25.0,
     }
 
 

@@ -4,7 +4,12 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, WINGTRA_LIDAR_XT32M2X } from "@/domain/lidar";
+import type { PlaneHardwareVersion } from "@/domain/types";
 import type { PolygonParams } from "@/components/MapFlightDirection/types";
+import {
+  getCompatibleWingtraPayloadOptionsForAnalysisParams,
+  getPreferredWingtraPlaneHardwareVersionForAnalysisParams,
+} from "@/interop/wingtra/convert";
 
 type Props = {
   open: boolean;
@@ -29,6 +34,15 @@ export default function PolygonParamsDialog({
   }, []);
 
   const [payloadKind, setPayloadKind] = React.useState<"camera" | "lidar">(defaults?.payloadKind ?? "camera");
+  const [planeHardwareVersion, setPlaneHardwareVersion] = React.useState<PlaneHardwareVersion>(
+    defaults?.planeHardwareVersion ??
+      getPreferredWingtraPlaneHardwareVersionForAnalysisParams({
+        payloadKind: defaults?.payloadKind ?? "camera",
+        cameraKey: defaults?.cameraKey,
+        lidarKey: defaults?.lidarKey,
+      }) ??
+      "5",
+  );
   const [altitudeAGL, setAltitudeAGL] = React.useState<number>(defaults?.altitudeAGL ?? 100);
   const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 70);
   const [sideOverlap, setSideOverlap] = React.useState<number>(defaults?.sideOverlap ?? 70);
@@ -59,9 +73,29 @@ export default function PolygonParamsDialog({
     { key: WINGTRA_LIDAR_XT32M2X.key, label: WINGTRA_LIDAR_XT32M2X.names?.[0] || 'Wingtra Lidar' },
   ];
 
+  const compatibleWingtraHardwareVersions = React.useMemo(() => {
+    const options = getCompatibleWingtraPayloadOptionsForAnalysisParams({
+      payloadKind,
+      cameraKey: payloadKind === "camera" ? cameraKey : undefined,
+      lidarKey: payloadKind === "lidar" ? lidarKey : undefined,
+    });
+
+    const versions = Array.from(new Set(options.map((option) => option.planeHardwareVersion))) as PlaneHardwareVersion[];
+    return versions.length > 0 ? versions : (["5"] as PlaneHardwareVersion[]);
+  }, [cameraKey, lidarKey, payloadKind]);
+
   React.useEffect(() => {
     if (open) {
       setPayloadKind(defaults?.payloadKind ?? "camera");
+      setPlaneHardwareVersion(
+        defaults?.planeHardwareVersion ??
+          getPreferredWingtraPlaneHardwareVersionForAnalysisParams({
+            payloadKind: defaults?.payloadKind ?? "camera",
+            cameraKey: defaults?.cameraKey,
+            lidarKey: defaults?.lidarKey,
+          }) ??
+          "5",
+      );
       setAltitudeAGL(defaults?.altitudeAGL ?? 100);
       setFrontOverlap(defaults?.frontOverlap ?? ((defaults?.payloadKind ?? "camera") === "lidar" ? 0 : 70));
       setSideOverlap(defaults?.sideOverlap ?? 70);
@@ -77,7 +111,18 @@ export default function PolygonParamsDialog({
       setRotateCamera90(rotate);
       setShowAdvanced(!!(defaults?.useCustomBearing) || rotate);
     }
-  }, [open, defaults?.payloadKind, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.lidarKey, defaults?.speedMps, defaults?.lidarReturnMode, defaults?.mappingFovDeg, defaults?.maxLidarRangeM, defaults?.useCustomBearing, defaults?.customBearingDeg, defaults?.cameraYawOffsetDeg]);
+  }, [open, defaults?.payloadKind, defaults?.planeHardwareVersion, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.lidarKey, defaults?.speedMps, defaults?.lidarReturnMode, defaults?.mappingFovDeg, defaults?.maxLidarRangeM, defaults?.useCustomBearing, defaults?.customBearingDeg, defaults?.cameraYawOffsetDeg]);
+
+  React.useEffect(() => {
+    if (compatibleWingtraHardwareVersions.includes(planeHardwareVersion)) return;
+    const preferred =
+      getPreferredWingtraPlaneHardwareVersionForAnalysisParams({
+        payloadKind,
+        cameraKey: payloadKind === "camera" ? cameraKey : undefined,
+        lidarKey: payloadKind === "lidar" ? lidarKey : undefined,
+      }) ?? compatibleWingtraHardwareVersions[compatibleWingtraHardwareVersions.length - 1] ?? "5";
+    setPlaneHardwareVersion(preferred);
+  }, [cameraKey, compatibleWingtraHardwareVersions, lidarKey, payloadKind, planeHardwareVersion]);
 
   if (!open || !polygonId) return null;
 
@@ -88,6 +133,21 @@ export default function PolygonParamsDialog({
           <CardTitle className="text-sm">Flight setup for <span className="font-mono">#{polygonId.slice(0,8)}</span></CardTitle>
         </CardHeader>
         <CardContent className="space-y-2">
+          <label className="text-xs text-gray-600 block">
+            Drone Version
+            <Select value={planeHardwareVersion} onValueChange={(value) => setPlaneHardwareVersion(value as PlaneHardwareVersion)}>
+              <SelectTrigger className="h-8 text-xs mt-1">
+                <SelectValue placeholder="Select drone version" />
+              </SelectTrigger>
+              <SelectContent>
+                {compatibleWingtraHardwareVersions.map((version) => (
+                  <SelectItem value={version} key={version} className="text-xs">
+                    {version === "4" ? "WingtraOne" : "WingtraRay"}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </label>
           <label className="text-xs text-gray-600 block">
             Payload
             <Select value={payloadKind} onValueChange={(value) => setPayloadKind(value as "camera" | "lidar")}>
@@ -252,6 +312,7 @@ export default function PolygonParamsDialog({
                 const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
                 const payload: PolygonParams = {
                   payloadKind,
+                  planeHardwareVersion,
                   altitudeAGL: Math.max(1, Number.isFinite(altitudeAGL) ? altitudeAGL : 100),
                   frontOverlap: payloadKind === "lidar" ? 0 : clampNumber(frontOverlap, 0, 95, 70),
                   sideOverlap: clampNumber(sideOverlap, 0, 95, 70),
@@ -278,6 +339,7 @@ export default function PolygonParamsDialog({
                   const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
                   const payload: PolygonParams = {
                     payloadKind,
+                    planeHardwareVersion,
                     altitudeAGL: Math.max(1, Number.isFinite(altitudeAGL) ? altitudeAGL : 100),
                     frontOverlap: payloadKind === "lidar" ? 0 : clampNumber(frontOverlap, 0, 95, 70),
                     sideOverlap: clampNumber(sideOverlap, 0, 95, 70),
