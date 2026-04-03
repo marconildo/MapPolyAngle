@@ -6,12 +6,30 @@
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
+import type { FlightParams, PlannedFlightGeometry } from '@/domain/types';
 import type { Map as MapboxMap } from 'mapbox-gl';
 import { haversineDistance } from '@/flight/geometry';
 import { generateFlightLinesForPolygon } from '@/flight/flightLines';
+import { generatePlannedFlightGeometryForPolygon } from '@/flight/plannedGeometry';
 import { destination as geoDestination } from '@/utils/terrainAspectHybrid';
 
 export { generateFlightLinesForPolygon } from '@/flight/flightLines';
+
+function toPlannedFlightGeometry(
+  rawGeometry: ReturnType<typeof generateFlightLinesForPolygon>,
+): PlannedFlightGeometry {
+  return {
+    ...rawGeometry,
+    flightLines: rawGeometry.flightLines as [number, number][][],
+    sweepLines: [],
+    gridPoints: [],
+    leadInPoints: [],
+    leadOutPoints: [],
+    connectedLines: [],
+    turnaroundRadiusM: 0,
+    turnBlocks: [],
+  };
+}
 
 function getLineColor(quality?: string) {
   switch (quality) {
@@ -422,22 +440,24 @@ export function setImageryOverlayOnMap(
   }, getDrawLayerAnchor(map));
 }
 
-export function addFlightLinesForPolygon(
+export function renderFlightLinesForPolygon(
   map: MapboxMap,
   polygonId: string,
-  ring: number[][],
-  bearingDeg: number,
-  lineSpacingM: number,
-  quality?: string
-): { flightLines: number[][][]; sweepIndices: number[]; lineSpacing: number } {
-  const { flightLines, sweepIndices, lineSpacing, bounds } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
+  geometry: PlannedFlightGeometry & {
+    bounds?: { minLng: number; minLat: number; maxLng: number; maxLat: number };
+  },
+  quality?: string,
+  debugBearingDeg?: number,
+): PlannedFlightGeometry {
+  const { flightLines, connectedLines, lineSpacing, bounds } = geometry;
+  const displayLines = connectedLines.length > 0 ? connectedLines : flightLines;
 
   const sourceId = `flight-lines-source-${polygonId}`;
   const layerId = `flight-lines-layer-${polygonId}`;
 
   const data = {
     type: 'FeatureCollection',
-    features: flightLines.map((line) => ({
+    features: displayLines.map((line) => ({
       type: 'Feature',
       geometry: {
         type: 'LineString',
@@ -478,18 +498,38 @@ export function addFlightLinesForPolygon(
     }, beforeId);
   }
 
-  if (flightLines.length === 0) {
+  if (displayLines.length === 0) {
     try {
       const b = bounds;
+      if (!b) {
+        throw new Error('bounds unavailable');
+      }
       const centerLng = (b.minLng + b.maxLng) / 2;
       const centerLat = (b.minLat + b.maxLat) / 2;
       console.warn(
-        `[flight-lines] No segments inside polygon for ${polygonId}. Debug: bearing=${bearingDeg.toFixed(2)}, spacing=${lineSpacing.toFixed(2)}m, center=(${centerLng.toFixed(5)},${centerLat.toFixed(5)}), bbox=lng[${b.minLng.toFixed(5)},${b.maxLng.toFixed(5)}], lat[${b.minLat.toFixed(5)},${b.maxLat.toFixed(5)}]`
+        `[flight-lines] No segments inside polygon for ${polygonId}. Debug: bearing=${(debugBearingDeg ?? 0).toFixed(2)}, spacing=${lineSpacing.toFixed(2)}m, center=(${centerLng.toFixed(5)},${centerLat.toFixed(5)}), bbox=lng[${b.minLng.toFixed(5)},${b.maxLng.toFixed(5)}], lat[${b.minLat.toFixed(5)},${b.maxLat.toFixed(5)}]`
       );
     } catch {}
   }
 
-  return { flightLines, sweepIndices, lineSpacing };
+  return geometry;
+}
+
+export function addFlightLinesForPolygon(
+  map: MapboxMap,
+  polygonId: string,
+  ring: number[][],
+  bearingDeg: number,
+  lineSpacingM: number,
+  params?: FlightParams,
+  quality?: string
+): PlannedFlightGeometry {
+  const rawGeometry = params ? null : generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
+  const geometry = params
+    ? generatePlannedFlightGeometryForPolygon(ring as [number, number][], bearingDeg, lineSpacingM, params)
+    : toPlannedFlightGeometry(rawGeometry!);
+
+  return renderFlightLinesForPolygon(map, polygonId, geometry, quality, bearingDeg);
 }
 
 export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {

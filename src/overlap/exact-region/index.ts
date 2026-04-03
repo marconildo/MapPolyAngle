@@ -1,8 +1,8 @@
 import { DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, forwardSpacingRotated, lineSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import type { FlightParams, TerrainTile } from "@/domain/types";
-import { build3DFlightPath, calculateOptimalTerrainZoom, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
-import { generateFlightLinesForPolygon } from "@/flight/flightLines";
+import type { CameraModel, FlightParams, PlannedFlightGeometry, TerrainTile } from "@/domain/types";
+import { build3DFlightPath, calculateOptimalTerrainZoom, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
+import { generatePlannedFlightGeometryForPolygon, summarizePlannedFlightGeometry } from "@/flight/plannedGeometry";
 import type {
   ExactCameraTileInput,
   ExactCameraTileOutput,
@@ -16,6 +16,7 @@ import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import type { GSDStats, LidarStripMeters, PaddedDemTileRGBA, PoseMeters, TileRGBA } from "@/overlap/types";
 import { tilesCoveringPolygon } from "@/overlap/tileCoverage";
 import type { TerrainPartitionSolutionPreview } from "@/terrain-partition/types";
+import { evaluatePreparedRegionOrientation, prepareRegionOrientationContext } from "@/utils/terrainPartitionObjective";
 
 const CAMERA_REGISTRY: Record<string, typeof SONY_RX1R2> = {
   SONY_RX1R2,
@@ -32,7 +33,20 @@ const DEFAULT_EXACT_OPTIMIZE_ZOOM = 14;
 const DEFAULT_TIME_WEIGHT = 0.1;
 const DEFAULT_CAMERA_SPEED_MPS = 12;
 const DEFAULT_MIN_OVERLAP_FOR_GSD = 3;
+const HYBRID_SURROGATE_POSE_THRESHOLD = 300;
+const HYBRID_SURROGATE_STEP_DEG = 10;
+const HYBRID_SURROGATE_MAX_HOTSPOTS = 3;
+const HYBRID_SURROGATE_MIN_SEPARATION_DEG = 30;
+const HYBRID_SURROGATE_ADDITIONAL_HOTSPOT_RELATIVE_COST_WINDOW = 0.03;
 
+function isExactRuntimeProfilingEnabled() {
+  return typeof process !== "undefined" && process.env?.EXACT_RUNTIME_PROFILE === "1";
+}
+
+function logExactRuntimeProfile(message: string) {
+  if (!isExactRuntimeProfilingEnabled()) return;
+  console.error(`[exact-runtime-profile] ${message}`);
+}
 export type ExactMetricKind = "gsd" | "density";
 export type ExactSearchMode = "local" | "global";
 
@@ -58,6 +72,7 @@ export interface ExactRegionRuntime {
   terrainProvider: ExactTerrainProvider;
   tileEvaluator: ExactTileEvaluator;
   yieldToEventLoop?: () => Promise<void>;
+  candidateConcurrency?: number;
 }
 
 export interface ExactRegionCommonArgs {
@@ -169,6 +184,60 @@ export interface ExactSolutionDebugTrace {
   regions: ExactRegionSearchTrace[];
 }
 
+type ExactMissionEstimate = {
+  missionTimeSec: number;
+  totalLengthM: number;
+  speedMps: number;
+  lineCount: number;
+};
+
+type ExactBearingArtifacts = {
+  normalizedBearingDeg: number;
+  geometry: PlannedFlightGeometry;
+  path3d: [number, number, number][][];
+  mission: ExactMissionEstimate;
+  camera?: {
+    camera: CameraModel;
+    poses: PoseMeters[];
+    poseCameraIndices: Uint16Array;
+  };
+  lidar?: {
+    strips: LidarStripMeters[];
+    stripsByTile: Map<string, LidarStripMeters[]>;
+  };
+};
+
+type ExactCandidateCacheEntry = {
+  requestOrder: number;
+  promise?: Promise<ExactBearingCandidate | null>;
+};
+
+type ExactBearingEvaluationContext = {
+  runtime: ExactRegionRuntime;
+  scopeId: string;
+  ring: [number, number][];
+  safeParams: FlightParams;
+  altitudeMode: "legacy" | "min-clearance";
+  minClearanceM: number;
+  exactZoom: number;
+  timeWeight: number;
+  clipInnerBufferM: number;
+  minOverlapForGsd: number;
+  lineSpacingM: number;
+  geometryTiles: TerrainTile[];
+  tileRefs: ExactTileRef[];
+  terrainTilesPromise?: Promise<Map<string, TileRGBA>>;
+  terrainTilesWithHaloPromise?: Promise<Map<string, ExactTileWithHalo>>;
+  artifactCache: Map<number, Promise<ExactBearingArtifacts>>;
+  candidateCache: Map<number, ExactCandidateCacheEntry>;
+  nextRequestOrder: number;
+};
+
+type SurrogateBasinCandidate = {
+  bearingDeg: number;
+  totalCost: number;
+};
+
 function tileKey(tileRef: ExactTileRef) {
   return `${tileRef.z}/${tileRef.x}/${tileRef.y}`;
 }
@@ -213,6 +282,96 @@ function path3dLengthMeters(path3d: [number, number, number][][]) {
     }
   }
   return total;
+}
+
+function getSpeedForParams(params: FlightParams) {
+  return isLidarParams(params)
+    ? (params.speedMps ?? getLidarModel(params.lidarKey).defaultSpeedMps)
+    : DEFAULT_CAMERA_SPEED_MPS;
+}
+
+function buildLidarStripBuckets(
+  tileRefs: ExactTileRef[],
+  strips: LidarStripMeters[],
+) {
+  const buckets = new Map<string, LidarStripMeters[]>();
+  for (const tileRef of tileRefs) {
+    const affectingStrips: LidarStripMeters[] = [];
+    for (const strip of strips) {
+      if (lidarStripMayAffectTile(strip, tileRef)) {
+        affectingStrips.push(strip);
+      }
+    }
+    if (affectingStrips.length > 0) {
+      buckets.set(tileKey(tileRef), affectingStrips);
+    }
+  }
+  return buckets;
+}
+
+function getCandidateConcurrency(runtime: ExactRegionRuntime) {
+  return Math.max(1, Math.floor(runtime.candidateConcurrency ?? 1));
+}
+
+function getTileConcurrency(runtime: ExactRegionRuntime) {
+  return Math.max(1, Math.floor(runtime.candidateConcurrency ?? 1));
+}
+
+function estimatePoseCountFromMissionLength(totalFlightLineLengthM: number, photoSpacingM: number | null) {
+  if (!(photoSpacingM && photoSpacingM > 0)) return 0;
+  return totalFlightLineLengthM / photoSpacingM;
+}
+
+function axialDistanceDeg(left: number, right: number) {
+  const diff = Math.abs(normalizeAxialBearingDeg(left - right));
+  return Math.min(diff, 180 - diff);
+}
+
+function collectBestSurrogateBasins(
+  candidates: SurrogateBasinCandidate[],
+  maxHotspots: number,
+  minSeparationDeg: number,
+  additionalHotspotRelativeCostWindow: number,
+) {
+  if (candidates.length === 0) return [] as SurrogateBasinCandidate[];
+  const sorted = [...candidates].sort((left, right) => left.totalCost - right.totalCost || left.bearingDeg - right.bearingDeg);
+  const selected: SurrogateBasinCandidate[] = [];
+  const bestCost = sorted[0].totalCost;
+  for (const candidate of sorted) {
+    if (
+      selected.length > 0
+      && candidate.totalCost > bestCost * (1 + additionalHotspotRelativeCostWindow)
+    ) {
+      break;
+    }
+    if (selected.every((selectedCandidate) => axialDistanceDeg(selectedCandidate.bearingDeg, candidate.bearingDeg) >= minSeparationDeg)) {
+      selected.push(candidate);
+    }
+    if (selected.length >= maxHotspots) break;
+  }
+  return selected;
+}
+
+async function mapWithConcurrencyLimit<T, R>(
+  values: readonly T[],
+  maxConcurrency: number,
+  mapper: (value: T, index: number) => Promise<R>,
+) {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, maxConcurrency), values.length);
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < values.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await mapper(values[currentIndex], currentIndex);
+      }
+    }),
+  );
+
+  return results;
 }
 
 function buildScoreBreakdown(
@@ -322,279 +481,300 @@ async function resolveGeometryTiles(
   return toTerrainTiles(tiles);
 }
 
-function estimateMissionBreakdown(
-  ring: [number, number][],
-  bearingDeg: number,
-  lineSpacing: number,
-  terrainTiles: TerrainTile[],
-  params: FlightParams,
-  altitudeMode: "legacy" | "min-clearance",
-  minClearanceM: number,
-  turnExtendM: number,
-) {
-  const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
-  if (!flightLines.length) {
-    return {
-      missionTimeSec: 0,
-      totalLengthM: 0,
-      speedMps: isLidarParams(params)
-        ? (params.speedMps ?? getLidarModel(params.lidarKey).defaultSpeedMps)
-        : DEFAULT_CAMERA_SPEED_MPS,
-      lineCount: 0,
-    };
-  }
-  const path3d = build3DFlightPath(
-    flightLines,
-    terrainTiles,
-    lineSpacing,
-    { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-    sweepIndices,
-  );
-  const totalLengthM = path3dLengthMeters(path3d);
-  const speedMps = isLidarParams(params)
-    ? (params.speedMps ?? getLidarModel(params.lidarKey).defaultSpeedMps)
-    : DEFAULT_CAMERA_SPEED_MPS;
-  return {
-    missionTimeSec: totalLengthM / Math.max(0.1, speedMps),
-    totalLengthM,
-    speedMps,
-    lineCount: flightLines.length,
-  };
-}
-
-async function buildCameraPosesForBearing(
-  scopeId: string,
-  ring: [number, number][],
-  params: FlightParams,
-  bearingDeg: number,
-  geometryTiles: TerrainTile[],
-  altitudeMode: "legacy" | "min-clearance",
-  minClearanceM: number,
-  turnExtendM: number,
-) {
-  const lineSpacing = getLineSpacingForParams(params);
-  const photoSpacing = getForwardSpacingForParams(params);
-  if (!photoSpacing || !(photoSpacing > 0)) {
-    return { poses: [] as PoseMeters[], lineSpacingM: lineSpacing };
-  }
-  const yawOffset = params.cameraYawOffsetDeg ?? 0;
-  const normalizeDeg = (value: number) => ((value % 360) + 360) % 360;
-  const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
-  const path3d = build3DFlightPath(
-    flightLines,
-    geometryTiles,
-    lineSpacing,
-    { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM },
-    sweepIndices,
-  );
-  const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false });
-  const filtered = ring.length >= 3
-    ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, ring))
-    : cameraPositions;
-  const poses: PoseMeters[] = filtered.map(([lng, lat, altMSL, yawDeg], index) => {
-    const [x, y] = lngLatToMeters(lng, lat);
-    return {
-      id: `exact_pose_${scopeId}_${index}`,
-      x,
-      y,
-      z: altMSL,
-      omega_deg: 0,
-      phi_deg: 0,
-      kappa_deg: normalizeDeg(-yawDeg + yawOffset),
-      polygonId: scopeId,
-    };
-  });
-  return { poses, lineSpacingM: lineSpacing };
-}
-
-async function buildLidarStripsForBearing(
-  scopeId: string,
-  ring: [number, number][],
-  params: FlightParams,
-  bearingDeg: number,
-  geometryTiles: TerrainTile[],
-  altitudeMode: "legacy" | "min-clearance",
-  minClearanceM: number,
-  turnExtendM: number,
-) {
-  const lineSpacing = getLineSpacingForParams(params);
-  const model = getLidarModel(params.lidarKey);
-  const altitudeAGL = params.altitudeAGL;
-  const mappingFovDeg = getLidarMappingFovDeg(model, params.mappingFovDeg);
-  const speedMps = params.speedMps ?? model.defaultSpeedMps;
-  const returnMode = params.lidarReturnMode ?? "single";
-  const maxLidarRangeM = params.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
-  const frameRateHz = params.lidarFrameRateHz ?? model.defaultFrameRateHz;
-  const azimuthSectorCenterDeg = params.lidarAzimuthSectorCenterDeg ?? model.defaultAzimuthSectorCenterDeg ?? 0;
-  const boresightYawDeg = params.lidarBoresightYawDeg ?? model.boresightYawDeg ?? 0;
-  const boresightPitchDeg = params.lidarBoresightPitchDeg ?? model.boresightPitchDeg ?? 0;
-  const boresightRollDeg = params.lidarBoresightRollDeg ?? model.boresightRollDeg ?? 0;
-  const comparisonMode = params.lidarComparisonMode ?? "first-return";
-  const densityPerPass = lidarSinglePassDensity(model, altitudeAGL, speedMps, returnMode, mappingFovDeg);
-  const halfFovTan = Math.tan((mappingFovDeg * Math.PI) / 360);
-  const strips: LidarStripMeters[] = [];
-  const { flightLines, sweepIndices } = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacing);
-  const sweeps = groupFlightLinesForTraversal(flightLines, lineSpacing, sweepIndices);
-  let passIndex = 0;
-  for (const sweep of sweeps) {
-    const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
-    const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
-    const firstFragment = orientedFragments[0];
-    const lastFragment = orientedFragments[orientedFragments.length - 1];
-    if (!Array.isArray(firstFragment) || firstFragment.length < 2 || !Array.isArray(lastFragment) || lastFragment.length < 2) continue;
-    const activeSweepLine = [
-      extendFlightLineForTurnRunout(firstFragment, turnExtendM)[0],
-      ...orientedFragments.flatMap((fragment, fragmentIndex) => fragmentIndex === 0 ? fragment : fragment.slice(1)),
-      extendFlightLineForTurnRunout(lastFragment, turnExtendM).slice(-1)[0],
-    ];
-    const sweepPath3d = build3DFlightPath(
-      [activeSweepLine],
-      geometryTiles,
-      lineSpacing,
-      { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, turnExtendM: 0 },
-    )[0];
-    if (!Array.isArray(sweepPath3d) || sweepPath3d.length < 2) continue;
-    const localPassIndex = passIndex++;
-    for (let i = 1; i < sweepPath3d.length; i++) {
-      const start = sweepPath3d[i - 1];
-      const end = sweepPath3d[i];
-      if (!Array.isArray(start) || !Array.isArray(end) || start.length < 3 || end.length < 3) continue;
-      const [x1, y1] = lngLatToMeters(start[0], start[1]);
-      const [x2, y2] = lngLatToMeters(end[0], end[1]);
-      const terrainMin = queryMinMaxElevationAlongPolylineWGS84([[start[0], start[1]], [end[0], end[1]]], geometryTiles, 12).min;
-      const maxSensorAltitude = Math.max(start[2], end[2]);
-      const maxHalfWidth = Number.isFinite(terrainMin)
-        ? Math.max(lidarSwathWidth(altitudeAGL, mappingFovDeg) / 2, Math.max(1, (maxSensorAltitude - terrainMin) * halfFovTan))
-        : lidarSwathWidth(altitudeAGL, mappingFovDeg) / 2;
-      strips.push({
-        id: `${scopeId}-sweep-${localPassIndex}-seg-${i - 1}`,
-        polygonId: scopeId,
-        x1,
-        y1,
-        z1: start[2],
-        x2,
-        y2,
-        z2: end[2],
-        plannedAltitudeAGL: altitudeAGL,
-        halfWidthM: maxHalfWidth,
-        densityPerPass,
-        speedMps,
-        effectivePointRate: model.effectivePointRates[returnMode],
-        halfFovTan,
-        maxRangeM: maxLidarRangeM,
-        passIndex: localPassIndex,
-        frameRateHz,
-        nativeHorizontalFovDeg: model.nativeHorizontalFovDeg,
-        mappingFovDeg,
-        verticalAnglesDeg: model.verticalAnglesDeg,
-        returnMode,
-        comparisonMode,
-        azimuthSectorCenterDeg,
-        boresightYawDeg,
-        boresightPitchDeg,
-        boresightRollDeg,
-      });
-    }
-  }
-  return { strips, lineSpacingM: lineSpacing };
-}
-
-export async function evaluateRegionBearingExact(
+async function createExactBearingEvaluationContext(
   runtime: ExactRegionRuntime,
-  args: ExactRegionCommonArgs & { bearingDeg: number },
-): Promise<ExactBearingCandidate | null> {
-  const safeParams = { ...args.params, useCustomBearing: false, customBearingDeg: undefined };
+  args: ExactRegionCommonArgs,
+  safeParams: FlightParams,
+): Promise<ExactBearingEvaluationContext> {
   const lineSpacingM = getLineSpacingForParams(safeParams);
   const geometryTiles = await resolveGeometryTiles(runtime, args.ring, args.geometryTiles);
   const exactZoom = args.exactOptimizeZoom ?? DEFAULT_EXACT_OPTIMIZE_ZOOM;
-  const timeWeight = args.timeWeight ?? DEFAULT_TIME_WEIGHT;
-  const exactQualityWeight = 1 - timeWeight;
-  const normalizedBearingDeg = normalizeAxialBearingDeg(args.bearingDeg);
-  const tileRefs = (() => {
-    const seen = new Set<string>();
-    const refs: ExactTileRef[] = [];
-    for (const tile of tilesCoveringPolygon({ ring: args.ring }, exactZoom)) {
-      const ref = normalizeTileRef({ z: exactZoom, x: tile.x, y: tile.y });
-      const key = tileKey(ref);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      refs.push(ref);
-    }
-    return refs;
-  })();
-  if (runtime.yieldToEventLoop) {
-    await runtime.yieldToEventLoop();
+  const seen = new Set<string>();
+  const tileRefs: ExactTileRef[] = [];
+  for (const tile of tilesCoveringPolygon({ ring: args.ring }, exactZoom)) {
+    const ref = normalizeTileRef({ z: exactZoom, x: tile.x, y: tile.y });
+    const key = tileKey(ref);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tileRefs.push(ref);
   }
+  return {
+    runtime,
+    scopeId: args.scopeId,
+    ring: args.ring,
+    safeParams,
+    altitudeMode: args.altitudeMode,
+    minClearanceM: args.minClearanceM,
+    exactZoom,
+    timeWeight: args.timeWeight ?? DEFAULT_TIME_WEIGHT,
+    clipInnerBufferM: args.clipInnerBufferM ?? 0,
+    minOverlapForGsd: args.minOverlapForGsd ?? DEFAULT_MIN_OVERLAP_FOR_GSD,
+    lineSpacingM,
+    geometryTiles,
+    tileRefs,
+    artifactCache: new Map(),
+    candidateCache: new Map(),
+    nextRequestOrder: 0,
+  };
+}
 
-  if (isLidarParams(safeParams)) {
-    const { strips } = await buildLidarStripsForBearing(
-      args.scopeId,
-      args.ring,
-      safeParams,
-      normalizedBearingDeg,
-      geometryTiles,
-      args.altitudeMode,
-      args.minClearanceM,
-      args.turnExtendM,
-    );
-    if (!strips.length) return null;
-    const tileMapWithHalo = await runtime.terrainProvider.getTerrainTilesWithHalo(tileRefs, 1);
-    const perTileStats: GSDStats[] = [];
-    for (const tileRef of tileRefs) {
-      const tileBundle = tileMapWithHalo.get(tileKey(tileRef));
-      if (!tileBundle) continue;
-      const tileStrips = strips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
-      if (!tileStrips.length) continue;
-      const response = await runtime.tileEvaluator.evaluateLidarTile({
-        tile: tileBundle.tile,
-        demTile: tileBundle.demTile,
-        polygons: [{ id: args.scopeId, ring: args.ring }],
-        strips: tileStrips,
-        options: { clipInnerBufferM: args.clipInnerBufferM ?? 0 },
+function getTerrainTilesForContext(context: ExactBearingEvaluationContext) {
+  if (!context.terrainTilesPromise) {
+    context.terrainTilesPromise = context.runtime.terrainProvider.getTerrainTiles(context.tileRefs);
+  }
+  return context.terrainTilesPromise;
+}
+
+function getTerrainTilesWithHaloForContext(context: ExactBearingEvaluationContext) {
+  if (!context.terrainTilesWithHaloPromise) {
+    context.terrainTilesWithHaloPromise = context.runtime.terrainProvider.getTerrainTilesWithHalo(context.tileRefs, 1);
+  }
+  return context.terrainTilesWithHaloPromise;
+}
+
+async function getExactBearingArtifacts(
+  context: ExactBearingEvaluationContext,
+  bearingDeg: number,
+) {
+  const normalizedBearingDeg = normalizeAxialBearingDeg(bearingDeg);
+  const cacheKey = Math.round(normalizedBearingDeg * 1000);
+  if (!context.artifactCache.has(cacheKey)) {
+    context.artifactCache.set(cacheKey, (async (): Promise<ExactBearingArtifacts> => {
+      const startedAt = performance.now();
+      const geometry = generatePlannedFlightGeometryForPolygon(
+        context.ring,
+        normalizedBearingDeg,
+        context.lineSpacingM,
+        context.safeParams,
+      );
+      const path3d = geometry.flightLines.length > 0
+        ? build3DFlightPath(
+          geometry,
+          context.geometryTiles,
+          context.lineSpacingM,
+          {
+            altitudeAGL: context.safeParams.altitudeAGL,
+            mode: context.altitudeMode,
+            minClearance: context.minClearanceM,
+            preconnected: true,
+          },
+        )
+        : [];
+      const speedMps = getSpeedForParams(context.safeParams);
+      const totalLengthM = path3dLengthMeters(path3d);
+      const mission: ExactMissionEstimate = {
+        missionTimeSec: totalLengthM / Math.max(0.1, speedMps),
+        totalLengthM,
+        speedMps,
+        lineCount: geometry.sweepLines.length,
+      };
+
+      if (isLidarParams(context.safeParams)) {
+        const model = getLidarModel(context.safeParams.lidarKey);
+        const altitudeAGL = context.safeParams.altitudeAGL;
+        const mappingFovDeg = getLidarMappingFovDeg(model, context.safeParams.mappingFovDeg);
+        const speedMpsLidar = context.safeParams.speedMps ?? model.defaultSpeedMps;
+        const returnMode = context.safeParams.lidarReturnMode ?? "single";
+        const maxLidarRangeM = context.safeParams.maxLidarRangeM ?? model.defaultMaxRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M;
+        const frameRateHz = context.safeParams.lidarFrameRateHz ?? model.defaultFrameRateHz;
+        const azimuthSectorCenterDeg = context.safeParams.lidarAzimuthSectorCenterDeg ?? model.defaultAzimuthSectorCenterDeg ?? 0;
+        const boresightYawDeg = context.safeParams.lidarBoresightYawDeg ?? model.boresightYawDeg ?? 0;
+        const boresightPitchDeg = context.safeParams.lidarBoresightPitchDeg ?? model.boresightPitchDeg ?? 0;
+        const boresightRollDeg = context.safeParams.lidarBoresightRollDeg ?? model.boresightRollDeg ?? 0;
+        const comparisonMode = context.safeParams.lidarComparisonMode ?? "first-return";
+        const densityPerPass = lidarSinglePassDensity(model, altitudeAGL, speedMpsLidar, returnMode, mappingFovDeg);
+        const halfFovTan = Math.tan((mappingFovDeg * Math.PI) / 360);
+        const strips: LidarStripMeters[] = [];
+        let passIndex = 0;
+        for (const activeSweepLine of geometry.sweepLines) {
+          if (!Array.isArray(activeSweepLine) || activeSweepLine.length < 2) continue;
+          const sweepPath3d = build3DFlightPath(
+            [activeSweepLine],
+            context.geometryTiles,
+            context.lineSpacingM,
+            { altitudeAGL, mode: context.altitudeMode, minClearance: context.minClearanceM, turnExtendM: 0 },
+          )[0];
+          if (!Array.isArray(sweepPath3d) || sweepPath3d.length < 2) continue;
+          const localPassIndex = passIndex++;
+          for (let index = 1; index < sweepPath3d.length; index += 1) {
+            const start = sweepPath3d[index - 1];
+            const end = sweepPath3d[index];
+            const [x1, y1] = lngLatToMeters(start[0], start[1]);
+            const [x2, y2] = lngLatToMeters(end[0], end[1]);
+            const terrainMin = queryMinMaxElevationAlongPolylineWGS84(
+              [[start[0], start[1]], [end[0], end[1]]],
+              context.geometryTiles,
+              12,
+            ).min;
+            const maxSensorAltitude = Math.max(start[2], end[2]);
+            const maxHalfWidth = Number.isFinite(terrainMin)
+              ? Math.max(lidarSwathWidth(altitudeAGL, mappingFovDeg) / 2, Math.max(1, (maxSensorAltitude - terrainMin) * halfFovTan))
+              : lidarSwathWidth(altitudeAGL, mappingFovDeg) / 2;
+            strips.push({
+              id: `${context.scopeId}-sweep-${localPassIndex}-seg-${index - 1}`,
+              polygonId: context.scopeId,
+              x1,
+              y1,
+              z1: start[2],
+              x2,
+              y2,
+              z2: end[2],
+              plannedAltitudeAGL: altitudeAGL,
+              halfWidthM: maxHalfWidth,
+              densityPerPass,
+              speedMps: speedMpsLidar,
+              effectivePointRate: model.effectivePointRates[returnMode],
+              halfFovTan,
+              maxRangeM: maxLidarRangeM,
+              passIndex: localPassIndex,
+              frameRateHz,
+              nativeHorizontalFovDeg: model.nativeHorizontalFovDeg,
+              mappingFovDeg,
+              verticalAnglesDeg: model.verticalAnglesDeg,
+              returnMode,
+              comparisonMode,
+              azimuthSectorCenterDeg,
+              boresightYawDeg,
+              boresightPitchDeg,
+              boresightRollDeg,
+            });
+          }
+        }
+        const result = {
+          normalizedBearingDeg,
+          geometry,
+          path3d,
+          mission,
+          lidar: {
+            strips,
+            stripsByTile: buildLidarStripBuckets(context.tileRefs, strips),
+          },
+        };
+        logExactRuntimeProfile(
+          `bearing=${normalizedBearingDeg.toFixed(2)} phase=artifacts payload=lidar elapsedMs=${(performance.now() - startedAt).toFixed(1)} sweeps=${geometry.sweepLines.length} pathSegments=${path3d.length} strips=${strips.length}`,
+        );
+        return result;
+      }
+
+      const camera = getCameraForParams(context.safeParams);
+      const photoSpacing = getForwardSpacingForParams(context.safeParams);
+      const yawOffset = context.safeParams.cameraYawOffsetDeg ?? 0;
+      const normalizeDeg = (value: number) => ((value % 360) + 360) % 360;
+      const cameraPositions = photoSpacing && photoSpacing > 0
+        ? sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false })
+        : [];
+      const filteredPositions = context.ring.length >= 3
+        ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, context.ring))
+        : cameraPositions;
+      const poses = filteredPositions.map(([lng, lat, altMSL, yawDeg], index) => {
+        const [x, y] = lngLatToMeters(lng, lat);
+        return {
+          id: `exact_pose_${context.scopeId}_${index}`,
+          x,
+          y,
+          z: altMSL,
+          omega_deg: 0,
+          phi_deg: 0,
+          kappa_deg: normalizeDeg(-yawDeg + yawOffset),
+          polygonId: context.scopeId,
+        };
       });
-      const densityStats = response.perPolygon?.find((entry) => entry.polygonId === args.scopeId)?.densityStats;
-      if (densityStats) perTileStats.push(densityStats);
+      const result = {
+        normalizedBearingDeg,
+        geometry,
+        path3d,
+        mission,
+        camera: {
+          camera,
+          poses,
+          poseCameraIndices: new Uint16Array(poses.length),
+        },
+      };
+      logExactRuntimeProfile(
+        `bearing=${normalizedBearingDeg.toFixed(2)} phase=artifacts payload=camera elapsedMs=${(performance.now() - startedAt).toFixed(1)} sweeps=${geometry.sweepLines.length} pathSegments=${path3d.length} poses=${poses.length}`,
+      );
+      return result;
+    })());
+  }
+  return context.artifactCache.get(cacheKey)!;
+}
+
+async function evaluateRegionBearingExactWithContext(
+  context: ExactBearingEvaluationContext,
+  bearingDeg: number,
+): Promise<ExactBearingCandidate | null> {
+  const candidateStartedAt = performance.now();
+  if (context.runtime.yieldToEventLoop) {
+    await context.runtime.yieldToEventLoop();
+  }
+  const exactQualityWeight = 1 - context.timeWeight;
+  const artifacts = await getExactBearingArtifacts(context, bearingDeg);
+
+  if (artifacts.lidar) {
+    if (!artifacts.lidar.strips.length) return null;
+    const terrainStartedAt = performance.now();
+    const tileMapWithHalo = await getTerrainTilesWithHaloForContext(context);
+    const terrainElapsedMs = performance.now() - terrainStartedAt;
+    const tileEvalStartedAt = performance.now();
+    const tileResults = await mapWithConcurrencyLimit(
+      context.tileRefs,
+      getTileConcurrency(context.runtime),
+      async (tileRef) => {
+        const key = tileKey(tileRef);
+        const tileBundle = tileMapWithHalo.get(key);
+        const tileStrips = artifacts.lidar!.stripsByTile.get(key);
+        if (!tileBundle || !tileStrips || tileStrips.length === 0) return null;
+        const response = await context.runtime.tileEvaluator.evaluateLidarTile({
+          tile: tileBundle.tile,
+          demTile: tileBundle.demTile,
+          polygons: [{ id: context.scopeId, ring: context.ring }],
+          strips: tileStrips,
+          options: { clipInnerBufferM: context.clipInnerBufferM },
+        });
+        const densityStats = response.perPolygon?.find((entry) => entry.polygonId === context.scopeId)?.densityStats;
+        return densityStats
+          ? { touched: true, stats: densityStats }
+          : { touched: true, stats: null };
+      },
+    );
+    const perTileStats: GSDStats[] = [];
+    let touchedTileCount = 0;
+    for (const tileResult of tileResults) {
+      if (!tileResult) continue;
+      touchedTileCount += tileResult.touched ? 1 : 0;
+      if (tileResult.stats) perTileStats.push(tileResult.stats);
     }
     if (!perTileStats.length) return null;
+    const tileEvalElapsedMs = performance.now() - tileEvalStartedAt;
     const stats = aggregateMetricStats(perTileStats);
-    const scored = scoreExactLidarStats(stats, safeParams);
-    const mission = estimateMissionBreakdown(
-      args.ring,
-      normalizedBearingDeg,
-      lineSpacingM,
-      geometryTiles,
-      safeParams,
-      args.altitudeMode,
-      args.minClearanceM,
-      args.turnExtendM,
-    );
-    const normalizedTimeCost = mission.missionTimeSec / 180;
+    const scored = scoreExactLidarStats(stats, context.safeParams);
+    const normalizedTimeCost = artifacts.mission.missionTimeSec / 180;
     const costBreakdown = buildExactCostBreakdown(
       scored.breakdown.modelVersion,
       exactQualityWeight,
       scored.qualityCost,
-      timeWeight,
+      context.timeWeight,
       normalizedTimeCost,
     );
     const missionBreakdown: ExactMissionBreakdown = {
-      totalLengthM: mission.totalLengthM,
-      speedMps: mission.speedMps,
-      lineCount: mission.lineCount,
-      sampleCount: new Set(strips.map((strip) => strip.passIndex ?? -1)).size,
-      segmentCount: strips.length,
+      totalLengthM: artifacts.mission.totalLengthM,
+      speedMps: artifacts.mission.speedMps,
+      lineCount: artifacts.mission.lineCount,
+      sampleCount: new Set(artifacts.lidar.strips.map((strip) => strip.passIndex ?? -1)).size,
+      segmentCount: artifacts.lidar.strips.length,
       sampleLabel: "Flight lines",
     };
-    return {
-      bearingDeg: normalizedBearingDeg,
+    const result: ExactBearingCandidate = {
+      bearingDeg: artifacts.normalizedBearingDeg,
       exactCost: costBreakdown.total,
       qualityCost: scored.qualityCost,
-      missionTimeSec: mission.missionTimeSec,
+      missionTimeSec: artifacts.mission.missionTimeSec,
       normalizedTimeCost,
       metricKind: "density",
       stats,
       diagnostics: {
         qualityCost: scored.qualityCost,
-        missionTimeSec: mission.missionTimeSec,
+        missionTimeSec: artifacts.mission.missionTimeSec,
         normalizedTimeCost,
         targetDensityPtsM2: scored.targetDensityPtsM2,
         holeFraction: scored.holeFraction,
@@ -606,79 +786,80 @@ export async function evaluateRegionBearingExact(
       costBreakdown,
       missionBreakdown,
     };
+    logExactRuntimeProfile(
+      `bearing=${artifacts.normalizedBearingDeg.toFixed(2)} payload=lidar totalMs=${(performance.now() - candidateStartedAt).toFixed(1)} terrainMs=${terrainElapsedMs.toFixed(1)} tileEvalMs=${tileEvalElapsedMs.toFixed(1)} touchedTiles=${touchedTileCount} strips=${artifacts.lidar.strips.length} exactCost=${result.exactCost.toFixed(4)}`,
+    );
+    return result;
   }
 
-  const { poses } = await buildCameraPosesForBearing(
-    args.scopeId,
-    args.ring,
-    safeParams,
-    normalizedBearingDeg,
-    geometryTiles,
-    args.altitudeMode,
-    args.minClearanceM,
-    args.turnExtendM,
+  const cameraArtifacts = artifacts.camera;
+  if (!cameraArtifacts || cameraArtifacts.poses.length === 0) return null;
+  const terrainStartedAt = performance.now();
+  const tileMap = await getTerrainTilesForContext(context);
+  const terrainElapsedMs = performance.now() - terrainStartedAt;
+  const tileEvalStartedAt = performance.now();
+  const tileResults = await mapWithConcurrencyLimit(
+    context.tileRefs,
+    getTileConcurrency(context.runtime),
+    async (tileRef) => {
+      const key = tileKey(tileRef);
+      const tile = tileMap.get(key);
+      if (!tile) return null;
+      const response = await context.runtime.tileEvaluator.evaluateCameraTile({
+        tile,
+        polygons: [{ id: context.scopeId, ring: context.ring }],
+        poses: cameraArtifacts.poses,
+        cameras: [cameraArtifacts.camera],
+        poseCameraIndices: cameraArtifacts.poseCameraIndices,
+        camera: undefined,
+        options: {
+          clipInnerBufferM: context.clipInnerBufferM,
+          minOverlapForGsd: context.minOverlapForGsd,
+        },
+      });
+      const gsdStats = response.perPolygon?.find((entry) => entry.polygonId === context.scopeId)?.gsdStats;
+      return gsdStats
+        ? { touched: true, stats: gsdStats }
+        : { touched: true, stats: null };
+    },
   );
-  if (!poses.length) return null;
-  const camera = getCameraForParams(safeParams);
-  const tileMap = await runtime.terrainProvider.getTerrainTiles(tileRefs);
   const perTileStats: GSDStats[] = [];
-  for (const tileRef of tileRefs) {
-    const tile = tileMap.get(tileKey(tileRef));
-    if (!tile) continue;
-    const response = await runtime.tileEvaluator.evaluateCameraTile({
-      tile,
-      polygons: [{ id: args.scopeId, ring: args.ring }],
-      poses,
-      cameras: [camera],
-      poseCameraIndices: new Uint16Array(poses.length),
-      camera: undefined,
-      options: {
-        clipInnerBufferM: args.clipInnerBufferM ?? 0,
-        minOverlapForGsd: args.minOverlapForGsd ?? DEFAULT_MIN_OVERLAP_FOR_GSD,
-      },
-    });
-    const gsdStats = response.perPolygon?.find((entry) => entry.polygonId === args.scopeId)?.gsdStats;
-    if (gsdStats) perTileStats.push(gsdStats);
+  let touchedTileCount = 0;
+  for (const tileResult of tileResults) {
+    if (!tileResult) continue;
+    touchedTileCount += tileResult.touched ? 1 : 0;
+    if (tileResult.stats) perTileStats.push(tileResult.stats);
   }
   if (!perTileStats.length) return null;
+  const tileEvalElapsedMs = performance.now() - tileEvalStartedAt;
   const stats = aggregateMetricStats(perTileStats);
-  const scored = scoreExactCameraStats(stats, safeParams);
-  const mission = estimateMissionBreakdown(
-    args.ring,
-    normalizedBearingDeg,
-    lineSpacingM,
-    geometryTiles,
-    safeParams,
-    args.altitudeMode,
-    args.minClearanceM,
-    args.turnExtendM,
-  );
-  const normalizedTimeCost = mission.missionTimeSec / 180;
+  const scored = scoreExactCameraStats(stats, context.safeParams);
+  const normalizedTimeCost = artifacts.mission.missionTimeSec / 180;
   const costBreakdown = buildExactCostBreakdown(
     scored.breakdown.modelVersion,
     exactQualityWeight,
     scored.qualityCost,
-    timeWeight,
+    context.timeWeight,
     normalizedTimeCost,
   );
   const missionBreakdown: ExactMissionBreakdown = {
-    totalLengthM: mission.totalLengthM,
-    speedMps: mission.speedMps,
-    lineCount: mission.lineCount,
-    sampleCount: poses.length,
+    totalLengthM: artifacts.mission.totalLengthM,
+    speedMps: artifacts.mission.speedMps,
+    lineCount: artifacts.mission.lineCount,
+    sampleCount: cameraArtifacts.poses.length,
     sampleLabel: "Images",
   };
-  return {
-    bearingDeg: normalizedBearingDeg,
+    const result: ExactBearingCandidate = {
+    bearingDeg: artifacts.normalizedBearingDeg,
     exactCost: costBreakdown.total,
     qualityCost: scored.qualityCost,
-    missionTimeSec: mission.missionTimeSec,
+    missionTimeSec: artifacts.mission.missionTimeSec,
     normalizedTimeCost,
     metricKind: "gsd",
     stats,
     diagnostics: {
       qualityCost: scored.qualityCost,
-      missionTimeSec: mission.missionTimeSec,
+      missionTimeSec: artifacts.mission.missionTimeSec,
       normalizedTimeCost,
       targetGsdM: scored.targetGsdM,
       overTargetAreaFraction: scored.overTargetAreaFraction,
@@ -689,6 +870,256 @@ export async function evaluateRegionBearingExact(
     costBreakdown,
     missionBreakdown,
   };
+  logExactRuntimeProfile(
+    `bearing=${artifacts.normalizedBearingDeg.toFixed(2)} payload=camera totalMs=${(performance.now() - candidateStartedAt).toFixed(1)} terrainMs=${terrainElapsedMs.toFixed(1)} tileEvalMs=${tileEvalElapsedMs.toFixed(1)} touchedTiles=${touchedTileCount} poses=${cameraArtifacts.poses.length} exactCost=${result.exactCost.toFixed(4)}`,
+  );
+  return result;
+}
+
+export async function evaluateRegionBearingExact(
+  runtime: ExactRegionRuntime,
+  args: ExactRegionCommonArgs & { bearingDeg: number },
+): Promise<ExactBearingCandidate | null> {
+  const safeParams = { ...args.params, useCustomBearing: false, customBearingDeg: undefined };
+  const context = await createExactBearingEvaluationContext(runtime, args, safeParams);
+  return evaluateRegionBearingExactWithContext(context, args.bearingDeg);
+}
+
+async function collectEvaluatedCandidates(context: ExactBearingEvaluationContext) {
+  return (await Promise.all(
+    [...context.candidateCache.values()].map(async (entry) => ({
+      requestOrder: entry.requestOrder,
+      candidate: entry.promise ? await entry.promise : null,
+    })),
+  ))
+    .filter((value): value is { requestOrder: number; candidate: ExactBearingCandidate } => value.candidate !== null)
+    .sort((left, right) => {
+      if (left.candidate.exactCost !== right.candidate.exactCost) {
+        return left.candidate.exactCost - right.candidate.exactCost;
+      }
+      return left.requestOrder - right.requestOrder;
+    })
+    .map((value) => value.candidate);
+}
+
+async function runExactBearingSearchWithContext(
+  context: ExactBearingEvaluationContext,
+  search: {
+    seedBearingDeg: number;
+    mode: ExactSearchMode;
+    halfWindowDeg: number;
+  },
+) {
+  const searchStartedAt = performance.now();
+  const normalizedSeedBearingDeg = Number.isFinite(search.seedBearingDeg)
+    ? normalizeAxialBearingDeg(search.seedBearingDeg)
+    : 0;
+  const coarseOffsets = [-10, 0, 10];
+  const refineStepsDeg = [8, 4, 2, 1].filter((step) => step <= search.halfWindowDeg);
+  const globalCoarseBearings = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165];
+  const minImprovement = 1e-4;
+  const candidateConcurrency = getCandidateConcurrency(context.runtime);
+
+  const getCandidateEntry = (bearingDeg: number) => {
+    const normalized = normalizeAxialBearingDeg(bearingDeg);
+    const cacheKey = Math.round(normalized * 1000);
+    let entry = context.candidateCache.get(cacheKey);
+    if (!entry) {
+      entry = { requestOrder: context.nextRequestOrder++ };
+      context.candidateCache.set(cacheKey, entry);
+    }
+    return { normalized, entry };
+  };
+
+  const evaluateBearing = (bearingDeg: number) => {
+    const { normalized, entry } = getCandidateEntry(bearingDeg);
+    if (!entry.promise) {
+      entry.promise = evaluateRegionBearingExactWithContext(context, normalized);
+    }
+    return entry.promise;
+  };
+
+  const evaluateOffset = (offsetDeg: number) => {
+    if (Math.abs(offsetDeg) > search.halfWindowDeg + 1e-6) return Promise.resolve<ExactBearingCandidate | null>(null);
+    return evaluateBearing(normalizedSeedBearingDeg + offsetDeg);
+  };
+
+  let best: ExactBearingCandidate | null = null;
+  let bestOffset = 0;
+  if (search.mode === "global") {
+    const coarseCandidates = Array.from(new Set([...globalCoarseBearings, Math.round(normalizedSeedBearingDeg * 10) / 10]));
+    const coarseStartedAt = performance.now();
+    const coarseResults = await mapWithConcurrencyLimit(
+      coarseCandidates,
+      candidateConcurrency,
+      (bearingDeg) => evaluateBearing(bearingDeg),
+    );
+    for (const candidate of coarseResults) {
+      if (candidate && (!best || candidate.exactCost < best.exactCost)) best = candidate;
+    }
+    logExactRuntimeProfile(
+      `search scopeId=${context.scopeId} mode=global coarseCandidates=${coarseCandidates.length} coarseMs=${(performance.now() - coarseStartedAt).toFixed(1)} bestBearing=${best?.bearingDeg?.toFixed(2) ?? "none"} bestCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+    );
+  } else {
+    const coarseCandidateOffsets = coarseOffsets.filter((offset) => Math.abs(offset) <= search.halfWindowDeg + 1e-6);
+    const coarseStartedAt = performance.now();
+    const coarseResults = await mapWithConcurrencyLimit(
+      coarseCandidateOffsets,
+      candidateConcurrency,
+      (offsetDeg) => evaluateOffset(offsetDeg),
+    );
+    for (let index = 0; index < coarseCandidateOffsets.length; index += 1) {
+      const candidate = coarseResults[index];
+      if (candidate && (!best || candidate.exactCost < best.exactCost)) {
+        best = candidate;
+        bestOffset = coarseCandidateOffsets[index];
+      }
+    }
+    logExactRuntimeProfile(
+      `search scopeId=${context.scopeId} mode=local seed=${normalizedSeedBearingDeg.toFixed(2)} coarseCandidates=${coarseCandidateOffsets.length} coarseMs=${(performance.now() - coarseStartedAt).toFixed(1)} bestBearing=${best?.bearingDeg?.toFixed(2) ?? "none"} bestCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+    );
+  }
+
+  if (best) {
+    for (const stepDeg of refineStepsDeg) {
+      const refineStepStartedAt = performance.now();
+      let refineIterations = 0;
+      let improved = true;
+      while (improved) {
+        improved = false;
+        refineIterations += 1;
+        const currentBest: ExactBearingCandidate = best;
+        const neighborSpecs: Array<{ offsetDeg: number; promise: Promise<ExactBearingCandidate | null> }> = search.mode === "global"
+          ? [
+            { offsetDeg: 0, promise: evaluateBearing(currentBest.bearingDeg - stepDeg) },
+            { offsetDeg: 0, promise: evaluateBearing(currentBest.bearingDeg + stepDeg) },
+          ]
+          : [
+            { offsetDeg: bestOffset - stepDeg, promise: evaluateOffset(bestOffset - stepDeg) },
+            { offsetDeg: bestOffset + stepDeg, promise: evaluateOffset(bestOffset + stepDeg) },
+          ];
+        const neighborResults = await mapWithConcurrencyLimit(
+          neighborSpecs,
+          Math.min(candidateConcurrency, neighborSpecs.length),
+          (spec) => spec.promise,
+        );
+        let nextBest: { offsetDeg: number; candidate: ExactBearingCandidate } | null = null;
+        for (let index = 0; index < neighborSpecs.length; index += 1) {
+          const candidate = neighborResults[index];
+          if (!candidate) continue;
+          if (!nextBest || candidate.exactCost < nextBest.candidate.exactCost) {
+            nextBest = { offsetDeg: neighborSpecs[index].offsetDeg, candidate };
+          }
+        }
+        if (nextBest && nextBest.candidate.exactCost + minImprovement < currentBest.exactCost) {
+          best = nextBest.candidate;
+          if (search.mode !== "global") bestOffset = nextBest.offsetDeg;
+          improved = true;
+        }
+      }
+      logExactRuntimeProfile(
+        `search scopeId=${context.scopeId} mode=${search.mode} stepDeg=${stepDeg} refineIterations=${refineIterations} refineMs=${(performance.now() - refineStepStartedAt).toFixed(1)} bestBearing=${best.bearingDeg.toFixed(2)} bestCost=${best.exactCost.toFixed(4)}`,
+      );
+    }
+  }
+
+  const evaluated = await collectEvaluatedCandidates(context);
+  logExactRuntimeProfile(
+    `search scopeId=${context.scopeId} mode=${search.mode} seed=${normalizedSeedBearingDeg.toFixed(2)} totalMs=${(performance.now() - searchStartedAt).toFixed(1)} evaluated=${evaluated.length} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+  );
+  return {
+    best,
+    evaluated,
+    seedBearingDeg: normalizedSeedBearingDeg,
+  };
+}
+
+function getHybridHotspotBearings(
+  context: ExactBearingEvaluationContext,
+  normalizedSeedBearingDeg: number,
+) {
+  if (isLidarParams(context.safeParams)) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=lidar`);
+    return null;
+  }
+  const photoSpacingM = getForwardSpacingForParams(context.safeParams);
+  if (!(photoSpacingM && photoSpacingM > 0)) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=no-photo-spacing`);
+    return null;
+  }
+
+  const coarseBearings = Array.from({ length: Math.ceil(180 / HYBRID_SURROGATE_STEP_DEG) }, (_, index) => index * HYBRID_SURROGATE_STEP_DEG);
+  const prepared = prepareRegionOrientationContext(
+    context.ring,
+    context.geometryTiles,
+    context.safeParams,
+    { tradeoff: 1 - context.timeWeight },
+  );
+
+  let estimatedPoseCount = 0;
+  let surrogateCandidates: SurrogateBasinCandidate[] = [];
+  if (prepared) {
+    const seedObjective = evaluatePreparedRegionOrientation(prepared, normalizedSeedBearingDeg);
+    estimatedPoseCount = estimatePoseCountFromMissionLength(seedObjective?.flightTime.totalFlightLineLengthM ?? 0, photoSpacingM);
+    surrogateCandidates = coarseBearings
+      .map((bearingDeg) => {
+        const objective = evaluatePreparedRegionOrientation(prepared, bearingDeg);
+        if (!objective) return null;
+        return { bearingDeg: objective.bearingDeg, totalCost: objective.totalCost } satisfies SurrogateBasinCandidate;
+      })
+      .filter((candidate): candidate is SurrogateBasinCandidate => candidate !== null);
+  } else {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} fallback=geometry-only`);
+    surrogateCandidates = coarseBearings.map((bearingDeg) => {
+      const geometry = generatePlannedFlightGeometryForPolygon(
+        context.ring,
+        bearingDeg,
+        context.lineSpacingM,
+        context.safeParams,
+      );
+      const summary = summarizePlannedFlightGeometry(geometry);
+      if (axialDistanceDeg(bearingDeg, normalizedSeedBearingDeg) < HYBRID_SURROGATE_STEP_DEG / 2) {
+        estimatedPoseCount = estimatePoseCountFromMissionLength(summary.totalFlightLineLengthM, photoSpacingM);
+      }
+      return {
+        bearingDeg,
+        totalCost: summary.totalConnectedPathLengthM,
+      } satisfies SurrogateBasinCandidate;
+    });
+  }
+
+  if (estimatedPoseCount <= HYBRID_SURROGATE_POSE_THRESHOLD) {
+    logExactRuntimeProfile(
+      `hybrid-search scopeId=${context.scopeId} skipped=below-threshold estimatedPoseCount=${estimatedPoseCount.toFixed(1)}`,
+    );
+    return null;
+  }
+  if (surrogateCandidates.length === 0) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=no-surrogate-candidates`);
+    return null;
+  }
+
+  const localMinima = surrogateCandidates.filter((candidate, index) => {
+    const left = surrogateCandidates[(index + surrogateCandidates.length - 1) % surrogateCandidates.length];
+    const right = surrogateCandidates[(index + 1) % surrogateCandidates.length];
+    return candidate.totalCost <= left.totalCost && candidate.totalCost <= right.totalCost;
+  });
+  const hotspotCandidates = collectBestSurrogateBasins(
+    localMinima.length > 0 ? localMinima : surrogateCandidates,
+    HYBRID_SURROGATE_MAX_HOTSPOTS,
+    HYBRID_SURROGATE_MIN_SEPARATION_DEG,
+    HYBRID_SURROGATE_ADDITIONAL_HOTSPOT_RELATIVE_COST_WINDOW,
+  );
+  const hotspotBearings = hotspotCandidates.map((candidate) => candidate.bearingDeg);
+  if (hotspotBearings.length === 0) {
+    logExactRuntimeProfile(`hybrid-search scopeId=${context.scopeId} skipped=no-hotspots estimatedPoseCount=${estimatedPoseCount.toFixed(1)}`);
+    return null;
+  }
+
+  logExactRuntimeProfile(
+    `hybrid-search scopeId=${context.scopeId} estimatedPoseCount=${estimatedPoseCount.toFixed(1)} hotspots=${hotspotCandidates.map((candidate) => `${candidate.bearingDeg.toFixed(1)}@${candidate.totalCost.toFixed(4)}`).join(",")} costWindow=${(HYBRID_SURROGATE_ADDITIONAL_HOTSPOT_RELATIVE_COST_WINDOW * 100).toFixed(1)}%`,
+  );
+  return hotspotBearings;
 }
 
 export async function optimizeBearingExact(
@@ -699,95 +1130,79 @@ export async function optimizeBearingExact(
     halfWindowDeg?: number;
   },
 ): Promise<ExactBearingSearchResult> {
+  const optimizeStartedAt = performance.now();
   const normalizedSeedBearingDeg = Number.isFinite(args.seedBearingDeg)
     ? normalizeAxialBearingDeg(args.seedBearingDeg)
     : 0;
   const safeParams = { ...args.params, useCustomBearing: false, customBearingDeg: undefined };
-  const lineSpacingM = getLineSpacingForParams(safeParams);
-  const geometryTiles = await resolveGeometryTiles(runtime, args.ring, args.geometryTiles);
-  const coarseOffsets = [-30, -20, -10, 0, 10, 20, 30];
-  const halfWindowDeg = Math.max(1, args.halfWindowDeg ?? 30);
-  const refineStepsDeg = [8, 4, 2, 1].filter((step) => step <= halfWindowDeg);
-  const globalCoarseBearings = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165];
-  const minImprovement = 1e-4;
+  const contextStartedAt = performance.now();
+  const context = await createExactBearingEvaluationContext(runtime, args, safeParams);
+  logExactRuntimeProfile(
+    `optimize scopeId=${context.scopeId} contextMs=${(performance.now() - contextStartedAt).toFixed(1)} lineSpacingM=${context.lineSpacingM.toFixed(2)} timeWeight=${context.timeWeight.toFixed(3)}`,
+  );
   const mode = args.mode ?? "local";
-  const evaluationCache = new Map<number, Promise<ExactBearingCandidate | null>>();
-
-  const evaluateBearing = async (bearingDeg: number) => {
-    const normalized = normalizeAxialBearingDeg(bearingDeg);
-    const cacheKey = Math.round(normalized * 1000);
-    if (!evaluationCache.has(cacheKey)) {
-      evaluationCache.set(cacheKey, evaluateRegionBearingExact(runtime, {
-        ...args,
-        params: safeParams,
-        bearingDeg: normalized,
-        geometryTiles,
-      }));
-    }
-    return evaluationCache.get(cacheKey)!;
-  };
-
-  const evaluateOffset = async (offsetDeg: number) => {
-    if (Math.abs(offsetDeg) > halfWindowDeg + 1e-6) return null;
-    return evaluateBearing(normalizedSeedBearingDeg + offsetDeg);
-  };
+  const halfWindowDeg = Math.max(1, args.halfWindowDeg ?? 30);
 
   let best: ExactBearingCandidate | null = null;
-  let bestOffset = 0;
   if (mode === "global") {
-    const coarseCandidates = Array.from(new Set([...globalCoarseBearings, Math.round(normalizedSeedBearingDeg * 10) / 10]));
-    for (const bearingDeg of coarseCandidates) {
-      const candidate = await evaluateBearing(bearingDeg);
-      if (candidate && (!best || candidate.exactCost < best.exactCost)) best = candidate;
-    }
-  } else {
-    best = await evaluateOffset(0);
-    for (const offsetDeg of coarseOffsets.filter((offset) => Math.abs(offset) <= halfWindowDeg + 1e-6)) {
-      const candidate = await evaluateOffset(offsetDeg);
-      if (candidate && (!best || candidate.exactCost < best.exactCost)) {
-        best = candidate;
-        bestOffset = offsetDeg;
-      }
-    }
-  }
-
-  if (best) {
-    for (const stepDeg of refineStepsDeg) {
-      let improved = true;
-      while (improved) {
-        improved = false;
-        const currentBest: ExactBearingCandidate = best;
-        const left: ExactBearingCandidate | null = mode === "global"
-          ? await evaluateBearing(currentBest.bearingDeg - stepDeg)
-          : await evaluateOffset(bestOffset - stepDeg);
-        const right: ExactBearingCandidate | null = mode === "global"
-          ? await evaluateBearing(currentBest.bearingDeg + stepDeg)
-          : await evaluateOffset(bestOffset + stepDeg);
-        const nextBest: { offsetDeg: number; candidate: ExactBearingCandidate } | null =
-          [
-            { offsetDeg: mode === "global" ? 0 : (bestOffset - stepDeg), candidate: left },
-            { offsetDeg: mode === "global" ? 0 : (bestOffset + stepDeg), candidate: right },
-          ]
-            .filter((value): value is { offsetDeg: number; candidate: ExactBearingCandidate } => value.candidate !== null)
-            .sort((a, b) => a.candidate.exactCost - b.candidate.exactCost)[0] ?? null;
-        if (nextBest && nextBest.candidate.exactCost + minImprovement < currentBest.exactCost) {
-          best = nextBest.candidate;
-          if (mode !== "global") bestOffset = nextBest.offsetDeg;
-          improved = true;
+    const hotspotStartedAt = performance.now();
+    const hotspotBearings = getHybridHotspotBearings(context, normalizedSeedBearingDeg);
+    logExactRuntimeProfile(
+      `optimize scopeId=${context.scopeId} hotspotSelectionMs=${(performance.now() - hotspotStartedAt).toFixed(1)} hotspotCount=${hotspotBearings?.length ?? 0}`,
+    );
+    if (hotspotBearings && hotspotBearings.length > 0) {
+      const hybridStartedAt = performance.now();
+      for (const hotspotBearingDeg of hotspotBearings) {
+        const localSearchStartedAt = performance.now();
+        const search = await runExactBearingSearchWithContext(context, {
+          seedBearingDeg: hotspotBearingDeg,
+          mode: "local",
+          halfWindowDeg,
+        });
+        logExactRuntimeProfile(
+          `optimize scopeId=${context.scopeId} hotspot=${hotspotBearingDeg.toFixed(2)} localSearchMs=${(performance.now() - localSearchStartedAt).toFixed(1)} bestBearing=${search.best?.bearingDeg?.toFixed(2) ?? "none"} bestCost=${search.best?.exactCost?.toFixed(4) ?? "none"}`,
+        );
+        if (search.best && (!best || search.best.exactCost < best.exactCost)) {
+          best = search.best;
         }
       }
+      logExactRuntimeProfile(
+        `optimize scopeId=${context.scopeId} hybridTotalMs=${(performance.now() - hybridStartedAt).toFixed(1)} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+      );
+    } else {
+      const globalSearchStartedAt = performance.now();
+      const search = await runExactBearingSearchWithContext(context, {
+        seedBearingDeg: normalizedSeedBearingDeg,
+        mode: "global",
+        halfWindowDeg,
+      });
+      best = search.best;
+      logExactRuntimeProfile(
+        `optimize scopeId=${context.scopeId} globalSearchMs=${(performance.now() - globalSearchStartedAt).toFixed(1)} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+      );
     }
+  } else {
+    const localSearchStartedAt = performance.now();
+    const search = await runExactBearingSearchWithContext(context, {
+      seedBearingDeg: normalizedSeedBearingDeg,
+      mode,
+      halfWindowDeg,
+    });
+    best = search.best;
+    logExactRuntimeProfile(
+      `optimize scopeId=${context.scopeId} localSearchMs=${(performance.now() - localSearchStartedAt).toFixed(1)} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+    );
   }
 
-  const evaluated = (await Promise.all([...evaluationCache.values()]))
-    .filter((value): value is ExactBearingCandidate => value !== null)
-    .sort((left, right) => left.exactCost - right.exactCost);
-
+  const evaluated = await collectEvaluatedCandidates(context);
+  logExactRuntimeProfile(
+    `optimize scopeId=${context.scopeId} mode=${mode} totalMs=${(performance.now() - optimizeStartedAt).toFixed(1)} evaluated=${evaluated.length} winner=${best?.bearingDeg?.toFixed(2) ?? "none"} winnerCost=${best?.exactCost?.toFixed(4) ?? "none"}`,
+  );
   return {
     best,
     evaluated,
     seedBearingDeg: normalizedSeedBearingDeg,
-    lineSpacingM,
+    lineSpacingM: context.lineSpacingM,
     safeParams,
   };
 }
@@ -842,20 +1257,10 @@ export async function evaluatePartitionSolutionExact(
     let passIndex = 0;
 
     for (const region of virtualPolygons) {
-      const { flightLines, sweepIndices } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
-      const sweeps = groupFlightLinesForTraversal(flightLines, lineSpacing, sweepIndices);
-      for (let lineIndex = 0; lineIndex < sweeps.length; lineIndex++) {
-        const sweep = sweeps[lineIndex];
-        const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
-        const orientedFragments = orderedFragments.map((fragment) => sweep.directionForward ? fragment : [...fragment].reverse());
-        const firstFragment = orientedFragments[0];
-        const lastFragment = orientedFragments[orientedFragments.length - 1];
-        if (!Array.isArray(firstFragment) || firstFragment.length < 2 || !Array.isArray(lastFragment) || lastFragment.length < 2) continue;
-        const activeSweepLine = [
-          extendFlightLineForTurnRunout(firstFragment, args.turnExtendM)[0],
-          ...orientedFragments.flatMap((fragment, fragmentIndex) => fragmentIndex === 0 ? fragment : fragment.slice(1)),
-          extendFlightLineForTurnRunout(lastFragment, args.turnExtendM).slice(-1)[0],
-        ];
+      const geometry = generatePlannedFlightGeometryForPolygon(region.ring, region.bearingDeg, lineSpacing, params);
+      for (let lineIndex = 0; lineIndex < geometry.sweepLines.length; lineIndex++) {
+        const activeSweepLine = geometry.sweepLines[lineIndex];
+        if (!Array.isArray(activeSweepLine) || activeSweepLine.length < 2) continue;
         const sweepPath3d = build3DFlightPath(
           [activeSweepLine],
           geometryTiles,
@@ -908,25 +1313,32 @@ export async function evaluatePartitionSolutionExact(
 
     const tileMapWithHalo = await runtime.terrainProvider.getTerrainTilesWithHalo(tileRefs, 1);
     const perRegionStats = new Map<string, GSDStats[]>();
-    for (const tileRef of tileRefs) {
-      const tileBundle = tileMapWithHalo.get(tileKey(tileRef));
-      if (!tileBundle) continue;
-      const tileStrips = strips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
-      if (!tileStrips.length) continue;
-      const result = await runtime.tileEvaluator.evaluateLidarTile({
-        tile: tileBundle.tile,
-        demTile: tileBundle.demTile,
-        polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
-        strips: tileStrips,
-        options: { clipInnerBufferM: args.clipInnerBufferM ?? 0 },
-      });
+    const tileResults = await mapWithConcurrencyLimit(
+      tileRefs,
+      getTileConcurrency(runtime),
+      async (tileRef) => {
+        const tileBundle = tileMapWithHalo.get(tileKey(tileRef));
+        if (!tileBundle) return null;
+        const tileStrips = strips.filter((strip) => lidarStripMayAffectTile(strip, tileRef));
+        if (!tileStrips.length) return null;
+        return runtime.tileEvaluator.evaluateLidarTile({
+          tile: tileBundle.tile,
+          demTile: tileBundle.demTile,
+          polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
+          strips: tileStrips,
+          options: { clipInnerBufferM: args.clipInnerBufferM ?? 0 },
+        });
+      },
+    );
+    tileResults.forEach((result) => {
+      if (!result) return;
       (result.perPolygon ?? []).forEach((polyStats) => {
         if (!polyStats.densityStats) return;
         const list = perRegionStats.get(polyStats.polygonId) ?? [];
         list.push(polyStats.densityStats);
         perRegionStats.set(polyStats.polygonId, list);
       });
-    }
+    });
     const regionSummaries = Array.from(perRegionStats.values()).map((statsList) => aggregateMetricStats(statsList)).filter((stats) => stats.count > 0);
     if (!regionSummaries.length) {
       throw new Error("No lidar density preview could be computed for this partition.");
@@ -951,13 +1363,12 @@ export async function evaluatePartitionSolutionExact(
   const poses: PoseMeters[] = [];
   let poseId = 0;
   for (const region of virtualPolygons) {
-    const { flightLines, sweepIndices } = generateFlightLinesForPolygon(region.ring, region.bearingDeg, lineSpacing);
+    const geometry = generatePlannedFlightGeometryForPolygon(region.ring, region.bearingDeg, lineSpacing, params);
     const path3d = build3DFlightPath(
-      flightLines,
+      geometry,
       geometryTiles,
       lineSpacing,
-      { altitudeAGL, mode: args.altitudeMode, minClearance: args.minClearanceM, turnExtendM: args.turnExtendM },
-      sweepIndices,
+      { altitudeAGL, mode: args.altitudeMode, minClearance: args.minClearanceM, preconnected: true },
     );
     const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing ?? 0, { includeTurns: false });
     const filtered = region.ring.length >= 3
@@ -983,28 +1394,35 @@ export async function evaluatePartitionSolutionExact(
 
   const tileMap = await runtime.terrainProvider.getTerrainTiles(tileRefs);
   const perRegionStats = new Map<string, GSDStats[]>();
-  for (const tileRef of tileRefs) {
-    const tile = tileMap.get(tileKey(tileRef));
-    if (!tile) continue;
-    const result = await runtime.tileEvaluator.evaluateCameraTile({
-      tile,
-      polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
-      poses,
-      cameras: [camera],
-      poseCameraIndices: new Uint16Array(poses.length),
-      camera: undefined,
-      options: {
-        clipInnerBufferM: args.clipInnerBufferM ?? 0,
-        minOverlapForGsd: args.minOverlapForGsd ?? DEFAULT_MIN_OVERLAP_FOR_GSD,
-      },
-    });
+  const tileResults = await mapWithConcurrencyLimit(
+    tileRefs,
+    getTileConcurrency(runtime),
+    async (tileRef) => {
+      const tile = tileMap.get(tileKey(tileRef));
+      if (!tile) return null;
+      return runtime.tileEvaluator.evaluateCameraTile({
+        tile,
+        polygons: virtualPolygons.map(({ id, ring }) => ({ id, ring })),
+        poses,
+        cameras: [camera],
+        poseCameraIndices: new Uint16Array(poses.length),
+        camera: undefined,
+        options: {
+          clipInnerBufferM: args.clipInnerBufferM ?? 0,
+          minOverlapForGsd: args.minOverlapForGsd ?? DEFAULT_MIN_OVERLAP_FOR_GSD,
+        },
+      });
+    },
+  );
+  tileResults.forEach((result) => {
+    if (!result) return;
     (result.perPolygon ?? []).forEach((polyStats) => {
       if (!polyStats.gsdStats) return;
       const list = perRegionStats.get(polyStats.polygonId) ?? [];
       list.push(polyStats.gsdStats);
       perRegionStats.set(polyStats.polygonId, list);
     });
-  }
+  });
   const regionSummaries = Array.from(perRegionStats.values()).map((statsList) => aggregateMetricStats(statsList)).filter((stats) => stats.count > 0);
   if (!regionSummaries.length) {
     throw new Error("No camera GSD preview could be computed for this partition.");
@@ -1053,7 +1471,6 @@ function scoreLidarPartitionPreview(
   const relativeTimePenalty = fastestMissionTimeSec > 0
     ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
     : 0;
-  const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.035;
   const breakdown = buildScoreBreakdown(
     "lidar-partition-v1",
     {
@@ -1104,7 +1521,6 @@ function scoreCameraPartitionPreview(
   const relativeTimePenalty = fastestMissionTimeSec > 0
     ? Math.max(0, solution.totalMissionTimeSec / fastestMissionTimeSec - 1)
     : 0;
-  const regionPenalty = Math.max(0, solution.regionCount - 1) * 0.12;
   const breakdown = buildScoreBreakdown(
     "camera-partition-v1",
     {
@@ -1261,7 +1677,6 @@ export async function rerankPartitionSolutionsExact(
   },
 ): Promise<ExactPartitionRerankResult> {
   if (args.solutions.length === 0) return { bestIndex: 0, solutions: [], previewsBySignature: {} };
-  const rankingSource = args.rankingSource ?? "frontend-exact";
   const fastestMissionTimeSec = args.solutions.reduce(
     (best, solution) => Math.min(best, solution.totalMissionTimeSec),
     Number.POSITIVE_INFINITY,

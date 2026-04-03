@@ -22,6 +22,7 @@ export interface CameraModel {
 }
 
 export type PayloadKind = 'camera' | 'lidar';
+export type PlaneHardwareVersion = '4' | '5';
 export type LidarReturnMode = 'single' | 'dual' | 'triple';
 export type LidarComparisonMode = 'first-return' | 'all-returns';
 
@@ -49,6 +50,7 @@ export interface LidarModel {
 
 export interface FlightParams {
   payloadKind?: PayloadKind; // defaults to 'camera' for legacy polygons
+  planeHardwareVersion?: PlaneHardwareVersion; // WingtraOne(v4) vs WingtraRay(v5) for export compatibility
   altitudeAGL: number;  // altitude above ground level in meters
   frontOverlap: number; // front overlap percentage (0–95); 0 for lidar payloads
   sideOverlap: number;  // side overlap percentage (0–95)
@@ -83,6 +85,32 @@ export interface TerrainTile {
 export interface FlightLines {
   lineSpacing: number; // spacing between flight lines in meters
   lines: LngLat[][];   // array of flight lines (each line is an array of LngLat points)
+}
+
+export interface PlannedTurnBlock {
+  startSweep: LngLat;
+  endSweep: LngLat;
+  turnOff: LngLat;
+  loiterCenter: LngLat;
+  nextSweepStart: LngLat;
+  loiterRadiusM: number;
+  loiterDirection: 1 | -1;
+  turnOffAcceptanceRadiusM: number;
+  loiterEntryPoint?: LngLat;
+  loiterExitPoint?: LngLat;
+}
+
+export interface PlannedFlightGeometry {
+  lineSpacing: number;
+  flightLines: LngLat[][]; // raw clipped sweep fragments kept for backward compatibility
+  sweepIndices: number[];
+  sweepLines: LngLat[][]; // ordered per-sweep lines after fragment grouping/merging
+  gridPoints: LngLat[];
+  leadInPoints: LngLat[];
+  leadOutPoints: LngLat[];
+  connectedLines: LngLat[][]; // sweep/turn segments in flown order
+  turnaroundRadiusM: number;
+  turnBlocks: PlannedTurnBlock[];
 }
 
 export interface PolygonAnalysisResult {

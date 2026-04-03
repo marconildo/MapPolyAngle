@@ -9,7 +9,7 @@ export interface ExactBearingBackendRequest {
   terrainSource: TerrainSourceSelection;
   altitudeMode: "legacy" | "min-clearance";
   minClearanceM: number;
-  turnExtendM: number;
+  turnExtendM: number; // deprecated compatibility field; backend keeps accepting it while ignoring it
   seedBearingDeg: number;
   mode?: "local" | "global";
   halfWindowDeg?: number;

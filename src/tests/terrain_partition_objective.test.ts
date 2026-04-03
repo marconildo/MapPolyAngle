@@ -237,8 +237,12 @@ function runNonConvexBridgePenaltyCase() {
   const crossNeck = evaluateRegionOrientation(dumbbellRing, [tile] as any, cameraParams, 90, { tradeoff: 0.35 });
   assert.ok(alongLobes && crossNeck, "dumbbell orientations should evaluate");
   assert.ok(
-    crossNeck!.flightTime.overflightTransitFraction > alongLobes!.flightTime.overflightTransitFraction + 0.08,
-    "cross-neck bearing should require more off-region transit between disconnected line fragments",
+    crossNeck!.flightTime.fragmentedLineFraction > alongLobes!.flightTime.fragmentedLineFraction + 0.5,
+    "cross-neck bearing should preserve the higher fragmented-sweep signature through the shared geometry model",
+  );
+  assert.ok(
+    crossNeck!.flightTime.totalMissionTimeSec > alongLobes!.flightTime.totalMissionTimeSec + 1000,
+    "cross-neck bearing should still score as materially slower once mission time comes from connected-path length",
   );
   assert.ok(
     crossNeck!.regularization.penalty > alongLobes!.regularization.penalty + 0.25,

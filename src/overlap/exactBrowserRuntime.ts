@@ -1,5 +1,7 @@
 import { fetchTerrainRGBA, LidarDensityWorker, OverlapWorker } from "@/overlap/controller";
 import type { PaddedDemTileRGBA, TileRGBA } from "@/overlap/types";
+import { getActiveDsmDescriptor } from "@/terrain/dsmSource";
+import { getCurrentTerrainSource } from "@/terrain/terrainSource";
 
 import type { ExactRegionRuntime, ExactTerrainProvider, ExactTileEvaluator, ExactTileRef, ExactTileWithHalo } from "./exact-region";
 
@@ -24,6 +26,66 @@ function yieldToFrame() {
     }
     setTimeout(resolve, 0);
   });
+}
+
+function resolveBrowserWorkerPoolSize() {
+  const hardwareConcurrency = typeof navigator !== "undefined" && Number.isFinite(navigator.hardwareConcurrency)
+    ? navigator.hardwareConcurrency
+    : 4;
+  return Math.min(4, Math.max(2, Math.floor(hardwareConcurrency / 2)));
+}
+
+class WorkerPool<TInput, TOutput, TWorker extends { runTile(args: TInput): Promise<TOutput>; terminate(): void }> {
+  private readonly workers: TWorker[];
+  private readonly idleWorkers: TWorker[];
+  private readonly queue: Array<{
+    input: TInput;
+    resolve: (value: TOutput) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private terminating = false;
+
+  constructor(
+    private readonly createWorker: () => TWorker,
+    readonly size: number,
+  ) {
+    this.workers = Array.from({ length: size }, () => createWorker());
+    this.idleWorkers = [...this.workers];
+  }
+
+  run(input: TInput) {
+    return new Promise<TOutput>((resolve, reject) => {
+      if (this.terminating) {
+        reject(new Error("Worker pool has been terminated."));
+        return;
+      }
+      this.queue.push({ input, resolve, reject });
+      this.drain();
+    });
+  }
+
+  terminate() {
+    this.terminating = true;
+    for (const worker of this.workers) worker.terminate();
+    while (this.queue.length > 0) {
+      this.queue.shift()?.reject(new Error("Worker pool has been terminated."));
+    }
+  }
+
+  private drain() {
+    while (!this.terminating && this.idleWorkers.length > 0 && this.queue.length > 0) {
+      const worker = this.idleWorkers.pop()!;
+      const job = this.queue.shift()!;
+      void worker.runTile(job.input)
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          if (!this.terminating) {
+            this.idleWorkers.push(worker);
+            this.drain();
+          }
+        });
+    }
+  }
 }
 
 class BrowserExactTerrainProvider implements ExactTerrainProvider {
@@ -129,39 +191,108 @@ class BrowserExactTerrainProvider implements ExactTerrainProvider {
 }
 
 class BrowserExactTileEvaluator implements ExactTileEvaluator {
-  private readonly cameraWorker = new OverlapWorker();
-  private readonly lidarWorker = new LidarDensityWorker();
+  private readonly cameraWorkers: WorkerPool<
+    Parameters<OverlapWorker["runTile"]>[0],
+    Awaited<ReturnType<OverlapWorker["runTile"]>>,
+    OverlapWorker
+  >;
+  private readonly lidarWorkers: WorkerPool<
+    Parameters<LidarDensityWorker["runTile"]>[0],
+    Awaited<ReturnType<LidarDensityWorker["runTile"]>>,
+    LidarDensityWorker
+  >;
+
+  readonly concurrency: number;
+
+  constructor(poolSize: number) {
+    this.concurrency = poolSize;
+    this.cameraWorkers = new WorkerPool(() => new OverlapWorker(), poolSize);
+    this.lidarWorkers = new WorkerPool(() => new LidarDensityWorker(), poolSize);
+  }
 
   evaluateCameraTile(input: Parameters<OverlapWorker["runTile"]>[0]) {
-    return this.cameraWorker.runTile(input);
+    return this.cameraWorkers.run(input);
   }
 
   evaluateLidarTile(input: Parameters<LidarDensityWorker["runTile"]>[0]) {
-    return this.lidarWorker.runTile(input);
+    return this.lidarWorkers.run(input);
   }
 
   dispose() {
-    this.cameraWorker.terminate();
-    this.lidarWorker.terminate();
+    this.cameraWorkers.terminate();
+    this.lidarWorkers.terminate();
   }
 }
 
 export function createBrowserExactRegionRuntime(mapboxToken: string): ExactRegionRuntime {
+  const tileEvaluator = new BrowserExactTileEvaluator(resolveBrowserWorkerPoolSize());
   return {
     terrainProvider: new BrowserExactTerrainProvider(mapboxToken),
-    tileEvaluator: new BrowserExactTileEvaluator(),
+    tileEvaluator,
     yieldToEventLoop: yieldToFrame,
+    candidateConcurrency: tileEvaluator.concurrency,
   };
+}
+
+type SharedBrowserRuntimeState = {
+  key: string;
+  runtime: ExactRegionRuntime;
+  inFlight: number;
+  stale: boolean;
+};
+
+let currentBrowserRuntimeState: SharedBrowserRuntimeState | null = null;
+const staleBrowserRuntimeStates: SharedBrowserRuntimeState[] = [];
+
+function getBrowserRuntimeCacheKey(mapboxToken: string) {
+  const terrainSource = getCurrentTerrainSource();
+  const activeDsm = getActiveDsmDescriptor();
+  return JSON.stringify({
+    mapboxToken,
+    terrainMode: terrainSource.mode,
+    terrainDatasetId: terrainSource.datasetId ?? null,
+    activeDsmId: activeDsm?.id ?? null,
+  });
+}
+
+function disposeBrowserRuntimeState(state: SharedBrowserRuntimeState) {
+  void state.runtime.tileEvaluator.dispose?.();
+}
+
+function cleanupStaleBrowserRuntimeStates() {
+  for (let index = staleBrowserRuntimeStates.length - 1; index >= 0; index -= 1) {
+    const state = staleBrowserRuntimeStates[index];
+    if (state.inFlight === 0) {
+      staleBrowserRuntimeStates.splice(index, 1);
+      disposeBrowserRuntimeState(state);
+    }
+  }
 }
 
 export async function withBrowserExactRegionRuntime<T>(
   mapboxToken: string,
   callback: (runtime: ExactRegionRuntime) => Promise<T>,
 ): Promise<T> {
-  const runtime = createBrowserExactRegionRuntime(mapboxToken);
+  cleanupStaleBrowserRuntimeStates();
+  const key = getBrowserRuntimeCacheKey(mapboxToken);
+  if (!currentBrowserRuntimeState || currentBrowserRuntimeState.key !== key) {
+    if (currentBrowserRuntimeState) {
+      currentBrowserRuntimeState.stale = true;
+      staleBrowserRuntimeStates.push(currentBrowserRuntimeState);
+    }
+    currentBrowserRuntimeState = {
+      key,
+      runtime: createBrowserExactRegionRuntime(mapboxToken),
+      inFlight: 0,
+      stale: false,
+    };
+  }
+  const runtimeState = currentBrowserRuntimeState;
+  runtimeState.inFlight += 1;
   try {
-    return await callback(runtime);
+    return await callback(runtimeState.runtime);
   } finally {
-    await runtime.tileEvaluator.dispose?.();
+    runtimeState.inFlight = Math.max(0, runtimeState.inFlight - 1);
+    cleanupStaleBrowserRuntimeStates();
   }
 }

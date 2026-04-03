@@ -1,6 +1,6 @@
 // src/interop/wingtra/types.ts
 
-import type { FlightParams, LidarReturnMode, LngLat, PayloadKind } from "@/domain/types";
+import type { FlightParams, LidarReturnMode, LngLat, PayloadKind, PlaneHardwareVersion } from "@/domain/types";
 
 export type WingtraAngleConvention =
   // Most QGC/WingtraPilot area missions: clockwise from North (0° = North)
@@ -46,6 +46,10 @@ export interface WingtraFlightPlan {
   fileType: "Plan";
   flightId?: string;
   geofence?: any;
+  flightPlanOrigin?: {
+    location: string;
+    coordinate: number[];
+  };
   groundStation?: string;
   flightPlan: {
     items: Array<WingtraAreaItem | Record<string, unknown>>;
@@ -73,6 +77,7 @@ export interface ImportedArea {
   terrainFollowing: boolean;
   cameraKey?: string;         // internal camera registry key (e.g. SONY_RX1R2, MAP61_17MM)
   lidarKey?: string;          // internal lidar registry key (e.g. WINGTRA_LIDAR_XT32M2X)
+  planeHardwareVersion?: PlaneHardwareVersion;
   speedMps?: number;          // cruise speed used for lidar density estimates
   lidarReturnMode?: LidarReturnMode;
   mappingFovDeg?: number;
@@ -89,6 +94,7 @@ export interface ImportedWingtraPlan {
   payloadKey?: string;      // payloadUniqueString
   payloadCameraKey?: string; // resolved internal camera key
   payloadLidarKey?: string; // resolved internal lidar key
+  planeHardwareVersion?: PlaneHardwareVersion;
   meta: {
     version: number;
     fileType: "Plan";
