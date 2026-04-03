@@ -1036,9 +1036,26 @@ export const generatePlannedFlightGeometryForPolygon = (
   bearingDeg: number,
   lineSpacingM: number,
   params: FlightParams,
+  options?: {
+    includeTurnPreview?: boolean;
+  },
 ): PlannedFlightGeometry & { bounds: { minLng: number; minLat: number; maxLng: number; maxLat: number; centroid: [number, number] } } => {
   const raw = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
   const sweepLines = mergeSweepLines(raw.flightLines as LngLat[][], raw.lineSpacing, raw.sweepIndices);
+  const includeTurnPreview = options?.includeTurnPreview ?? true;
+  if (!includeTurnPreview) {
+    return {
+      ...raw,
+      flightLines: raw.flightLines as LngLat[][],
+      sweepLines,
+      gridPoints: [],
+      leadInPoints: [],
+      leadOutPoints: [],
+      connectedLines: sweepLines,
+      turnaroundRadiusM: 0,
+      turnBlocks: [],
+    };
+  }
   const canonicalSweepLines = normalizeSweepLineDirectionsForGrid(sweepLines);
   const flightTurnModel = getFlightTurnModel(params);
   const { gridPoints, leadInPoints, leadOutPoints } = buildSurveyGridPoints(

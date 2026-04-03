@@ -666,7 +666,9 @@ function estimateFlightPatternMetrics(
   shortLineThresholdM: number,
   params: FlightParams,
 ): FlightPatternMetrics {
-  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacingM, params);
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, bearingDeg, lineSpacingM, params, {
+    includeTurnPreview: false,
+  });
   const summary = summarizePlannedFlightGeometry(geometry);
   const lengths = geometry.sweepLines.map((sweepLine) => {
     let sweepLengthM = 0;
