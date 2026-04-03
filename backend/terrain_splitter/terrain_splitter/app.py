@@ -1048,7 +1048,7 @@ def solve_partition(request: PartitionSolveRequest) -> PartitionSolveResponse:
         if solver_perf_summary is not None and isinstance(solver_debug_payload, dict):
             solver_summary_payload = solver_debug_payload.get("solverSummary")
             if isinstance(solver_summary_payload, dict):
-                solver_summary_payload["performanceHotspots"] = solver_perf_summary
+                solver_summary_payload["performanceSummary"] = solver_perf_summary
         if EXACT_RUNTIME_BRIDGE is not None and len(surrogate_solutions) > 1:
             try:
                 exact_status = "executed"
