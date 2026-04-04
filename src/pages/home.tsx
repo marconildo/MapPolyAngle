@@ -675,7 +675,7 @@ export default function Home() {
       ? `Imagery overlay: ${imageryDescriptor.name.length > 9 ? `${imageryDescriptor.name.slice(0, 9)}...` : imageryDescriptor.name}`
       : 'Terrain source';
   const headerButtonClassName = isMobile
-    ? 'h-9 flex-1 min-w-[5.75rem] justify-center px-3'
+    ? 'h-9 min-w-0 flex-1 justify-center px-2.5 text-[13px]'
     : 'h-8 px-2 whitespace-nowrap';
   const analysisPanelBody = (
     <>
@@ -837,11 +837,11 @@ export default function Home() {
     <div className="h-screen flex flex-col bg-gray-50">
       {/* Header (compact) */}
       <header className="bg-white/95 backdrop-blur border-b border-gray-200 px-3 md:px-4 py-2 z-50">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 bg-blue-600 rounded-md flex items-center justify-center">
-              <Map className="w-4 h-4 text-white" />
-            </div>
+        <div className="flex items-center gap-2 md:justify-between">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-blue-600">
+            <Map className="h-4 w-4 text-white" />
+          </div>
+          {!isMobile && (
             <div className="leading-tight">
               <h1 className="text-sm md:text-base font-semibold text-gray-900 tracking-tight">
                 Flight Plan Analyser
@@ -850,8 +850,8 @@ export default function Home() {
                 Terrain‑aware flight planning &amp; GSD analysis
               </p>
             </div>
-          </div>
-          <div className="flex w-full flex-wrap items-center gap-2 md:w-auto md:justify-end">
+          )}
+          <div className="flex min-w-0 flex-1 items-center gap-2 md:w-auto md:flex-none md:justify-end">
             {/* Consolidated Import dropdown */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -1027,11 +1027,13 @@ export default function Home() {
               <button
                 type="button"
                 aria-label="Open analysis panel"
-                className="absolute right-3 top-[58%] z-40 flex h-16 w-12 -translate-y-1/2 flex-col items-center justify-center gap-0.5 rounded-full border border-slate-200 bg-white text-slate-700 shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
+                className="absolute right-3 top-3 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
                 onClick={() => setMobileAnalysisOpen(true)}
               >
-                <ChevronUp className="h-4 w-4" aria-hidden="true" />
-                <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
+                <div className="flex flex-col items-center leading-none">
+                  <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                  <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                </div>
               </button>
             )}
 
