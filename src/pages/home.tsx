@@ -95,9 +95,6 @@ function normalizeFlightplanFilename(name: string | undefined): string {
   return `${base.length > 0 ? base : 'exported'}.flightplan`;
 }
 
-const MOBILE_ANALYSIS_COLLAPSED_SNAP = 168;
-const MOBILE_ANALYSIS_EXPANDED_SNAP = 0.5;
-
 export default function Home() {
   const isMobile = useIsMobile();
   const imageryOverlayImportEnabled = false;
@@ -121,7 +118,7 @@ export default function Home() {
   const [terrainSourceState, setTerrainSourceState] = useState<TerrainSourceState>(() => getTerrainSourceState());
   const [imageryOverlayState, setImageryOverlayState] = useState<ImageryOverlayState>(() => getImageryOverlayState());
   const [showTerrainSource, setShowTerrainSource] = useState(false);
-  const [mobileAnalysisSnapPoint, setMobileAnalysisSnapPoint] = useState<number | string | null>(MOBILE_ANALYSIS_COLLAPSED_SNAP);
+  const [mobileAnalysisOpen, setMobileAnalysisOpen] = useState(false);
   const [importUiState, setImportUiState] = useState<null | {
     operationId: number;
     kind: 'terrain' | 'imagery';
@@ -680,12 +677,6 @@ export default function Home() {
   const headerButtonClassName = isMobile
     ? 'h-9 flex-1 min-w-[5.75rem] justify-center px-3'
     : 'h-8 px-2 whitespace-nowrap';
-  const mobileAnalysisExpanded = mobileAnalysisSnapPoint === MOBILE_ANALYSIS_EXPANDED_SNAP;
-  const mobileAnalysisSummary = terrainAnalysisDisabled
-    ? importUiMessage
-    : panelEnabled
-      ? 'Terrain, overlap & GSD controls'
-      : 'Import or draw polygons to start analysis';
   const analysisPanelBody = (
     <>
       <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/70">
@@ -1031,74 +1022,43 @@ export default function Home() {
         </Suspense>
 
         {isMobile && (
-          <Drawer
-            open
-            dismissible={false}
-            modal={false}
-            shouldScaleBackground={false}
-            snapPoints={[MOBILE_ANALYSIS_COLLAPSED_SNAP, MOBILE_ANALYSIS_EXPANDED_SNAP]}
-            activeSnapPoint={mobileAnalysisSnapPoint}
-            setActiveSnapPoint={setMobileAnalysisSnapPoint}
-            fadeFromIndex={1}
-            snapToSequentialPoint
-          >
-            <DrawerContent
-              hideHandle
-              className="bottom-[max(1rem,env(safe-area-inset-bottom))] overflow-visible rounded-t-3xl border-t border-slate-200 bg-white shadow-[0_-12px_32px_rgba(15,23,42,0.12)]"
-            >
-              {!mobileAnalysisExpanded && (
-                <button
-                  type="button"
-                  aria-label="Expand analysis panel"
-                  className="absolute left-1/2 top-0 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
-                  onClick={() => setMobileAnalysisSnapPoint(MOBILE_ANALYSIS_EXPANDED_SNAP)}
-                >
-                  <ChevronUp className="h-5 w-5" aria-hidden="true" />
-                </button>
-              )}
+          <>
+            {!mobileAnalysisOpen && (
               <button
                 type="button"
                 aria-label="Open analysis panel"
-                className="block w-full touch-manipulation text-left"
-                onClick={() => {
-                  if (!mobileAnalysisExpanded) {
-                    setMobileAnalysisSnapPoint(MOBILE_ANALYSIS_EXPANDED_SNAP);
-                  }
-                }}
+                className="absolute right-3 top-[58%] z-40 flex h-16 w-12 -translate-y-1/2 flex-col items-center justify-center gap-0.5 rounded-full border border-slate-200 bg-white text-slate-700 shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
+                onClick={() => setMobileAnalysisOpen(true)}
               >
-                <div className="px-4 pb-4 pt-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="text-sm font-semibold text-slate-900">Analysis</div>
-                      <p className="mt-1 text-xs text-slate-600">{mobileAnalysisSummary}</p>
-                    </div>
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-700">
-                      <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
-                    </div>
-                  </div>
-                  {!mobileAnalysisExpanded && (
-                    <div className="mt-3 h-1.5 w-16 rounded-full bg-slate-200" />
-                  )}
-                </div>
+                <ChevronUp className="h-4 w-4" aria-hidden="true" />
+                <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
               </button>
+            )}
 
-              {mobileAnalysisExpanded && (
-                <>
-                  <DrawerHeader className="border-t border-slate-100 pb-2 pt-4">
-                    <DrawerTitle className="text-base">Analysis</DrawerTitle>
-                    <DrawerDescription>
-                      Terrain source, overlap and GSD controls for the current workspace.
-                    </DrawerDescription>
-                  </DrawerHeader>
-                  <div className="max-h-[calc(50vh-7.5rem)] overflow-y-auto overscroll-contain px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
-                    <div className="space-y-3">
-                      {analysisPanelBody}
-                    </div>
-                  </div>
-                </>
-              )}
+            <Drawer
+              open={mobileAnalysisOpen}
+              onOpenChange={setMobileAnalysisOpen}
+              modal={false}
+              shouldScaleBackground={false}
+            >
+            <DrawerContent
+              hideOverlay
+              className="h-[50vh] max-h-[50vh] rounded-t-3xl border-t border-slate-200 bg-white shadow-[0_-12px_32px_rgba(15,23,42,0.12)]"
+            >
+              <DrawerHeader className="pb-2">
+                <DrawerTitle className="text-base">Analysis</DrawerTitle>
+                <DrawerDescription>
+                  Terrain source, overlap and GSD controls for the current workspace.
+                </DrawerDescription>
+              </DrawerHeader>
+              <div className="overflow-y-auto overscroll-contain px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+                <div className="space-y-3">
+                  {analysisPanelBody}
+                </div>
+              </div>
             </DrawerContent>
-          </Drawer>
+            </Drawer>
+          </>
         )}
 
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
