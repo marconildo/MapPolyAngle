@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal } from 'lucide-react';
+import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal, ChevronUp } from 'lucide-react';
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
@@ -95,7 +95,7 @@ function normalizeFlightplanFilename(name: string | undefined): string {
   return `${base.length > 0 ? base : 'exported'}.flightplan`;
 }
 
-const MOBILE_ANALYSIS_COLLAPSED_SNAP = 120;
+const MOBILE_ANALYSIS_COLLAPSED_SNAP = 168;
 const MOBILE_ANALYSIS_EXPANDED_SNAP = 0.5;
 
 export default function Home() {
@@ -1042,7 +1042,20 @@ export default function Home() {
             fadeFromIndex={1}
             snapToSequentialPoint
           >
-            <DrawerContent className="overflow-hidden rounded-t-3xl border-t border-slate-200 bg-white shadow-[0_-12px_32px_rgba(15,23,42,0.12)]">
+            <DrawerContent
+              hideHandle
+              className="bottom-[max(1rem,env(safe-area-inset-bottom))] overflow-visible rounded-t-3xl border-t border-slate-200 bg-white shadow-[0_-12px_32px_rgba(15,23,42,0.12)]"
+            >
+              {!mobileAnalysisExpanded && (
+                <button
+                  type="button"
+                  aria-label="Expand analysis panel"
+                  className="absolute left-1/2 top-0 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
+                  onClick={() => setMobileAnalysisSnapPoint(MOBILE_ANALYSIS_EXPANDED_SNAP)}
+                >
+                  <ChevronUp className="h-5 w-5" aria-hidden="true" />
+                </button>
+              )}
               <button
                 type="button"
                 aria-label="Open analysis panel"
@@ -1053,7 +1066,7 @@ export default function Home() {
                   }
                 }}
               >
-                <div className="px-4 pb-4 pt-1">
+                <div className="px-4 pb-4 pt-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="text-sm font-semibold text-slate-900">Analysis</div>
@@ -1063,6 +1076,9 @@ export default function Home() {
                       <SlidersHorizontal className="h-4 w-4" aria-hidden="true" />
                     </div>
                   </div>
+                  {!mobileAnalysisExpanded && (
+                    <div className="mt-3 h-1.5 w-16 rounded-full bg-slate-200" />
+                  )}
                 </div>
               </button>
 
