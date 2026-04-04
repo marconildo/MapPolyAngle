@@ -4,11 +4,12 @@ import type { PolygonAnalysisResult } from '@/components/MapFlightDirection/type
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Drawer, DrawerContent, DrawerDescription, DrawerHeader, DrawerTitle } from '@/components/ui/drawer';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, AlertCircle, Upload, Download } from 'lucide-react';
+import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal, ChevronUp } from 'lucide-react';
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
@@ -117,6 +118,7 @@ export default function Home() {
   const [terrainSourceState, setTerrainSourceState] = useState<TerrainSourceState>(() => getTerrainSourceState());
   const [imageryOverlayState, setImageryOverlayState] = useState<ImageryOverlayState>(() => getImageryOverlayState());
   const [showTerrainSource, setShowTerrainSource] = useState(false);
+  const [mobileAnalysisOpen, setMobileAnalysisOpen] = useState(false);
   const [importUiState, setImportUiState] = useState<null | {
     operationId: number;
     kind: 'terrain' | 'imagery';
@@ -672,30 +674,190 @@ export default function Home() {
       : imageryOverlayImportEnabled && imageryDescriptor
       ? `Imagery overlay: ${imageryDescriptor.name.length > 9 ? `${imageryDescriptor.name.slice(0, 9)}...` : imageryDescriptor.name}`
       : 'Terrain source';
+  const headerButtonClassName = isMobile
+    ? 'h-9 min-w-0 flex-1 justify-center px-2.5 text-[13px]'
+    : 'h-8 px-2 whitespace-nowrap';
+  const analysisPanelBody = (
+    <>
+      <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/70">
+        <button
+          type="button"
+          onClick={() => setShowTerrainSource((current) => !current)}
+          className="flex w-full items-center justify-between px-3 py-2 text-left"
+        >
+          <span className="text-xs font-medium text-slate-900">{showTerrainSource ? 'Terrain source' : collapsedTerrainSourceTitle}</span>
+          <span className="text-[11px] text-slate-500">{showTerrainSource ? 'Hide' : 'Show'}</span>
+        </button>
+        {showTerrainSource && (
+          <div className="space-y-3 border-t border-slate-200 px-3 py-3">
+            <div className="space-y-2">
+              <div className="text-[11px] font-medium text-slate-700">Terrain source</div>
+              {terrainDescriptor ? (
+                <div className="space-y-1 text-[11px] text-slate-600">
+                  <div className="font-medium text-slate-800">{terrainDescriptor.name}</div>
+                  <div>
+                    {terrainDescriptor.width.toLocaleString()} x {terrainDescriptor.height.toLocaleString()} px · {formatBytes(terrainDescriptor.fileSizeBytes)}
+                  </div>
+                  <div>{terrainDescriptor.sourceCrsLabel}</div>
+                  {(terrainDescriptor.nativeResolutionXM || terrainDescriptor.nativeResolutionYM) && (
+                    <div>
+                      Native resolution: {(terrainDescriptor.nativeResolutionXM ?? 0).toFixed(2)} m × {(terrainDescriptor.nativeResolutionYM ?? 0).toFixed(2)} m
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="text-[11px] text-slate-500">
+                  Import a GeoTIFF terrain source to use custom elevation.
+                </div>
+              )}
+              {terrainSourceState.error && (
+                <div className="mt-1 text-[11px] text-red-600">{terrainSourceState.error}</div>
+              )}
+              {terrainDescriptor && (
+                <div className="flex gap-2">
+                  <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToDsm}>
+                    Zoom
+                  </Button>
+                </div>
+              )}
+              {!terrainDescriptor && rememberedTerrainDescriptor && (
+                <div className="space-y-2 text-[11px] text-slate-600">
+                  <div className="font-medium text-slate-800">{rememberedTerrainDescriptor.name}</div>
+                  <div>
+                    {rememberedTerrainDescriptor.width.toLocaleString()} x {rememberedTerrainDescriptor.height.toLocaleString()} px · {formatBytes(rememberedTerrainDescriptor.fileSizeBytes)}
+                  </div>
+                  <div>{rememberedTerrainDescriptor.sourceCrsLabel}</div>
+                  {(rememberedTerrainDescriptor.nativeResolutionXM || rememberedTerrainDescriptor.nativeResolutionYM) && (
+                    <div>
+                      Native resolution: {(rememberedTerrainDescriptor.nativeResolutionXM ?? 0).toFixed(2)} m × {(rememberedTerrainDescriptor.nativeResolutionYM ?? 0).toFixed(2)} m
+                    </div>
+                  )}
+                  <div className="text-[11px] text-slate-500">
+                    Saved locally. Click Load to apply this DSM terrain.
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-[11px]"
+                      onClick={handleApplyRememberedTerrainSource}
+                      disabled={terrainAnalysisDisabled || !terrainSourceState.backendEnabled}
+                    >
+                      Load
+                    </Button>
+                    <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToRememberedDsm}>
+                      Zoom
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {imageryOverlayImportEnabled ? (
+              <div className="border-t border-slate-200 pt-3 space-y-2">
+                <div className="text-[11px] font-medium text-slate-700">Imagery overlay</div>
+                {imageryDescriptor ? (
+                  <div className="space-y-1 text-[11px] text-slate-600">
+                    <div className="font-medium text-slate-800">{imageryDescriptor.name}</div>
+                    <div>
+                      {imageryDescriptor.width.toLocaleString()} x {imageryDescriptor.height.toLocaleString()} px · {formatBytes(imageryDescriptor.fileSizeBytes)}
+                    </div>
+                    <div>{imageryDescriptor.sourceCrsLabel}</div>
+                  </div>
+                ) : (
+                  <div className="text-[11px] text-slate-500">
+                    Import a georeferenced GeoTIFF ortho to view it as an imagery overlay.
+                  </div>
+                )}
+                {imageryOverlayState.error && (
+                  <div className="mt-1 text-[11px] text-red-600">{imageryOverlayState.error}</div>
+                )}
+                {imageryDescriptor && (
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToImageryOverlay}>
+                      Zoom
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2 text-[11px]"
+                      onClick={() => clearActiveImageryOverlay()}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        )}
+      </div>
+
+      {isAnalyzing && (
+        <div className="flex items-center justify-center py-4 border-b mb-3">
+          <div className="text-center">
+            <LoadingSpinner size="sm" className="mx-auto mb-2" />
+            <p className="text-xs text-gray-600">
+              Analyzing {analyzingPolygons.size} polygon{analyzingPolygons.size !== 1 ? 's' : ''}...
+            </p>
+          </div>
+        </div>
+      )}
+
+      {!isAnalyzing && !hasResults && (
+        <div className="text-center py-6 text-gray-500">
+          <p className="text-xs">Import flightplan or draw polygons to start analysis</p>
+        </div>
+      )}
+
+      <div className={panelEnabled && !terrainAnalysisDisabled ? '' : 'opacity-50 pointer-events-none'}>
+        <Suspense fallback={<DeferredPanelFallback />}>
+          <OverlapGSDPanel
+            mapRef={mapRef}
+            mapboxToken={mapboxToken}
+            clearAllEpoch={clearAllEpoch}
+            getPerPolygonParams={() => paramsByPolygon}
+            onEditPolygonParams={handleEditPolygonParams}
+            onAutoRun={handleAutoRunReceived}
+            onClearExposed={handleClearReceived}
+            onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
+            onPosesImported={(c)=> setImportedPoseCount(c)}
+            polygonAnalyses={polygonResults}
+            overrides={overrides}
+            importedOriginals={importedOriginals}
+            selectedPolygonId={selectedPolygonId}
+            onSelectPolygon={setSelectedPolygonId}
+          />
+        </Suspense>
+      </div>
+    </>
+  );
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
       {/* Header (compact) */}
       <header className="bg-white/95 backdrop-blur border-b border-gray-200 px-3 md:px-4 py-2 z-50">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 bg-blue-600 rounded-md flex items-center justify-center">
-              <Map className="w-4 h-4 text-white" />
+        <div className="flex items-center gap-2 md:justify-between">
+          <div className="flex shrink-0 items-center gap-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-md bg-blue-600">
+              <Map className="h-4 w-4 text-white" />
             </div>
-            <div className="leading-tight">
-              <h1 className="text-sm md:text-base font-semibold text-gray-900 tracking-tight">
-                Flight Plan Analyser
-              </h1>
-              <p className="hidden md:block text-[11px] text-gray-500">
-                Terrain‑aware flight planning &amp; GSD analysis
-              </p>
-            </div>
+            {!isMobile && (
+              <div className="leading-tight">
+                <h1 className="text-sm md:text-base font-semibold text-gray-900 tracking-tight">
+                  Flight Plan Analyser
+                </h1>
+                <p className="hidden md:block text-[11px] text-gray-500">
+                  Terrain‑aware flight planning &amp; GSD analysis
+                </p>
+              </div>
+            )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2 md:w-auto md:flex-none md:justify-end">
             {/* Consolidated Import dropdown */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline" className="h-8 px-2 whitespace-nowrap">
+                <Button size="sm" variant="outline" className={headerButtonClassName}>
                   <Upload className="w-3 h-3 mr-1" /> Import ▾
                 </Button>
               </DropdownMenuTrigger>
@@ -727,7 +889,7 @@ export default function Home() {
             {/* Consolidated Export dropdown */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline" className="h-8 px-2 whitespace-nowrap" title="Export data">
+                <Button size="sm" variant="outline" className={headerButtonClassName} title="Export data">
                   <Download className="w-3 h-3 mr-1" /> Export ▾
                 </Button>
               </DropdownMenuTrigger>
@@ -747,7 +909,7 @@ export default function Home() {
             <Button
               size="sm"
               variant="outline"
-              className="h-8 px-2 whitespace-nowrap"
+              className={headerButtonClassName}
               onClick={clearAllDrawings}
             >
               <Trash2 className="w-3 h-3 mr-1" />
@@ -861,6 +1023,48 @@ export default function Home() {
         />); })()}
         </Suspense>
 
+        {isMobile && (
+          <>
+            {!mobileAnalysisOpen && (
+              <button
+                type="button"
+                aria-label="Open analysis panel"
+                className="absolute right-3 top-3 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 touch-manipulation"
+                onClick={() => setMobileAnalysisOpen(true)}
+              >
+                <div className="flex flex-col items-center leading-none">
+                  <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                  <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                </div>
+              </button>
+            )}
+
+            <Drawer
+              open={mobileAnalysisOpen}
+              onOpenChange={setMobileAnalysisOpen}
+              modal={false}
+              shouldScaleBackground={false}
+            >
+            <DrawerContent
+              hideOverlay
+              className="h-[50vh] max-h-[50vh] rounded-t-3xl border-t border-slate-200 bg-white shadow-[0_-12px_32px_rgba(15,23,42,0.12)]"
+            >
+              <DrawerHeader className="pb-2">
+                <DrawerTitle className="text-base">Analysis</DrawerTitle>
+                <DrawerDescription>
+                  Terrain source, overlap and GSD controls for the current workspace.
+                </DrawerDescription>
+              </DrawerHeader>
+              <div className="overflow-y-auto overscroll-contain px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+                <div className="space-y-3">
+                  {analysisPanelBody}
+                </div>
+              </div>
+            </DrawerContent>
+            </Drawer>
+          </>
+        )}
+
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
           <div className="absolute top-2 right-2 z-40 w-[500px] max-w-[90vw] max-h-[calc(100vh-120px)] overflow-y-auto">
@@ -871,160 +1075,7 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-medium text-gray-900">Analysis</h3>
               </div>
-
-              <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/70">
-                <button
-                  type="button"
-                  onClick={() => setShowTerrainSource((current) => !current)}
-                  className="flex w-full items-center justify-between px-3 py-2 text-left"
-                >
-                  <span className="text-xs font-medium text-slate-900">{showTerrainSource ? 'Terrain source' : collapsedTerrainSourceTitle}</span>
-                  <span className="text-[11px] text-slate-500">{showTerrainSource ? 'Hide' : 'Show'}</span>
-                </button>
-                {showTerrainSource && (
-                  <div className="space-y-3 border-t border-slate-200 px-3 py-3">
-                    <div className="space-y-2">
-                      <div className="text-[11px] font-medium text-slate-700">Terrain source</div>
-                      {terrainDescriptor ? (
-                        <div className="space-y-1 text-[11px] text-slate-600">
-                          <div className="font-medium text-slate-800">{terrainDescriptor.name}</div>
-                          <div>
-                            {terrainDescriptor.width.toLocaleString()} x {terrainDescriptor.height.toLocaleString()} px · {formatBytes(terrainDescriptor.fileSizeBytes)}
-                          </div>
-                          <div>{terrainDescriptor.sourceCrsLabel}</div>
-                          {(terrainDescriptor.nativeResolutionXM || terrainDescriptor.nativeResolutionYM) && (
-                            <div>
-                              Native resolution: {(terrainDescriptor.nativeResolutionXM ?? 0).toFixed(2)} m × {(terrainDescriptor.nativeResolutionYM ?? 0).toFixed(2)} m
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="text-[11px] text-slate-500">
-                          Import a GeoTIFF terrain source to use custom elevation.
-                        </div>
-                      )}
-                      {terrainSourceState.error && (
-                        <div className="mt-1 text-[11px] text-red-600">{terrainSourceState.error}</div>
-                      )}
-                      {terrainDescriptor && (
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToDsm}>
-                            Zoom
-                          </Button>
-                        </div>
-                      )}
-                      {!terrainDescriptor && rememberedTerrainDescriptor && (
-                        <div className="space-y-2 text-[11px] text-slate-600">
-                          <div className="font-medium text-slate-800">{rememberedTerrainDescriptor.name}</div>
-                          <div>
-                            {rememberedTerrainDescriptor.width.toLocaleString()} x {rememberedTerrainDescriptor.height.toLocaleString()} px · {formatBytes(rememberedTerrainDescriptor.fileSizeBytes)}
-                          </div>
-                          <div>{rememberedTerrainDescriptor.sourceCrsLabel}</div>
-                          {(rememberedTerrainDescriptor.nativeResolutionXM || rememberedTerrainDescriptor.nativeResolutionYM) && (
-                            <div>
-                              Native resolution: {(rememberedTerrainDescriptor.nativeResolutionXM ?? 0).toFixed(2)} m × {(rememberedTerrainDescriptor.nativeResolutionYM ?? 0).toFixed(2)} m
-                            </div>
-                          )}
-                          <div className="text-[11px] text-slate-500">
-                            Saved locally. Click Load to apply this DSM terrain.
-                          </div>
-                          <div className="flex gap-2">
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-7 px-2 text-[11px]"
-                              onClick={handleApplyRememberedTerrainSource}
-                              disabled={terrainAnalysisDisabled || !terrainSourceState.backendEnabled}
-                            >
-                              Load
-                            </Button>
-                            <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToRememberedDsm}>
-                              Zoom
-                            </Button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-
-                    {imageryOverlayImportEnabled ? (
-                      <div className="border-t border-slate-200 pt-3 space-y-2">
-                        <div className="text-[11px] font-medium text-slate-700">Imagery overlay</div>
-                        {imageryDescriptor ? (
-                          <div className="space-y-1 text-[11px] text-slate-600">
-                            <div className="font-medium text-slate-800">{imageryDescriptor.name}</div>
-                            <div>
-                              {imageryDescriptor.width.toLocaleString()} x {imageryDescriptor.height.toLocaleString()} px · {formatBytes(imageryDescriptor.fileSizeBytes)}
-                            </div>
-                            <div>{imageryDescriptor.sourceCrsLabel}</div>
-                          </div>
-                        ) : (
-                          <div className="text-[11px] text-slate-500">
-                            Import a georeferenced GeoTIFF ortho to view it as an imagery overlay.
-                          </div>
-                        )}
-                        {imageryOverlayState.error && (
-                          <div className="mt-1 text-[11px] text-red-600">{imageryOverlayState.error}</div>
-                        )}
-                        {imageryDescriptor && (
-                          <div className="flex gap-2">
-                            <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={zoomToImageryOverlay}>
-                              Zoom
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-7 px-2 text-[11px]"
-                              onClick={() => clearActiveImageryOverlay()}
-                            >
-                              Clear
-                            </Button>
-                          </div>
-                        )}
-                      </div>
-                    ) : null}
-                  </div>
-                )}
-              </div>
-
-              {isAnalyzing && (
-                <div className="flex items-center justify-center py-4 border-b mb-3">
-                  <div className="text-center">
-                    <LoadingSpinner size="sm" className="mx-auto mb-2" />
-                    <p className="text-xs text-gray-600">
-                      Analyzing {analyzingPolygons.size} polygon{analyzingPolygons.size !== 1 ? 's' : ''}...
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {!isAnalyzing && !hasResults && (
-                <div className="text-center py-6 text-gray-500">
-                  <p className="text-xs">Import flightplan or draw polygons to start analysis</p>
-                </div>
-              )}
-
-              {/* Multiple Polygon Results */}
-
-              <div className={panelEnabled && !terrainAnalysisDisabled ? '' : 'opacity-50 pointer-events-none'}>
-                <Suspense fallback={<DeferredPanelFallback />}>
-                  <OverlapGSDPanel
-                    mapRef={mapRef}
-                    mapboxToken={mapboxToken}
-                    clearAllEpoch={clearAllEpoch}
-                    getPerPolygonParams={() => paramsByPolygon}
-                    onEditPolygonParams={handleEditPolygonParams}
-                    onAutoRun={handleAutoRunReceived}
-                    onClearExposed={handleClearReceived}
-                    onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
-                    onPosesImported={(c)=> setImportedPoseCount(c)}
-                    polygonAnalyses={polygonResults}
-                    overrides={overrides}
-                    importedOriginals={importedOriginals}
-                    selectedPolygonId={selectedPolygonId}
-                    onSelectPolygon={setSelectedPolygonId}
-                  />
-                </Suspense>
-              </div>
+              {analysisPanelBody}
             </CardContent>
           </Card>
         </div>

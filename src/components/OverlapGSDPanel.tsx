@@ -2809,12 +2809,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
                   {isSelected && (
                     <>
-                      <div className="flex flex-wrap gap-2">
+                      <div className="flex flex-wrap gap-1.5 sm:gap-2">
                         {!isPoseArea && (
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 px-1.5 text-[11px]"
+                            className="h-6 whitespace-nowrap px-1.5 text-[10px] sm:text-[11px]"
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelection(polygonId);
@@ -2830,7 +2830,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           <Button
                             size="sm"
                             variant="secondary"
-                            className="h-6 px-1.5 text-[11px] border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+                            className="h-6 whitespace-nowrap border border-input bg-background px-1.5 text-[10px] hover:bg-accent hover:text-accent-foreground sm:text-[11px]"
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelection(polygonId);
@@ -2847,7 +2847,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 px-1.5 text-[11px]"
+                            className="h-6 whitespace-nowrap px-1.5 text-[10px] sm:text-[11px]"
                             disabled={!!splittingPolygonIds[polygonId]}
                             onClick={async (e) => {
                               e.stopPropagation();
@@ -2914,7 +2914,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                         <Button
                           size="sm"
                           variant="outline"
-                          className="h-6 px-1.5 text-[11px]"
+                          className="h-6 whitespace-nowrap px-1.5 text-[10px] sm:text-[11px]"
                           disabled={isPoseArea}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -2930,7 +2930,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 px-1.5 text-[11px] ml-auto border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
+                            className="h-6 whitespace-nowrap border-red-300 px-1.5 text-[10px] text-red-600 hover:bg-red-50 hover:text-red-700 sm:ml-auto sm:text-[11px]"
                             onClick={(e) => {
                               e.stopPropagation();
                               mapRef.current?.clearPolygon?.(polygonId);
