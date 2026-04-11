@@ -21,6 +21,8 @@ import {
   clearAllTriggerPoints,
   setProcessingPerimeterPolygons,
   setSelectedPolygonHighlight,
+  setNonSelectedPolygonDimMask,
+  setFlightLineSelectionEmphasis,
   renderFlightLinesForPolygon,
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
@@ -590,21 +592,15 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 
     const syncFlightLinesVisibility = useCallback((visible: boolean) => {
       flightLinesVisibleRef.current = visible;
+      const emphasizedPolygonId = (() => {
+        const selectedPolygonId = selectedPolygonIdRef.current;
+        if (!selectedPolygonId) return null;
+        return polygonFlightLinesRef.current.has(selectedPolygonId) ? selectedPolygonId : null;
+      })();
 
       const map = mapRef.current;
       if (map) {
-        const layers = map.getStyle()?.layers ?? [];
-        for (const layer of layers) {
-          if (
-            layer.id.startsWith('flight-lines-layer-') ||
-            layer.id.startsWith('flight-triggers-layer-') ||
-            layer.id.startsWith('flight-triggers-label-')
-          ) {
-            try {
-              map.setLayoutProperty(layer.id, 'visibility', visible ? 'visible' : 'none');
-            } catch {}
-          }
-        }
+        setFlightLineSelectionEmphasis(map, emphasizedPolygonId, visible);
       }
 
       const overlay = deckOverlayRef.current;
@@ -612,12 +608,51 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       setDeckLayers((currentLayers) => {
         const nextLayers = currentLayers.map((layer: any) => {
           const id = String(layer?.id ?? '');
+          const isPathLayer = id.startsWith('drone-path-') || id.startsWith('drone-centerline-');
+          const isTriggerLayer = id.startsWith('trigger-points-');
+          const isCameraLayer = id.startsWith('camera-points-');
           const isFlightLayer =
+            isPathLayer ||
             id.startsWith('drone-path-') ||
             id.startsWith('drone-centerline-') ||
-            id.startsWith('trigger-points-');
+            isTriggerLayer ||
+            isCameraLayer;
           if (!isFlightLayer) return layer;
-          return typeof layer?.clone === 'function' ? layer.clone({ visible }) : layer;
+          const polygonId = id.startsWith('drone-path-')
+            ? id.slice('drone-path-'.length)
+            : id.startsWith('drone-centerline-')
+              ? id.slice('drone-centerline-'.length)
+              : id.startsWith('trigger-points-')
+                ? id.slice('trigger-points-'.length)
+                : id.startsWith('camera-points-')
+                  ? id.slice('camera-points-'.length)
+                  : '';
+          const isSelected = !!emphasizedPolygonId && polygonId === emphasizedPolygonId;
+          const isDimmed = !!emphasizedPolygonId && !isSelected;
+          if (typeof layer?.clone !== 'function') return layer;
+
+          if (isPathLayer) {
+            return layer.clone({
+              visible,
+              getColor: isDimmed ? [100, 200, 255, 70] : isSelected ? [245, 158, 11, 255] : [100, 200, 255, 230],
+              getWidth: isSelected ? 3.5 : 2,
+            });
+          }
+
+          if (isTriggerLayer) {
+            return layer.clone({
+              visible,
+              getRadius: isSelected ? 5 : 4,
+              getFillColor: isDimmed ? [12, 36, 97, 55] : [12, 36, 97, 230],
+              getLineColor: isDimmed ? [230, 240, 255, 40] : [230, 240, 255, 220],
+            });
+          }
+
+          return layer.clone({
+            visible,
+            getFillColor: isDimmed ? [255, 71, 87, 80] : [255, 71, 87, 255],
+            getLineColor: isDimmed ? [255, 255, 255, 70] : [255, 255, 255, 255],
+          });
         });
         overlay.setProps({ layers: nextLayers });
         return nextLayers;
@@ -1532,8 +1567,18 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       const draw = drawRef.current as any;
       if (!map) return;
       const polygonId = selectedPolygonIdRef.current;
+      const allPolygons: Array<{ polygonId: string; ring: [number, number][] }> = (draw?.getAll?.()?.features ?? [])
+        .filter((feature: any) => feature?.geometry?.type === 'Polygon' && feature?.id)
+        .map((feature: any) => ({
+          polygonId: String(feature.id),
+          ring: feature.geometry.coordinates?.[0] as [number, number][],
+        }))
+        .filter((polygon: { polygonId: string; ring: [number, number][] }) => Array.isArray(polygon.ring) && polygon.ring.length >= 4);
       if (!polygonId) {
+        setNonSelectedPolygonDimMask(map, []);
         setSelectedPolygonHighlight(map, null);
+        setFlightLineSelectionEmphasis(map, null, flightLinesVisibleRef.current);
+        syncFlightLinesVisibility(flightLinesVisibleRef.current);
         return;
       }
       const feature = draw?.get?.(polygonId);
@@ -1542,11 +1587,17 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           ? (feature.geometry.coordinates?.[0] as [number, number][] | undefined)
           : undefined;
       if (!ring || ring.length < 4) {
+        setNonSelectedPolygonDimMask(map, []);
         setSelectedPolygonHighlight(map, null);
+        setFlightLineSelectionEmphasis(map, null, flightLinesVisibleRef.current);
+        syncFlightLinesVisibility(flightLinesVisibleRef.current);
         return;
       }
+      setNonSelectedPolygonDimMask(map, allPolygons.filter((polygon) => polygon.polygonId !== polygonId));
       setSelectedPolygonHighlight(map, { polygonId, ring });
-    }, []);
+      setFlightLineSelectionEmphasis(map, polygonId, flightLinesVisibleRef.current);
+      syncFlightLinesVisibility(flightLinesVisibleRef.current);
+    }, [syncFlightLinesVisibility]);
 
     // ---------- Mapbox Draw handlers ----------
     const handleDrawCreate = useCallback((e: any) => {
