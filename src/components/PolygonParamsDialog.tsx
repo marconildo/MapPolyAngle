@@ -28,9 +28,19 @@ export default function PolygonParamsDialog({
   onSubmitAll,
   defaults
 }: Props) {
-  const clampNumber = React.useCallback((value: number, min: number, max: number, fallback: number) => {
+  const clampNumber = React.useCallback((value: number | undefined, min: number, max: number, fallback: number) => {
     if (!Number.isFinite(value)) return fallback;
-    return Math.min(max, Math.max(min, value));
+    const safeValue = value as number;
+    return Math.min(max, Math.max(min, safeValue));
+  }, []);
+  const parseOptionalNumber = React.useCallback((value: string): number | undefined => {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return undefined;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }, []);
+  const formatInputNumber = React.useCallback((value: number | undefined, fallback: number) => {
+    return String(Number.isFinite(value) ? value : fallback);
   }, []);
 
   const [payloadKind, setPayloadKind] = React.useState<"camera" | "lidar">(defaults?.payloadKind ?? "camera");
@@ -43,18 +53,26 @@ export default function PolygonParamsDialog({
       }) ??
       "5",
   );
-  const [altitudeAGL, setAltitudeAGL] = React.useState<number>(defaults?.altitudeAGL ?? 100);
-  const [frontOverlap, setFrontOverlap] = React.useState<number>(defaults?.frontOverlap ?? 70);
-  const [sideOverlap, setSideOverlap] = React.useState<number>(defaults?.sideOverlap ?? 70);
+  const [altitudeAGLInput, setAltitudeAGLInput] = React.useState<string>(formatInputNumber(defaults?.altitudeAGL, 100));
+  const [frontOverlapInput, setFrontOverlapInput] = React.useState<string>(formatInputNumber(defaults?.frontOverlap, 70));
+  const [sideOverlapInput, setSideOverlapInput] = React.useState<string>(formatInputNumber(defaults?.sideOverlap, 70));
   const [cameraKey, setCameraKey] = React.useState<string>(defaults?.cameraKey ?? "MAP61_17MM");
   const [lidarKey, setLidarKey] = React.useState<string>(defaults?.lidarKey ?? WINGTRA_LIDAR_XT32M2X.key);
-  const [speedMps, setSpeedMps] = React.useState<number>(defaults?.speedMps ?? WINGTRA_LIDAR_XT32M2X.defaultSpeedMps);
+  const [speedMpsInput, setSpeedMpsInput] = React.useState<string>(
+    formatInputNumber(defaults?.speedMps, WINGTRA_LIDAR_XT32M2X.defaultSpeedMps),
+  );
   const [lidarReturnMode, setLidarReturnMode] = React.useState<"single" | "dual" | "triple">(defaults?.lidarReturnMode ?? "single");
-  const [mappingFovDeg, setMappingFovDeg] = React.useState<number>(defaults?.mappingFovDeg ?? WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg);
-  const [maxLidarRangeM, setMaxLidarRangeM] = React.useState<number>(defaults?.maxLidarRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M);
+  const [mappingFovDegInput, setMappingFovDegInput] = React.useState<string>(
+    formatInputNumber(defaults?.mappingFovDeg, WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg),
+  );
+  const [maxLidarRangeMInput, setMaxLidarRangeMInput] = React.useState<string>(
+    formatInputNumber(defaults?.maxLidarRangeM, DEFAULT_LIDAR_MAX_RANGE_M),
+  );
   const [showAdvanced, setShowAdvanced] = React.useState<boolean>(false);
   const [useCustomBearing, setUseCustomBearing] = React.useState<boolean>(defaults?.useCustomBearing ?? false);
-  const [customBearingDeg, setCustomBearingDeg] = React.useState<number>(defaults?.customBearingDeg ?? 0);
+  const [customBearingDegInput, setCustomBearingDegInput] = React.useState<string>(
+    formatInputNumber(defaults?.customBearingDeg, 0),
+  );
   const [rotateCamera90, setRotateCamera90] = React.useState<boolean>(
     Math.round((((defaults?.cameraYawOffsetDeg ?? 0) % 180) + 180) % 180) === 90
   );
@@ -96,22 +114,22 @@ export default function PolygonParamsDialog({
           }) ??
           "5",
       );
-      setAltitudeAGL(defaults?.altitudeAGL ?? 100);
-      setFrontOverlap(defaults?.frontOverlap ?? ((defaults?.payloadKind ?? "camera") === "lidar" ? 0 : 70));
-      setSideOverlap(defaults?.sideOverlap ?? 70);
+      setAltitudeAGLInput(formatInputNumber(defaults?.altitudeAGL, 100));
+      setFrontOverlapInput(formatInputNumber(defaults?.frontOverlap, (defaults?.payloadKind ?? "camera") === "lidar" ? 0 : 70));
+      setSideOverlapInput(formatInputNumber(defaults?.sideOverlap, 70));
       setCameraKey(defaults?.cameraKey ?? "MAP61_17MM");
       setLidarKey(defaults?.lidarKey ?? WINGTRA_LIDAR_XT32M2X.key);
-      setSpeedMps(defaults?.speedMps ?? WINGTRA_LIDAR_XT32M2X.defaultSpeedMps);
+      setSpeedMpsInput(formatInputNumber(defaults?.speedMps, WINGTRA_LIDAR_XT32M2X.defaultSpeedMps));
       setLidarReturnMode(defaults?.lidarReturnMode ?? "single");
-      setMappingFovDeg(defaults?.mappingFovDeg ?? WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg);
-      setMaxLidarRangeM(defaults?.maxLidarRangeM ?? DEFAULT_LIDAR_MAX_RANGE_M);
+      setMappingFovDegInput(formatInputNumber(defaults?.mappingFovDeg, WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg));
+      setMaxLidarRangeMInput(formatInputNumber(defaults?.maxLidarRangeM, DEFAULT_LIDAR_MAX_RANGE_M));
       setUseCustomBearing(defaults?.useCustomBearing ?? false);
-      setCustomBearingDeg(defaults?.customBearingDeg ?? 0);
+      setCustomBearingDegInput(formatInputNumber(defaults?.customBearingDeg, 0));
       const rotate = Math.round((((defaults?.cameraYawOffsetDeg ?? 0) % 180) + 180) % 180) === 90;
       setRotateCamera90(rotate);
       setShowAdvanced(!!(defaults?.useCustomBearing) || rotate);
     }
-  }, [open, defaults?.payloadKind, defaults?.planeHardwareVersion, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.lidarKey, defaults?.speedMps, defaults?.lidarReturnMode, defaults?.mappingFovDeg, defaults?.maxLidarRangeM, defaults?.useCustomBearing, defaults?.customBearingDeg, defaults?.cameraYawOffsetDeg]);
+  }, [open, defaults?.payloadKind, defaults?.planeHardwareVersion, defaults?.altitudeAGL, defaults?.frontOverlap, defaults?.sideOverlap, defaults?.cameraKey, defaults?.lidarKey, defaults?.speedMps, defaults?.lidarReturnMode, defaults?.mappingFovDeg, defaults?.maxLidarRangeM, defaults?.useCustomBearing, defaults?.customBearingDeg, defaults?.cameraYawOffsetDeg, formatInputNumber]);
 
   React.useEffect(() => {
     if (compatibleWingtraHardwareVersions.includes(planeHardwareVersion)) return;
@@ -123,6 +141,56 @@ export default function PolygonParamsDialog({
       }) ?? compatibleWingtraHardwareVersions[compatibleWingtraHardwareVersions.length - 1] ?? "5";
     setPlaneHardwareVersion(preferred);
   }, [cameraKey, compatibleWingtraHardwareVersions, lidarKey, payloadKind, planeHardwareVersion]);
+
+  const buildPayload = React.useCallback((): PolygonParams => {
+    const altitudeAGL = Math.max(1, parseOptionalNumber(altitudeAGLInput) ?? 100);
+    const frontOverlap = clampNumber(parseOptionalNumber(frontOverlapInput), 0, 95, 70);
+    const sideOverlap = clampNumber(parseOptionalNumber(sideOverlapInput), 0, 95, 70);
+    const speedMps = Math.max(0.1, parseOptionalNumber(speedMpsInput) ?? WINGTRA_LIDAR_XT32M2X.defaultSpeedMps);
+    const mappingFovDeg = clampNumber(
+      parseOptionalNumber(mappingFovDegInput),
+      1,
+      180,
+      WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg,
+    );
+    const maxLidarRangeM = Math.max(1, parseOptionalNumber(maxLidarRangeMInput) ?? DEFAULT_LIDAR_MAX_RANGE_M);
+    const customBearingDeg = parseOptionalNumber(customBearingDegInput) ?? 0;
+    const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
+
+    return {
+      payloadKind,
+      planeHardwareVersion,
+      altitudeAGL,
+      frontOverlap: payloadKind === "lidar" ? 0 : frontOverlap,
+      sideOverlap,
+      cameraKey: payloadKind === "camera" ? cameraKey : undefined,
+      lidarKey: payloadKind === "lidar" ? lidarKey : undefined,
+      cameraYawOffsetDeg: payloadKind === "camera" && rotateCamera90 ? 90 : 0,
+      speedMps: payloadKind === "lidar" ? speedMps : undefined,
+      lidarReturnMode: payloadKind === "lidar" ? lidarReturnMode : undefined,
+      mappingFovDeg: payloadKind === "lidar" ? mappingFovDeg : undefined,
+      maxLidarRangeM: payloadKind === "lidar" ? maxLidarRangeM : undefined,
+      useCustomBearing,
+      customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
+    };
+  }, [
+    altitudeAGLInput,
+    cameraKey,
+    clampNumber,
+    customBearingDegInput,
+    frontOverlapInput,
+    lidarKey,
+    lidarReturnMode,
+    mappingFovDegInput,
+    maxLidarRangeMInput,
+    parseOptionalNumber,
+    payloadKind,
+    planeHardwareVersion,
+    rotateCamera90,
+    sideOverlapInput,
+    speedMpsInput,
+    useCustomBearing,
+  ]);
 
   if (!open || !polygonId) return null;
 
@@ -196,30 +264,30 @@ export default function PolygonParamsDialog({
           <label className="text-xs text-gray-600 block">
             Altitude AGL (m)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number"
-                   value={altitudeAGL}
-                   onChange={(e)=>setAltitudeAGL(Math.max(1, parseInt(e.target.value || "100")))} />
+                   value={altitudeAGLInput}
+                   onChange={(e)=>setAltitudeAGLInput(e.target.value)} />
           </label>
           {payloadKind === "camera" && (
             <label className="text-xs text-gray-600 block">
               Front overlap (%)
               <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95}
-                     value={frontOverlap}
-                     onChange={(e)=>setFrontOverlap(clampNumber(parseInt(e.target.value || "70"), 0, 95, 70))} />
+                     value={frontOverlapInput}
+                     onChange={(e)=>setFrontOverlapInput(e.target.value)} />
             </label>
           )}
           <label className="text-xs text-gray-600 block">
             Side overlap (%)
             <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={0} max={95}
-                   value={sideOverlap}
-                   onChange={(e)=>setSideOverlap(clampNumber(parseInt(e.target.value || "70"), 0, 95, 70))} />
+                   value={sideOverlapInput}
+                   onChange={(e)=>setSideOverlapInput(e.target.value)} />
           </label>
           {payloadKind === "lidar" && (
             <>
               <label className="text-xs text-gray-600 block">
                 Speed (m/s)
                 <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={1} step={0.1}
-                       value={speedMps}
-                       onChange={(e)=>setSpeedMps(Math.max(0.1, parseFloat(e.target.value || `${WINGTRA_LIDAR_XT32M2X.defaultSpeedMps}`)))} />
+                       value={speedMpsInput}
+                       onChange={(e)=>setSpeedMpsInput(e.target.value)} />
               </label>
               <label className="text-xs text-gray-600 block">
                 Return mode
@@ -237,14 +305,14 @@ export default function PolygonParamsDialog({
               <label className="text-xs text-gray-600 block">
                 Mapping FOV (deg)
                 <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={1} max={180}
-                       value={mappingFovDeg}
-                       onChange={(e)=>setMappingFovDeg(clampNumber(parseFloat(e.target.value || `${WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg}`), 1, 180, WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg))} />
+                       value={mappingFovDegInput}
+                       onChange={(e)=>setMappingFovDegInput(e.target.value)} />
               </label>
               <label className="text-xs text-gray-600 block">
                 Max lidar range (m)
                 <input className="w-full border rounded px-2 py-1 text-xs" type="number" min={1} step={1}
-                       value={maxLidarRangeM}
-                       onChange={(e)=>setMaxLidarRangeM(Math.max(1, parseFloat(e.target.value || `${DEFAULT_LIDAR_MAX_RANGE_M}`)))} />
+                       value={maxLidarRangeMInput}
+                       onChange={(e)=>setMaxLidarRangeMInput(e.target.value)} />
               </label>
             </>
           )}
@@ -293,12 +361,9 @@ export default function PolygonParamsDialog({
                   min={0}
                   max={359.9}
                   step={0.1}
-                  value={customBearingDeg}
+                  value={customBearingDegInput}
                   disabled={!useCustomBearing}
-                  onChange={(e) => {
-                    const raw = parseFloat(e.target.value || '0');
-                    if (Number.isFinite(raw)) setCustomBearingDeg(raw);
-                  }}
+                  onChange={(e) => setCustomBearingDegInput(e.target.value)}
                 />
               </label>
             </div>
@@ -309,24 +374,7 @@ export default function PolygonParamsDialog({
               size="sm"
               className="flex-1 min-w-0 h-8 px-2 text-xs"
               onClick={() => {
-                const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
-                const payload: PolygonParams = {
-                  payloadKind,
-                  planeHardwareVersion,
-                  altitudeAGL: Math.max(1, Number.isFinite(altitudeAGL) ? altitudeAGL : 100),
-                  frontOverlap: payloadKind === "lidar" ? 0 : clampNumber(frontOverlap, 0, 95, 70),
-                  sideOverlap: clampNumber(sideOverlap, 0, 95, 70),
-                  cameraKey: payloadKind === "camera" ? cameraKey : undefined,
-                  lidarKey: payloadKind === "lidar" ? lidarKey : undefined,
-                  cameraYawOffsetDeg: payloadKind === "camera" && rotateCamera90 ? 90 : 0,
-                  speedMps: payloadKind === "lidar" ? Math.max(0.1, Number.isFinite(speedMps) ? speedMps : WINGTRA_LIDAR_XT32M2X.defaultSpeedMps) : undefined,
-                  lidarReturnMode: payloadKind === "lidar" ? lidarReturnMode : undefined,
-                  mappingFovDeg: payloadKind === "lidar" ? clampNumber(mappingFovDeg, 1, 180, WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg) : undefined,
-                  maxLidarRangeM: payloadKind === "lidar" ? Math.max(1, Number.isFinite(maxLidarRangeM) ? maxLidarRangeM : DEFAULT_LIDAR_MAX_RANGE_M) : undefined,
-                  useCustomBearing,
-                  customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
-                };
-                onSubmit(payload);
+                onSubmit(buildPayload());
               }}>
               Apply
             </Button>
@@ -336,24 +384,7 @@ export default function PolygonParamsDialog({
                 variant="secondary"
                 className="h-8 px-2 text-xs whitespace-nowrap"
                 onClick={() => {
-                  const normalizedBearing = ((customBearingDeg % 360) + 360) % 360;
-                  const payload: PolygonParams = {
-                    payloadKind,
-                    planeHardwareVersion,
-                    altitudeAGL: Math.max(1, Number.isFinite(altitudeAGL) ? altitudeAGL : 100),
-                    frontOverlap: payloadKind === "lidar" ? 0 : clampNumber(frontOverlap, 0, 95, 70),
-                    sideOverlap: clampNumber(sideOverlap, 0, 95, 70),
-                    cameraKey: payloadKind === "camera" ? cameraKey : undefined,
-                    lidarKey: payloadKind === "lidar" ? lidarKey : undefined,
-                    cameraYawOffsetDeg: payloadKind === "camera" && rotateCamera90 ? 90 : 0,
-                    speedMps: payloadKind === "lidar" ? Math.max(0.1, Number.isFinite(speedMps) ? speedMps : WINGTRA_LIDAR_XT32M2X.defaultSpeedMps) : undefined,
-                    lidarReturnMode: payloadKind === "lidar" ? lidarReturnMode : undefined,
-                    mappingFovDeg: payloadKind === "lidar" ? clampNumber(mappingFovDeg, 1, 180, WINGTRA_LIDAR_XT32M2X.effectiveHorizontalFovDeg) : undefined,
-                    maxLidarRangeM: payloadKind === "lidar" ? Math.max(1, Number.isFinite(maxLidarRangeM) ? maxLidarRangeM : DEFAULT_LIDAR_MAX_RANGE_M) : undefined,
-                    useCustomBearing,
-                    customBearingDeg: useCustomBearing ? normalizedBearing : undefined,
-                  };
-                  onSubmitAll(payload);
+                  onSubmitAll(buildPayload());
                 }}
                 title="Apply these parameters to all remaining polygons awaiting setup"
               >
