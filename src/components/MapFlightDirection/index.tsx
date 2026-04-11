@@ -105,6 +105,18 @@ function normalizeBearing(value?: number): number | undefined {
   return (((value as number) % 360) + 360) % 360;
 }
 
+const DECK_FLIGHT_LAYER_ID_PREFIXES = [
+  'drone-path-',
+  'drone-centerline-',
+  'trigger-points-',
+  'camera-points-',
+] as const;
+
+function getDeckFlightLayerPolygonId(layerId: string): string {
+  const prefix = DECK_FLIGHT_LAYER_ID_PREFIXES.find((candidate) => layerId.startsWith(candidate));
+  return prefix ? layerId.slice(prefix.length) : '';
+}
+
 function aggregateMetricStats(tileStats: GSDStats[]): GSDStats {
   const valid = tileStats.filter((s) => s && s.count > 0 && isFinite(s.min) && isFinite(s.max) && s.max > 0);
   if (valid.length === 0) return { min: 0, max: 0, mean: 0, count: 0, totalAreaM2: 0, histogram: [] };
@@ -613,20 +625,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           const isCameraLayer = id.startsWith('camera-points-');
           const isFlightLayer =
             isPathLayer ||
-            id.startsWith('drone-path-') ||
-            id.startsWith('drone-centerline-') ||
             isTriggerLayer ||
             isCameraLayer;
           if (!isFlightLayer) return layer;
-          const polygonId = id.startsWith('drone-path-')
-            ? id.slice('drone-path-'.length)
-            : id.startsWith('drone-centerline-')
-              ? id.slice('drone-centerline-'.length)
-              : id.startsWith('trigger-points-')
-                ? id.slice('trigger-points-'.length)
-                : id.startsWith('camera-points-')
-                  ? id.slice('camera-points-'.length)
-                  : '';
+          const polygonId = getDeckFlightLayerPolygonId(id);
           const isSelected = !!emphasizedPolygonId && polygonId === emphasizedPolygonId;
           const isDimmed = !!emphasizedPolygonId && !isSelected;
           if (typeof layer?.clone !== 'function') return layer;
