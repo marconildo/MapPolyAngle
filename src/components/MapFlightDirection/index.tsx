@@ -634,7 +634,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           if (isPathLayer) {
             return layer.clone({
               visible,
-              getColor: isDimmed ? [100, 200, 255, 70] : isSelected ? [245, 158, 11, 255] : [100, 200, 255, 230],
+              getColor: isDimmed ? [100, 200, 255, 70] : isSelected ? [100, 200, 255, 255] : [100, 200, 255, 230],
               getWidth: isSelected ? 3.5 : 2,
             });
           }
@@ -1562,6 +1562,23 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       return { parentId, coordPath };
     }, []);
 
+    const hitInteractiveMapFeature = useCallback((map: MapboxMap, point: { x: number; y: number }) => {
+      const features = map.queryRenderedFeatures(point as any);
+      return features.some((feature: any) => {
+        const layerId = String(feature?.layer?.id ?? '');
+        const meta = feature?.properties?.meta;
+        if (meta === 'feature' || meta === 'vertex' || meta === 'midpoint') return true;
+        return (
+          layerId.startsWith('flight-lines-layer-') ||
+          layerId.startsWith('flight-triggers-layer-') ||
+          layerId.startsWith('flight-triggers-label-') ||
+          layerId === 'selected-polygon-highlight-fill' ||
+          layerId === 'selected-polygon-highlight-outer' ||
+          layerId === 'selected-polygon-highlight-inner'
+        );
+      });
+    }, []);
+
     const syncSelectedPolygonHighlight = useCallback(() => {
       const map = mapRef.current;
       const draw = drawRef.current as any;
@@ -1717,6 +1734,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             }, 0);
           } catch {}
         });
+        map.on('click', (e: any) => {
+          try {
+            const drawMode = (drawRef.current as any)?.getMode?.();
+            if (drawMode === 'draw_polygon' || drawMode === 'direct_select') return;
+            if (hitInteractiveMapFeature(map, e.point)) return;
+            scheduleGuardedTimeout(() => onPolygonSelected?.(null), 0);
+          } catch {}
+        });
         // Open params dialog when user selects an existing polygon
         map.on('draw.selectionchange', (e: any) => {
           try {
@@ -1748,7 +1773,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
           } catch {}
         });
       },
-      [applyTerrainSourceToMap, clearDrawSelectionForPan, getClickedVertex, handleDrawCreate, handleDrawUpdate, handleDrawDelete, onPolygonSelected, scheduleGuardedTimeout, syncFlightLinesVisibility, syncSelectedPolygonHighlight]
+      [applyTerrainSourceToMap, clearDrawSelectionForPan, getClickedVertex, handleDrawCreate, handleDrawUpdate, handleDrawDelete, hitInteractiveMapFeature, onPolygonSelected, scheduleGuardedTimeout, syncFlightLinesVisibility, syncSelectedPolygonHighlight]
     );
 
     useEffect(() => {
@@ -1762,6 +1787,26 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       selectedPolygonIdRef.current = selectedPolygonId;
       syncSelectedPolygonHighlight();
     }, [selectedPolygonId, syncSelectedPolygonHighlight]);
+
+    useEffect(() => {
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key !== 'Escape') return;
+        if (!selectedPolygonIdRef.current) return;
+        if (event.defaultPrevented) return;
+        const target = event.target;
+        if (target instanceof HTMLElement) {
+          const tagName = target.tagName.toLowerCase();
+          if (tagName === 'input' || tagName === 'textarea' || tagName === 'select' || target.isContentEditable) {
+            return;
+          }
+        }
+        const drawMode = (drawRef.current as any)?.getMode?.();
+        if (drawMode === 'draw_polygon' || drawMode === 'direct_select') return;
+        onPolygonSelected?.(null);
+      };
+      window.addEventListener('keydown', onKeyDown);
+      return () => window.removeEventListener('keydown', onKeyDown);
+    }, [onPolygonSelected]);
 
     useMapInitialization({
       mapboxToken,

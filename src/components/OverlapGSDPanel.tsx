@@ -1785,11 +1785,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     const hasActiveSelection = !!activeSelectedId && combinedPolygons.some((item) => item.polygonId === activeSelectedId);
     if (hasActiveSelection) return;
 
-    if (combinedPolygons.length === 1) {
-      setSelection(combinedPolygons[0].polygonId);
-      return;
-    }
-
     if (activeSelectedId) {
       setSelection(null);
     }
