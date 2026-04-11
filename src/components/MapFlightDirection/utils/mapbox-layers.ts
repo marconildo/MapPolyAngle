@@ -64,6 +64,9 @@ const SELECTED_POLYGON_SOURCE_ID = 'selected-polygon-highlight-source';
 const SELECTED_POLYGON_FILL_LAYER_ID = 'selected-polygon-highlight-fill';
 const SELECTED_POLYGON_OUTER_LAYER_ID = 'selected-polygon-highlight-outer';
 const SELECTED_POLYGON_INNER_LAYER_ID = 'selected-polygon-highlight-inner';
+const NON_SELECTED_POLYGONS_SOURCE_ID = 'non-selected-polygons-dim-source';
+const NON_SELECTED_POLYGONS_FILL_LAYER_ID = 'non-selected-polygons-dim-fill';
+const NON_SELECTED_POLYGONS_LINE_LAYER_ID = 'non-selected-polygons-dim-line';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -312,6 +315,83 @@ export function clearDsmFootprintPolygon(map: MapboxMap) {
   try { if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) map.removeSource(DSM_FOOTPRINT_SOURCE_ID); } catch {}
 }
 
+export function setNonSelectedPolygonDimMask(
+  map: MapboxMap,
+  polygons: Array<{ polygonId: string; ring: [number, number][] }>,
+) {
+  if (polygons.length === 0) {
+    try { if (map.getLayer(NON_SELECTED_POLYGONS_LINE_LAYER_ID)) map.removeLayer(NON_SELECTED_POLYGONS_LINE_LAYER_ID); } catch {}
+    try { if (map.getLayer(NON_SELECTED_POLYGONS_FILL_LAYER_ID)) map.removeLayer(NON_SELECTED_POLYGONS_FILL_LAYER_ID); } catch {}
+    try { if (map.getSource(NON_SELECTED_POLYGONS_SOURCE_ID)) map.removeSource(NON_SELECTED_POLYGONS_SOURCE_ID); } catch {}
+    return;
+  }
+
+  const data = {
+    type: 'FeatureCollection',
+    features: polygons
+      .map((polygon) => {
+        const closedRing = ensureClosedRing(polygon.ring);
+        if (closedRing.length < 4) return null;
+        return {
+          type: 'Feature',
+          geometry: {
+            type: 'Polygon',
+            coordinates: [closedRing],
+          },
+          properties: {
+            polygonId: polygon.polygonId,
+          },
+        };
+      })
+      .filter((feature): feature is NonNullable<typeof feature> => feature !== null),
+  } as const;
+
+  if (data.features.length === 0) {
+    setNonSelectedPolygonDimMask(map, []);
+    return;
+  }
+
+  if (map.getSource(NON_SELECTED_POLYGONS_SOURCE_ID)) {
+    (map.getSource(NON_SELECTED_POLYGONS_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(NON_SELECTED_POLYGONS_SOURCE_ID, {
+      type: 'geojson',
+      data,
+    } as any);
+  }
+
+  if (!map.getLayer(NON_SELECTED_POLYGONS_FILL_LAYER_ID)) {
+    const beforeId = getDrawLayerAnchor(map);
+    map.addLayer({
+      id: NON_SELECTED_POLYGONS_FILL_LAYER_ID,
+      type: 'fill',
+      source: NON_SELECTED_POLYGONS_SOURCE_ID,
+      paint: {
+        'fill-color': '#ffffff',
+        'fill-opacity': 0.08,
+      },
+    }, beforeId);
+  }
+
+  if (!map.getLayer(NON_SELECTED_POLYGONS_LINE_LAYER_ID)) {
+    const beforeId = getDrawLayerAnchor(map);
+    map.addLayer({
+      id: NON_SELECTED_POLYGONS_LINE_LAYER_ID,
+      type: 'line',
+      source: NON_SELECTED_POLYGONS_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#94a3b8',
+        'line-width': 1.5,
+        'line-opacity': 0.3,
+      },
+    }, beforeId);
+  }
+}
+
 export function setSelectedPolygonHighlight(
   map: MapboxMap,
   polygon: { polygonId: string; ring: [number, number][] } | null,
@@ -400,6 +480,49 @@ export function setSelectedPolygonHighlight(
         'line-opacity': 1,
       },
     });
+  }
+}
+
+export function setFlightLineSelectionEmphasis(
+  map: MapboxMap,
+  selectedPolygonId: string | null,
+  visible: boolean,
+) {
+  const layers = map.getStyle()?.layers ?? [];
+  for (const layer of layers) {
+    const layerId = layer.id;
+    const isLineLayer = layerId.startsWith('flight-lines-layer-');
+    const isTriggerCircleLayer = layerId.startsWith('flight-triggers-layer-');
+    const isTriggerLabelLayer = layerId.startsWith('flight-triggers-label-');
+    if (!isLineLayer && !isTriggerCircleLayer && !isTriggerLabelLayer) continue;
+
+    const polygonId = isLineLayer
+      ? layerId.slice('flight-lines-layer-'.length)
+      : isTriggerCircleLayer
+        ? layerId.slice('flight-triggers-layer-'.length)
+        : layerId.slice('flight-triggers-label-'.length);
+    const isSelected = !!selectedPolygonId && polygonId === selectedPolygonId;
+    const isDimmed = !!selectedPolygonId && !isSelected;
+
+    try {
+      map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
+    } catch {}
+
+    if (isLineLayer) {
+      try { map.setPaintProperty(layerId, 'line-opacity', isDimmed ? 0.16 : 0.95); } catch {}
+      try { map.setPaintProperty(layerId, 'line-width', isSelected ? 1.8 : 0.5); } catch {}
+    }
+
+    if (isTriggerCircleLayer) {
+      try { map.setPaintProperty(layerId, 'circle-opacity', isDimmed ? 0.18 : 0.95); } catch {}
+      try { map.setPaintProperty(layerId, 'circle-stroke-opacity', isDimmed ? 0.2 : 1); } catch {}
+      try { map.setPaintProperty(layerId, 'circle-radius', isSelected ? 2.2 : 1.5); } catch {}
+    }
+
+    if (isTriggerLabelLayer) {
+      try { map.setPaintProperty(layerId, 'text-opacity', isDimmed ? 0.16 : 0.92); } catch {}
+      try { map.setPaintProperty(layerId, 'text-halo-color', isSelected ? '#f8fafc' : '#ffffff'); } catch {}
+    }
   }
 }
 

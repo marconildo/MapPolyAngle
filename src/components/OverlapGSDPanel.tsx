@@ -728,6 +728,41 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     };
   }, [computeOverlayRanges]);
 
+  const setOverlaySelectionEmphasis = useCallback((
+    map: mapboxgl.Map,
+    runId: string,
+    selectedPolygonId: string | null,
+    resetUnmatchedLayers: boolean,
+  ) => {
+    const selectedTileKeys = selectedPolygonId
+      ? new Set(perPolyTileStatsRef.current.get(selectedPolygonId)?.keys() ?? [])
+      : null;
+    const shouldEmphasizeSelection = !!selectedPolygonId && !!selectedTileKeys && selectedTileKeys.size > 0;
+    const layers = map.getStyle?.().layers ?? [];
+    for (const layer of layers) {
+      const layerId = String(layer?.id ?? '');
+      if (!layerId.startsWith(`ogsd-${runId}-`)) continue;
+      const match = layerId.match(/^ogsd-[^-]+-(?:overlap|pass|gsd|density)-(\d+)-(\d+)-(\d+)$/);
+      if (!match) {
+        if (!resetUnmatchedLayers) continue;
+        try {
+          map.setPaintProperty(layerId, 'raster-opacity', opacity);
+        } catch {}
+        continue;
+      }
+
+      const [, z, x, y] = match;
+      const cacheKey = `${z}/${x}/${y}`;
+      const isSelectedTile = shouldEmphasizeSelection ? selectedTileKeys!.has(cacheKey) : true;
+      const rasterOpacity = shouldEmphasizeSelection
+        ? (isSelectedTile ? opacity : Math.min(0.2, opacity * 0.24))
+        : opacity;
+      try {
+        map.setPaintProperty(layerId, 'raster-opacity', rasterOpacity);
+      } catch {}
+    }
+  }, [opacity]);
+
   const redrawAnalysisOverlays = useCallback((statsOverride?: OverallMetricStats, rangesOverride?: OverlayScaleRanges) => {
     const map = mapRef.current?.getMap?.();
     const runId = globalRunIdRef.current;
@@ -768,13 +803,25 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         });
       }
     }
-  }, [mapRef, opacity, overallStats, resolveOverlayRanges]);
+    setOverlaySelectionEmphasis(map, runId, activeSelectedId, false);
+  }, [activeSelectedId, mapRef, overallStats, resolveOverlayRanges, setOverlaySelectionEmphasis]);
+
+  const applyOverlaySelectionEmphasis = useCallback((selectedPolygonId: string | null) => {
+    const map = mapRef.current?.getMap?.();
+    const runId = globalRunIdRef.current;
+    if (!map || !runId || !map.isStyleLoaded?.()) return;
+    setOverlaySelectionEmphasis(map, runId, selectedPolygonId, true);
+  }, [mapRef, setOverlaySelectionEmphasis]);
 
   React.useEffect(() => {
     redrawAnalysisOverlaysRef.current = () => {
       redrawAnalysisOverlays();
     };
   }, [redrawAnalysisOverlays]);
+
+  React.useEffect(() => {
+    applyOverlaySelectionEmphasis(activeSelectedId);
+  }, [activeSelectedId, applyOverlaySelectionEmphasis, perPolygonStats]);
 
   const handleShowAnalysisOverlayChange = useCallback((checked: boolean) => {
     showGsdRef.current = checked;
@@ -1727,11 +1774,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
     const hasActiveSelection = !!activeSelectedId && combinedPolygons.some((item) => item.polygonId === activeSelectedId);
     if (hasActiveSelection) return;
-
-    if (combinedPolygons.length === 1) {
-      setSelection(combinedPolygons[0].polygonId);
-      return;
-    }
 
     if (activeSelectedId) {
       setSelection(null);
