@@ -1,13 +1,12 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type mapboxgl from "mapbox-gl";
-import { LidarDensityWorker, OverlapWorker, fetchTerrainRGBA, tilesCoveringPolygon } from "@/overlap/controller";
 import { addOrUpdateTileOverlay, clearAllOverlays, clearRunOverlays } from "@/overlap/overlay";
 import type { CameraModel, PoseMeters, PolygonLngLatWithId, GSDStats, PolygonTileStats, LidarStripMeters, OverlayTileResult, TileResult } from "@/overlap/types";
 import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import { sampleCameraPositionsOnFlightPath, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
 import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -18,10 +17,7 @@ import type { BearingOverride, MapFlightDirectionAPI, TerrainPartitionSolutionPr
 import type { FlightParams, LidarReturnMode, TerrainTile } from "@/domain/types";
 import { extractPoses, wgs84ToWebMercator, extractCameraModel } from "@/utils/djiGeotags";
 import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
-import { planCoverageAutoRun } from "@/overlap/coverageAutoRun";
-import { aggregateMetricStats as aggregateMetricStatsBase, aggregateOverallMetricStats } from "@/overlap/metricAggregation";
-import { rerankPartitionSolutionsExact, type ExactPartitionPreview as SharedExactPartitionPreview } from "@/overlap/exact-region";
-import { withBrowserExactRegionRuntime } from "@/overlap/exactBrowserRuntime";
+import type { ExactPartitionPreview as SharedExactPartitionPreview } from "@/overlap/exact-region";
 import { createCoveragePanelResetState } from "@/state/clearAllState";
 import { shouldRunAsyncGeneration } from "@/state/asyncUpdateGuard";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
@@ -73,6 +69,52 @@ type OverlayMetricRange = {
 type OverlayScaleRanges = Partial<Record<MetricKind, OverlayMetricRange>>;
 
 type ExactPartitionPreview = SharedExactPartitionPreview;
+type CoverageAutoRunModule = typeof import("@/overlap/coverageAutoRun");
+type ExactRegionModule = typeof import("@/overlap/exact-region");
+type ExactBrowserRuntimeModule = typeof import("@/overlap/exactBrowserRuntime");
+type MetricAggregationModule = typeof import("@/overlap/metricAggregation");
+type OverlapControllerModule = typeof import("@/overlap/controller");
+
+let coverageAutoRunModulePromise: Promise<CoverageAutoRunModule> | null = null;
+let exactRegionModulePromise: Promise<ExactRegionModule> | null = null;
+let exactBrowserRuntimeModulePromise: Promise<ExactBrowserRuntimeModule> | null = null;
+let metricAggregationModulePromise: Promise<MetricAggregationModule> | null = null;
+let overlapControllerModulePromise: Promise<OverlapControllerModule> | null = null;
+
+function loadCoverageAutoRunModule(): Promise<CoverageAutoRunModule> {
+  if (!coverageAutoRunModulePromise) {
+    coverageAutoRunModulePromise = import("@/overlap/coverageAutoRun");
+  }
+  return coverageAutoRunModulePromise;
+}
+
+function loadExactRegionModule(): Promise<ExactRegionModule> {
+  if (!exactRegionModulePromise) {
+    exactRegionModulePromise = import("@/overlap/exact-region");
+  }
+  return exactRegionModulePromise;
+}
+
+function loadExactBrowserRuntimeModule(): Promise<ExactBrowserRuntimeModule> {
+  if (!exactBrowserRuntimeModulePromise) {
+    exactBrowserRuntimeModulePromise = import("@/overlap/exactBrowserRuntime");
+  }
+  return exactBrowserRuntimeModulePromise;
+}
+
+function loadMetricAggregationModule(): Promise<MetricAggregationModule> {
+  if (!metricAggregationModulePromise) {
+    metricAggregationModulePromise = import("@/overlap/metricAggregation");
+  }
+  return metricAggregationModulePromise;
+}
+
+function loadOverlapControllerModule(): Promise<OverlapControllerModule> {
+  if (!overlapControllerModulePromise) {
+    overlapControllerModulePromise = import("@/overlap/controller");
+  }
+  return overlapControllerModulePromise;
+}
 
 const TERRAIN_SPLIT_DEBUG = true;
 const HEATMAP_GRADIENT_GSD = "linear-gradient(90deg, rgb(0 0 255) 0%, rgb(0 255 255) 25%, rgb(0 255 0) 50%, rgb(255 255 0) 75%, rgb(255 0 0) 100%)";
@@ -666,10 +708,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   // Accurate aggregation with a higher-fidelity histogram for scoring.
   const tailAreaAcres = 1; // trim per side (acres)
 
-  const aggregateMetricStats = useCallback((tileStats: GSDStats[]): GSDStats => {
-    return aggregateMetricStatsBase(tileStats, tailAreaAcres);
-  }, [tailAreaAcres]);
-
   const overlayRangeForStats = useCallback((stats: GSDStats | null, metricKind: MetricKind) => {
     if (!stats || !(stats.count > 0) || !Number.isFinite(stats.min) || !Number.isFinite(stats.max)) return null;
     let min = histogramQuantile(stats, OVERLAY_SCALE_LOWER_QUANTILE);
@@ -911,17 +949,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         { altitudeAGL: altForThisPoly, mode, minClearance: minClr, preconnected: true },
       );
 
-      const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward, { includeTurns: false });
-      // Filter out cameras outside the polygon ring
       const polys = api.getPolygonsWithIds?.() || [];
       const ring = (polys.find((pp:any)=> (pp.id||'unknown')===polygonId)?.ring) as [number,number][] | undefined;
-      const inside = (lng:number,lat:number,ring:[number,number][]) => {
-        let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
-          const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
-          const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
-        } return ins;
-      };
-      const filtered = ring && ring.length>=3 ? cameraPositions.filter(([lng,lat])=> inside(lng,lat,ring)) : cameraPositions;
+      const filtered = sampleCameraPositionsOnPlannedFlightGeometry(lineData, path3D, spacingForward)
+        .filter(([lng, lat]) => !ring || ring.length < 3 || isPointInRing(lng, lat, ring));
 
       const normalizeDeg = (d: number) => ((d % 360) + 360) % 360;
       filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
@@ -1092,6 +1123,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
     const parentTiles = (api?.getPolygonTiles?.().get(polygonId) ?? []) as TerrainTile[];
     if (!parentTiles.length) throw new Error('Terrain tiles are not available yet. Run analysis on this polygon first.');
+    const [
+      { aggregateMetricStats },
+      { fetchTerrainRGBA, tilesCoveringPolygon, LidarDensityWorker, OverlapWorker },
+    ] = await Promise.all([
+      loadMetricAggregationModule(),
+      loadOverlapControllerModule(),
+    ]);
 
     const altitudeMode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : altitudeModeUI;
     const minClearance = (api as any)?.getMinClearance ? (api as any).getMinClearance() : minClearanceUI;
@@ -1327,10 +1365,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         lineSpacing,
         { altitudeAGL, mode: altitudeMode, minClearance, preconnected: true },
       );
-      const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false });
-      const filtered = region.ring.length >= 3
-        ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, region.ring))
-        : cameraPositions;
+      const filtered = sampleCameraPositionsOnPlannedFlightGeometry(geometry, path3d, photoSpacing)
+        .filter(([lng, lat]) => region.ring.length < 3 || isPointInRing(lng, lat, region.ring));
       filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
         const [x, y] = lngLatToMeters(lng, lat);
         poses.push({
@@ -1402,7 +1438,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     sideOverlap,
     turnExtendUI,
     zoom,
-    aggregateMetricStats,
   ]);
 
   const scoreLidarPartitionPreview = useCallback((
@@ -1535,6 +1570,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     const altitudeMode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : altitudeModeUI;
     const minClearance = (api as any)?.getMinClearance ? (api as any).getMinClearance() : minClearanceUI;
     const turnExtend = (api as any)?.getTurnExtend ? Math.max(0, (api as any).getTurnExtend()) : turnExtendUI;
+    const [{ rerankPartitionSolutionsExact }, { withBrowserExactRegionRuntime }] = await Promise.all([
+      loadExactRegionModule(),
+      loadExactBrowserRuntimeModule(),
+    ]);
     const exact = await withBrowserExactRegionRuntime(mapboxToken, (runtime) => rerankPartitionSolutionsExact(runtime, {
       scopeId: polygonId,
       polygonId,
@@ -1949,6 +1988,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     const computeStartedAt = splitPerfNow();
     const mySeq = ++computeSeqRef.current;
     const scope = opts?.polygonId ?? '__all__';
+    const [
+      { aggregateMetricStats, aggregateOverallMetricStats },
+      { fetchTerrainRGBA, tilesCoveringPolygon, LidarDensityWorker, OverlapWorker },
+    ] = await Promise.all([
+      loadMetricAggregationModule(),
+      loadOverlapControllerModule(),
+    ]);
     splitPerfLog(scope, 'coverage compute start', {
       seq: mySeq,
       polygonId: opts?.polygonId,
@@ -2303,7 +2349,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         }, 0, pending.generation ?? generation);
       }
     }
-  }, [CAMERA_REGISTRY, aggregateMetricStats, buildLidarStrips, cameraText, cancelGuardedTimeout, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, scheduleGuardedTimeout, showCameraPoints, toOverlayTileResult, zoom]);
+  }, [CAMERA_REGISTRY, buildLidarStrips, cameraText, cancelGuardedTimeout, clipInnerBufferM, getMergedParamsMap, getPolygons, importedPoses, isLidarPayload, mapRef, mapboxToken, parseCameraOverride, parsePosesMeters, redrawAnalysisOverlays, scheduleGuardedTimeout, showCameraPoints, toOverlayTileResult, zoom]);
 
   // Auto-run function that can be called externally
   const autoRun = useCallback(async (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => {
@@ -2326,6 +2372,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
       ? [opts.polygonId]
       : (api?.getPolygonsWithIds?.() ?? []).map((polygon: any) => polygon.id || 'unknown');
     const haveLidarPolys = relevantIds.some((polygonId) => isLidarPayload(polygonId, paramsMap));
+    const { planCoverageAutoRun } = await loadCoverageAutoRunModule();
     const plan = planCoverageAutoRun({
       request: opts,
       nowMs: Date.now(),
@@ -3228,4 +3275,4 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   );
 }
 
-export default OverlapGSDPanel;
+export default React.memo(OverlapGSDPanel);

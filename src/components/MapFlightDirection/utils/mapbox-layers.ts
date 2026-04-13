@@ -580,14 +580,14 @@ export function renderFlightLinesForPolygon(
 
   const data = {
     type: 'FeatureCollection',
-    features: displayLines.map((line) => ({
+    features: displayLines.length > 0 ? [{
       type: 'Feature',
       geometry: {
-        type: 'LineString',
-        coordinates: line,
+        type: 'MultiLineString',
+        coordinates: displayLines,
       },
       properties: {},
-    })),
+    }] : [],
   } as const;
 
   // Source: update or add

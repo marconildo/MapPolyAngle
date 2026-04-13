@@ -407,6 +407,32 @@ export default function Home() {
     clearGSDRef.current = clearFn;
   }, []);
 
+  const getParamsByPolygon = useCallback(() => paramsByPolygon, [paramsByPolygon]);
+
+  const handleExposePoseImporter = useCallback((fn: (mode?: 'dji' | 'wingtra') => void) => {
+    openDJIImporterRef.current = fn;
+  }, []);
+
+  const handlePosesImported = useCallback((count: number) => {
+    setImportedPoseCount(count);
+  }, []);
+
+  const handleClearGsd = useCallback(() => {
+    clearGSDRef.current?.();
+  }, []);
+
+  const handleTerrainSourceReady = useCallback((readyTerrainSource: TerrainSourceState['source']) => {
+    const readyKey = `${readyTerrainSource.mode}:${readyTerrainSource.datasetId ?? ''}`;
+    lastReadyTerrainKeyRef.current = readyKey;
+    console.log('[terrain-source] map reported terrain source ready', {
+      readyKey,
+    });
+    setImportUiState((current) => {
+      if (!current || current.phase !== 'applying') return current;
+      return current.targetKey === readyKey ? null : current;
+    });
+  }, []);
+
   // Also refresh overrides when results change
   React.useEffect(() => {
     if (mapRef.current) {
@@ -609,20 +635,22 @@ export default function Home() {
   }, []);
 
   const handleConfirmWingtraExport = useCallback(() => {
-    const api = mapRef.current;
-    if (!api?.exportWingtraFlightPlan) return;
+    void (async () => {
+      const api = mapRef.current;
+      if (!api?.exportWingtraFlightPlan) return;
 
-    try {
-      const { blob } = api.exportWingtraFlightPlan();
-      downloadFlightplanBlob(blob, normalizeFlightplanFilename(exportNameDraft));
-      setExportNameDialogOpen(false);
-    } catch (error) {
-      toast({
-        variant: 'destructive',
-        title: 'Export failed',
-        description: error instanceof Error ? error.message : String(error),
-      });
-    }
+      try {
+        const { blob } = await api.exportWingtraFlightPlan();
+        downloadFlightplanBlob(blob, normalizeFlightplanFilename(exportNameDraft));
+        setExportNameDialogOpen(false);
+      } catch (error) {
+        toast({
+          variant: 'destructive',
+          title: 'Export failed',
+          description: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
   }, [exportNameDraft]);
 
   if (!mapboxToken) {
@@ -816,12 +844,12 @@ export default function Home() {
             mapRef={mapRef}
             mapboxToken={mapboxToken}
             clearAllEpoch={clearAllEpoch}
-            getPerPolygonParams={() => paramsByPolygon}
+            getPerPolygonParams={getParamsByPolygon}
             onEditPolygonParams={handleEditPolygonParams}
             onAutoRun={handleAutoRunReceived}
             onClearExposed={handleClearReceived}
-            onExposePoseImporter={(fn)=>{ openDJIImporterRef.current = fn; }}
-            onPosesImported={(c)=> setImportedPoseCount(c)}
+            onExposePoseImporter={handleExposePoseImporter}
+            onPosesImported={handlePosesImported}
             polygonAnalyses={polygonResults}
             overrides={overrides}
             importedOriginals={importedOriginals}
@@ -985,43 +1013,47 @@ export default function Home() {
           />
         ) : null}
         {/* PER‑POLYGON PARAMS DIALOG */}
-        <Suspense fallback={null}>
-        {(() => {
-          const pid = paramsDialog.polygonId || "";
-          const mapParams = mapRef.current?.getPerPolygonParams?.() || {} as any;
-          const current = mapParams[pid] || paramsByPolygon[pid] || {} as any;
-          return (
-        <PolygonParamsDialog
-          open={paramsDialog.open}
-          polygonId={paramsDialog.polygonId}
-          onClose={handleCloseParams}
-          onSubmit={handleApplyParams}
-          onSubmitAll={(params) => {
-            mapRef.current?.applyParamsToAllPending?.(params);
-            // Refresh local cache from source of truth
-            const updated = mapRef.current?.getPerPolygonParams?.() || {};
-            setParamsByPolygon(updated as any);
-            setParamsDialog({ open: false, polygonId: null });
-          }}
-          defaults={{
-            payloadKind: current.payloadKind ?? 'camera',
-            planeHardwareVersion: current.planeHardwareVersion,
-            altitudeAGL: current.altitudeAGL ?? 100,
-            frontOverlap: current.frontOverlap ?? ((current.payloadKind ?? 'camera') === 'lidar' ? 0 : 70),
-            sideOverlap: current.sideOverlap ?? 70,
-            cameraKey: current.cameraKey ?? 'MAP61_17MM',
-            lidarKey: current.lidarKey,
-            cameraYawOffsetDeg: current.cameraYawOffsetDeg ?? 0,
-            speedMps: current.speedMps,
-            lidarReturnMode: current.lidarReturnMode,
-            mappingFovDeg: current.mappingFovDeg,
-            maxLidarRangeM: current.maxLidarRangeM,
-            pointDensityPtsM2: current.pointDensityPtsM2,
-            useCustomBearing: current.useCustomBearing ?? false,
-            customBearingDeg: current.customBearingDeg ?? undefined,
-          }}
-        />); })()}
-        </Suspense>
+        {paramsDialog.open && paramsDialog.polygonId ? (
+          <Suspense fallback={null}>
+            {(() => {
+              const pid = paramsDialog.polygonId || "";
+              const mapParams = mapRef.current?.getPerPolygonParams?.() || {} as any;
+              const current = mapParams[pid] || paramsByPolygon[pid] || {} as any;
+              return (
+                <PolygonParamsDialog
+                  open={paramsDialog.open}
+                  polygonId={paramsDialog.polygonId}
+                  onClose={handleCloseParams}
+                  onSubmit={handleApplyParams}
+                  onSubmitAll={(params) => {
+                    mapRef.current?.applyParamsToAllPending?.(params);
+                    // Refresh local cache from source of truth
+                    const updated = mapRef.current?.getPerPolygonParams?.() || {};
+                    setParamsByPolygon(updated as any);
+                    setParamsDialog({ open: false, polygonId: null });
+                  }}
+                  defaults={{
+                    payloadKind: current.payloadKind ?? 'camera',
+                    planeHardwareVersion: current.planeHardwareVersion,
+                    altitudeAGL: current.altitudeAGL ?? 100,
+                    frontOverlap: current.frontOverlap ?? ((current.payloadKind ?? 'camera') === 'lidar' ? 0 : 70),
+                    sideOverlap: current.sideOverlap ?? 70,
+                    cameraKey: current.cameraKey ?? 'MAP61_17MM',
+                    lidarKey: current.lidarKey,
+                    cameraYawOffsetDeg: current.cameraYawOffsetDeg ?? 0,
+                    speedMps: current.speedMps,
+                    lidarReturnMode: current.lidarReturnMode,
+                    mappingFovDeg: current.mappingFovDeg,
+                    maxLidarRangeM: current.maxLidarRangeM,
+                    pointDensityPtsM2: current.pointDensityPtsM2,
+                    useCustomBearing: current.useCustomBearing ?? false,
+                    customBearingDeg: current.customBearingDeg ?? undefined,
+                  }}
+                />
+              );
+            })()}
+          </Suspense>
+        ) : null}
 
         {isMobile && (
           <>
@@ -1092,24 +1124,13 @@ export default function Home() {
             sampleStep={sampleStep}
             terrainDemUrlTemplate={getTerrainDemUrlTemplateForCurrentSource()}
             terrainSource={terrainSourceState.source}
-            onTerrainSourceReady={(readyTerrainSource) => {
-              const readyKey = `${readyTerrainSource.mode}:${readyTerrainSource.datasetId ?? ''}`;
-              lastReadyTerrainKeyRef.current = readyKey;
-              console.log('[terrain-source] map reported terrain source ready', {
-                readyKey,
-                currentImportUiState: importUiState,
-              });
-              setImportUiState((current) => {
-                if (!current || current.phase !== 'applying') return current;
-                return current.targetKey === readyKey ? null : current;
-              });
-            }}
+            onTerrainSourceReady={handleTerrainSourceReady}
             onAnalysisStart={handleAnalysisStart}
             onAnalysisComplete={handleAnalysisComplete}
             onError={handleError}
             onRequestParams={handleRequestParams}
             onFlightLinesUpdated={handleFlightLinesUpdated}
-            onClearGSD={() => clearGSDRef.current?.()}
+            onClearGSD={handleClearGsd}
             onPolygonSelected={setSelectedPolygonId}
             selectedPolygonId={selectedPolygonId}
           />

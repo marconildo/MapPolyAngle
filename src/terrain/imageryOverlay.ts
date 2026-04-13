@@ -1,7 +1,3 @@
-import { fromArrayBuffer, fromBlob } from "geotiff";
-import { toProj4 } from "geotiff-geokeys-to-proj4";
-import proj4 from "proj4";
-
 import type { Bounds, GeoTiffSourceDescriptor, ImageryOverlayDescriptor, ImageryOverlayState, LngLatBounds } from "./types";
 
 type ActiveImageryOverlay = {
@@ -13,6 +9,15 @@ type ActiveImageryOverlay = {
 
 const MAX_OVERLAY_RENDER_DIMENSION = 4096;
 
+type ImageryGeoTiffDependencies = {
+  fromArrayBuffer: typeof import("geotiff")["fromArrayBuffer"];
+  fromBlob: typeof import("geotiff")["fromBlob"];
+  toProj4: typeof import("geotiff-geokeys-to-proj4")["toProj4"];
+  proj4: (...args: any[]) => any;
+};
+
+let imageryGeoTiffDependenciesPromise: Promise<ImageryGeoTiffDependencies> | null = null;
+
 const listeners = new Set<() => void>();
 
 let activeImageryOverlay: ActiveImageryOverlay | null = null;
@@ -21,6 +26,20 @@ let imageryOverlayState: ImageryOverlayState = {
   isLoading: false,
   error: null,
 };
+
+function loadImageryGeoTiffDependencies(): Promise<ImageryGeoTiffDependencies> {
+  const promise = imageryGeoTiffDependenciesPromise ?? (imageryGeoTiffDependenciesPromise = Promise.all([
+      import("geotiff"),
+      import("geotiff-geokeys-to-proj4"),
+      import("proj4"),
+    ]).then(([geotiff, geoKeys, proj4Module]) => ({
+      fromArrayBuffer: geotiff.fromArrayBuffer,
+      fromBlob: geotiff.fromBlob,
+      toProj4: geoKeys.toProj4,
+      proj4: ((proj4Module as unknown as { default?: unknown }).default ?? proj4Module) as (...args: any[]) => any,
+    })));
+  return promise;
+}
 
 function emit() {
   for (const listener of listeners) listener();
@@ -84,6 +103,7 @@ function generateLocalImageryId(): string {
 }
 
 async function openGeoTiff(file: File) {
+  const { fromArrayBuffer, fromBlob } = await loadImageryGeoTiffDependencies();
   if (typeof FileReader === "function") {
     return fromBlob(file);
   }
@@ -161,6 +181,7 @@ export async function loadImageryOverlayFromFile(file: File): Promise<ImageryOve
   emit();
 
   try {
+    const { toProj4, proj4 } = await loadImageryGeoTiffDependencies();
     const tiff = await openGeoTiff(file);
     const image = await tiff.getImage();
     const geoKeys = image.getGeoKeys() as Record<string, any>;

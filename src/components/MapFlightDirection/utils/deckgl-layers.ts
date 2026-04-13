@@ -9,46 +9,7 @@
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import { PathLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { COORDINATE_SYSTEM } from '@deck.gl/core';
-
-function areSamePoint3D(
-  left: [number, number, number],
-  right: [number, number, number],
-  epsilon: number = 1e-9,
-) {
-  return (
-    Math.abs(left[0] - right[0]) <= epsilon &&
-    Math.abs(left[1] - right[1]) <= epsilon &&
-    Math.abs(left[2] - right[2]) <= epsilon
-  );
-}
-
-function mergeConnectedPathSegments(
-  path3d: [number, number, number][][],
-): [number, number, number][][] {
-  const mergedPaths: [number, number, number][][] = [];
-
-  for (const segment of path3d) {
-    if (!Array.isArray(segment) || segment.length === 0) continue;
-
-    const currentMergedPath = mergedPaths.at(-1);
-    if (!currentMergedPath || currentMergedPath.length === 0) {
-      mergedPaths.push([...segment]);
-      continue;
-    }
-
-    const previousEndPoint = currentMergedPath[currentMergedPath.length - 1];
-    const currentStartPoint = segment[0];
-
-    if (areSamePoint3D(previousEndPoint, currentStartPoint)) {
-      currentMergedPath.push(...segment.slice(1));
-      continue;
-    }
-
-    mergedPaths.push([...segment]);
-  }
-
-  return mergedPaths;
-}
+import { mergeContiguous3DPathSegmentsForRender } from './geometry';
 
 export function update3DPathLayer(
   overlay: MapboxOverlay,
@@ -57,12 +18,12 @@ export function update3DPathLayer(
   setLayers: React.Dispatch<React.SetStateAction<any[]>>
 ) {
   const layers: any[] = [];
-  const mergedPaths = mergeConnectedPathSegments(path3d);
+  const renderPaths = mergeContiguous3DPathSegmentsForRender(path3d);
 
-  // Create a simple 3D path layer for each flight line segment
+  // Collapse contiguous sweep/turn segments into continuous render paths to avoid visible seams.
   const pathLayer = new PathLayer({
     id: `drone-path-${polygonId}`,
-    data: mergedPaths,
+    data: renderPaths,
     getPath: (d: any) => d,
     getColor: [100, 200, 255, 240], // thin light blue line
     getWidth: 2,
@@ -110,12 +71,8 @@ export function update3DCameraPointsLayer(
   const isImportedPoses = polygonId === '__POSES__';
   const cameraLayer = new ScatterplotLayer({
     id: `camera-points-${polygonId}`,
-    data: cameraPositions.map((pos, index) => ({
-      position: pos,
-      index: index + 1,
-      altitude: pos[2]
-    })),
-    getPosition: (d: any) => d.position,
+    data: cameraPositions,
+    getPosition: (d: any) => d,
     // Make imported red circles smaller than polygon camera points
     getRadius: isImportedPoses ? 3 : 8,
     getFillColor: [255, 71, 87, 255], // Red color #ff4757
@@ -163,8 +120,8 @@ export function update3DTriggerPointsLayer(
 ) {
   const triggerLayer = new ScatterplotLayer({
     id: `trigger-points-${polygonId}`,
-    data: triggerPositions.map((pos) => ({ position: pos })),
-    getPosition: (d: any) => d.position,
+    data: triggerPositions,
+    getPosition: (d: any) => d,
     getRadius: 4, // half the size of camera points
     getFillColor: [12, 36, 97, 230], // Dark blue
     getLineColor: [230, 240, 255, 220],
