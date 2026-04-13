@@ -20,6 +20,161 @@ const TURN_LIFT_ELEVATION_PER_METER = 0.25;
 const TURN_LIFT_LOOP_DEGREES = 360;
 const TURN_LIFT_LOOP_POINT_SPACING_M = 8;
 const TURN_LIFT_CIRCLE_TOLERANCE_M = 5;
+const POLYLINE_ELEVATION_TARGET_SAMPLE_SPACING_M = 15;
+
+const preconnectedPathCache = new WeakMap<
+  PlannedFlightGeometry,
+  Map<string, [number, number, number][][]>
+>();
+const mergedRenderPathCache = new WeakMap<
+  readonly [number, number, number][][],
+  [number, number, number][][]
+>();
+const flightPathSampleCache = new WeakMap<
+  readonly [number, number, number][][],
+  Map<string, [number, number, number, number][]>
+>();
+const terrainDataSignatureCache = new WeakMap<ArrayBufferView, string>();
+const plannedGeometrySweepSampleCache = new WeakMap<
+  Pick<PlannedFlightGeometry, "connectedLines" | "flightLines" | "sweepIndices" | "lineSpacing">,
+  WeakMap<readonly [number, number, number][][], Map<string, [number, number, number, number][]>>
+>();
+
+function getTerrainDataSignature(data: ArrayBufferView) {
+  const cachedSignature = terrainDataSignatureCache.get(data);
+  if (cachedSignature) return cachedSignature;
+
+  const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  let hash = 2166136261;
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash ^= bytes[index];
+    hash = Math.imul(hash, 16777619);
+  }
+
+  const signature = `${data.byteLength}:${(hash >>> 0).toString(16)}`;
+  terrainDataSignatureCache.set(data, signature);
+  return signature;
+}
+
+function getPreconnectedPathCacheKey(
+  lineSpacing: number,
+  altitudeAGL: number,
+  mode: "legacy" | "min-clearance",
+  minClearance: number,
+  homeAltitude: number | undefined,
+  turnExtendM: number,
+  tiles: readonly TerrainTile[],
+) {
+  const tilesKey =
+    tiles.length === 0
+      ? "none"
+      : tiles
+          .map((tile) => {
+            const format = tile.format ?? "terrain-rgb";
+            return `${tile.z}/${tile.x}/${tile.y}/${tile.width}x${tile.height}/${format}/${getTerrainDataSignature(tile.data)}`;
+          })
+          .join(";");
+  return [
+    lineSpacing.toFixed(6),
+    altitudeAGL.toFixed(3),
+    mode,
+    minClearance.toFixed(3),
+    homeAltitude === undefined ? "none" : homeAltitude.toFixed(3),
+    turnExtendM.toFixed(3),
+    tilesKey,
+  ].join("|");
+}
+
+function getFlightPathSampleCacheKey(
+  photoSpacingMeters: number,
+  includeTurns: boolean,
+) {
+  return `${photoSpacingMeters.toFixed(6)}|${includeTurns ? "turns" : "sweeps"}`;
+}
+
+function getPlannedSweepSampleCacheKey(photoSpacingMeters: number) {
+  return photoSpacingMeters.toFixed(6);
+}
+
+function are3DPathPointsContinuous(
+  previousPoint: [number, number, number],
+  nextPoint: [number, number, number],
+) {
+  return (
+    haversineDistance(
+      [previousPoint[0], previousPoint[1]],
+      [nextPoint[0], nextPoint[1]],
+    ) <= 0.05 &&
+    Math.abs(previousPoint[2] - nextPoint[2]) <= 0.05
+  );
+}
+
+function readPreconnectedPathCache(
+  geometry: PlannedFlightGeometry,
+  cacheKey: string,
+) {
+  return preconnectedPathCache.get(geometry)?.get(cacheKey);
+}
+
+function rememberPreconnectedPathCache(
+  geometry: PlannedFlightGeometry,
+  cacheKey: string,
+  path: [number, number, number][][],
+) {
+  let keyedCache = preconnectedPathCache.get(geometry);
+  if (!keyedCache) {
+    keyedCache = new Map<string, [number, number, number][][]>();
+    preconnectedPathCache.set(geometry, keyedCache);
+  }
+  keyedCache.set(cacheKey, path);
+}
+
+function readFlightPathSampleCache(
+  path3D: readonly [number, number, number][][],
+  cacheKey: string,
+) {
+  return flightPathSampleCache.get(path3D)?.get(cacheKey);
+}
+
+function rememberFlightPathSampleCache(
+  path3D: readonly [number, number, number][][],
+  cacheKey: string,
+  samples: [number, number, number, number][],
+) {
+  let sampleCache = flightPathSampleCache.get(path3D);
+  if (!sampleCache) {
+    sampleCache = new Map<string, [number, number, number, number][]>();
+    flightPathSampleCache.set(path3D, sampleCache);
+  }
+  sampleCache.set(cacheKey, samples);
+}
+
+function readPlannedSweepSampleCache(
+  geometry: Pick<PlannedFlightGeometry, "connectedLines" | "flightLines" | "sweepIndices" | "lineSpacing">,
+  path3D: readonly [number, number, number][][],
+  cacheKey: string,
+) {
+  return plannedGeometrySweepSampleCache.get(geometry)?.get(path3D)?.get(cacheKey);
+}
+
+function rememberPlannedSweepSampleCache(
+  geometry: Pick<PlannedFlightGeometry, "connectedLines" | "flightLines" | "sweepIndices" | "lineSpacing">,
+  path3D: readonly [number, number, number][][],
+  cacheKey: string,
+  samples: [number, number, number, number][],
+) {
+  let geometryCache = plannedGeometrySweepSampleCache.get(geometry);
+  if (!geometryCache) {
+    geometryCache = new WeakMap<readonly [number, number, number][][], Map<string, [number, number, number, number][]>>();
+    plannedGeometrySweepSampleCache.set(geometry, geometryCache);
+  }
+  let pathCache = geometryCache.get(path3D);
+  if (!pathCache) {
+    pathCache = new Map<string, [number, number, number, number][]>();
+    geometryCache.set(path3D, pathCache);
+  }
+  pathCache.set(cacheKey, samples);
+}
 
 function convertElevationToWGS84(lat: number, lng: number, elevationEGM96: number): number {
   return egm96.egm96ToEllipsoid(lat, lng, elevationEGM96);
@@ -50,6 +205,22 @@ function queryMaxElevationAlongLineWGS84(
   return Number.isFinite(maxElevationWGS84) ? maxElevationWGS84 : -Infinity;
 }
 
+function getAdaptiveSegmentSampleCount(
+  startPoint: [number, number],
+  endPoint: [number, number],
+  maxSamplesPerSegment: number,
+) {
+  if (!(maxSamplesPerSegment > 1)) return 1;
+  const segmentLengthM = haversineDistance(startPoint, endPoint);
+  return Math.max(
+    1,
+    Math.min(
+      maxSamplesPerSegment,
+      Math.ceil(segmentLengthM / POLYLINE_ELEVATION_TARGET_SAMPLE_SPACING_M),
+    ),
+  );
+}
+
 export function queryMinMaxElevationAlongPolylineWGS84(
   line: [number, number][],
   tiles: TerrainTile[],
@@ -58,12 +229,20 @@ export function queryMinMaxElevationAlongPolylineWGS84(
   let minElev = +Infinity;
   let maxElev = -Infinity;
   if (!Array.isArray(line) || line.length === 0) return { min: minElev, max: maxElev };
+  if (line.length === 1) {
+    const [lng, lat] = line[0];
+    const elevEGM96 = queryElevationAtPoint(lng, lat, tiles);
+    if (!Number.isFinite(elevEGM96)) return { min: minElev, max: maxElev };
+    const elevW = convertElevationToWGS84(lat, lng, elevEGM96);
+    return { min: elevW, max: elevW };
+  }
 
   for (let i = 0; i < line.length - 1; i++) {
     const [startLng, startLat] = line[i];
     const [endLng, endLat] = line[i + 1];
-    for (let s = 0; s <= samplesPerSegment; s++) {
-      const t = s / samplesPerSegment;
+    const segmentSampleCount = getAdaptiveSegmentSampleCount(line[i], line[i + 1], samplesPerSegment);
+    for (let s = 0; s <= segmentSampleCount; s++) {
+      const t = s / segmentSampleCount;
       const lng = startLng + t * (endLng - startLng);
       const lat = startLat + t * (endLat - startLat);
       const elevEGM96 = queryElevationAtPoint(lng, lat, tiles);
@@ -72,14 +251,6 @@ export function queryMinMaxElevationAlongPolylineWGS84(
       if (elevW < minElev) minElev = elevW;
       if (elevW > maxElev) maxElev = elevW;
     }
-  }
-
-  for (const [lng, lat] of line) {
-    const elevEGM96 = queryElevationAtPoint(lng, lat, tiles);
-    if (!Number.isFinite(elevEGM96)) continue;
-    const elevW = convertElevationToWGS84(lat, lng, elevEGM96);
-    if (elevW < minElev) minElev = elevW;
-    if (elevW > maxElev) maxElev = elevW;
   }
 
   return { min: minElev, max: maxElev };
@@ -371,6 +542,23 @@ export function getPolygonBounds(ring: number[][]) {
   };
 }
 
+export function isPointInRing(
+  lng: number,
+  lat: number,
+  ring: [number, number][],
+) {
+  let inside = false;
+  for (let index = 0, previousIndex = ring.length - 1; index < ring.length; previousIndex = index++) {
+    const [xi, yi] = ring[index];
+    const [xj, yj] = ring[previousIndex];
+    const intersects =
+      (yi > lat) !== (yj > lat) &&
+      lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
 export function calculateOptimalLineSpacing(ring: number[][], bearingDeg: number): number {
   const bounds = getPolygonBounds(ring);
   const { centroid } = bounds;
@@ -501,6 +689,14 @@ export function build3DFlightPath(
   const homeAltitude = usingLegacySig ? undefined : ((opts as any).homeAltitude as number | undefined);
   const turnExtendM = usingLegacySig ? 0 : Math.max(0, (opts as any).turnExtendM ?? 0);
   const preconnected = usingGeometryInput || (!usingLegacySig && Boolean((opts as any).preconnected));
+  const preconnectedPathCacheKey =
+    preconnected && geometryInput
+      ? getPreconnectedPathCacheKey(lineSpacing, altitudeAGL, mode, minClearance, homeAltitude, turnExtendM, tiles)
+      : undefined;
+  if (preconnected && geometryInput && preconnectedPathCacheKey) {
+    const cachedPath = readPreconnectedPathCache(geometryInput, preconnectedPathCacheKey);
+    if (cachedPath) return cachedPath;
+  }
   const pointElevationWgs84Cache = new Map<string, number>();
   const polylineElevationExtremaCache = new WeakMap<readonly [number, number][], Map<number, { min: number; max: number }>>();
   const segmentElevationMaxCache = new Map<string, number>();
@@ -534,8 +730,9 @@ export function build3DFlightPath(
       for (let i = 0; i < line.length - 1; i++) {
         const [startLng, startLat] = line[i];
         const [endLng, endLat] = line[i + 1];
-        for (let s = 0; s <= samplesPerSegment; s++) {
-          const t = s / samplesPerSegment;
+        const segmentSampleCount = getAdaptiveSegmentSampleCount(line[i], line[i + 1], samplesPerSegment);
+        for (let s = 0; s <= segmentSampleCount; s++) {
+          const t = s / segmentSampleCount;
           const lng = startLng + t * (endLng - startLng);
           const lat = startLat + t * (endLat - startLat);
           const elevW = getPointElevationWGS84(lng, lat);
@@ -543,13 +740,6 @@ export function build3DFlightPath(
           if (elevW < minElev) minElev = elevW;
           if (elevW > maxElev) maxElev = elevW;
         }
-      }
-
-      for (const [lng, lat] of line) {
-        const elevW = getPointElevationWGS84(lng, lat);
-        if (!Number.isFinite(elevW)) continue;
-        if (elevW < minElev) minElev = elevW;
-        if (elevW > maxElev) maxElev = elevW;
       }
     }
 
@@ -713,9 +903,13 @@ export function build3DFlightPath(
       .filter((line) => line.length >= 2);
 
     if (homeAltitude !== undefined) {
-      return connectedSegments.map((segment) =>
+      const cachedPath = connectedSegments.map((segment) =>
         segment.map(([lng, lat]) => [lng, lat, homeAltitude + altitudeAGL] as [number, number, number]),
       );
+      if (preconnectedPathCacheKey) {
+        rememberPreconnectedPathCache(geometryInput, preconnectedPathCacheKey, cachedPath);
+      }
+      return cachedPath;
     }
 
     const leadInLine =
@@ -755,13 +949,21 @@ export function build3DFlightPath(
       (segment, segmentIndex) => segmentIndex % 2 === 1 && segment !== connectedSegments[segmentIndex],
     );
     if (!turnaroundsChanged) {
-      return liftConnectedSegments(connectedSegments, provisionalSweepAltitudes);
+      const cachedPath = liftConnectedSegments(connectedSegments, provisionalSweepAltitudes);
+      if (preconnectedPathCacheKey) {
+        rememberPreconnectedPathCache(geometryInput, preconnectedPathCacheKey, cachedPath);
+      }
+      return cachedPath;
     }
     const finalSweepAltitudes = calculateSweepAltitudes(expandedTurnaroundSegments);
     const finalConnectedSegments = buildTurnaroundSegments(finalSweepAltitudes);
     const resolvedSweepAltitudes = calculateSweepAltitudes(finalConnectedSegments);
 
-    return liftConnectedSegments(finalConnectedSegments, resolvedSweepAltitudes);
+    const cachedPath = liftConnectedSegments(finalConnectedSegments, resolvedSweepAltitudes);
+    if (preconnectedPathCacheKey) {
+      rememberPreconnectedPathCache(geometryInput, preconnectedPathCacheKey, cachedPath);
+    }
+    return cachedPath;
   }
 
   if (preconnected) {
@@ -900,6 +1102,9 @@ export function sampleCameraPositionsOnFlightPath(
 ): [number, number, number, number][] {
   const cameraPositions: [number, number, number, number][] = [];
   const includeTurns = !!opts?.includeTurns;
+  const sampleCacheKey = getFlightPathSampleCacheKey(photoSpacingMeters, includeTurns);
+  const cachedSamples = readFlightPathSampleCache(path3D, sampleCacheKey);
+  if (cachedSamples) return cachedSamples;
 
   for (let segIndex = 0; segIndex < path3D.length; segIndex++) {
     if (!includeTurns && (segIndex % 2 === 1)) continue;
@@ -948,6 +1153,174 @@ export function sampleCameraPositionsOnFlightPath(
     }
   }
 
+  rememberFlightPathSampleCache(path3D, sampleCacheKey, cameraPositions);
+  return cameraPositions;
+}
+
+export function mergeContiguous3DPathSegmentsForRender(
+  path3D: [number, number, number][][],
+): [number, number, number][][] {
+  const cachedMergedPath = mergedRenderPathCache.get(path3D);
+  if (cachedMergedPath) return cachedMergedPath;
+
+  const mergedPaths: [number, number, number][][] = [];
+  for (const segment of path3D) {
+    if (!Array.isArray(segment) || segment.length === 0) continue;
+    if (mergedPaths.length === 0) {
+      mergedPaths.push([...segment]);
+      continue;
+    }
+
+    const currentPath = mergedPaths[mergedPaths.length - 1];
+    const previousPoint = currentPath[currentPath.length - 1];
+    const nextPoint = segment[0];
+    if (are3DPathPointsContinuous(previousPoint, nextPoint)) {
+      currentPath.push(...segment.slice(1));
+      continue;
+    }
+
+    mergedPaths.push([...segment]);
+  }
+
+  mergedRenderPathCache.set(path3D, mergedPaths);
+  return mergedPaths;
+}
+
+function findFirstBearingForLine(line: [number, number][]): number | undefined {
+  for (let index = 1; index < line.length; index += 1) {
+    const start = line[index - 1];
+    const end = line[index];
+    if (start[0] === end[0] && start[1] === end[1]) continue;
+    return geoBearing(start, end);
+  }
+  return undefined;
+}
+
+export function sampleCameraPositionsOnPlannedFlightGeometry(
+  geometry: Pick<PlannedFlightGeometry, "connectedLines" | "flightLines" | "sweepIndices" | "lineSpacing">,
+  path3D: [number, number, number][][],
+  photoSpacingMeters: number,
+): [number, number, number, number][] {
+  if (!(photoSpacingMeters > 0)) return [];
+  const sampleCacheKey = getPlannedSweepSampleCacheKey(photoSpacingMeters);
+  const cachedSamples = readPlannedSweepSampleCache(geometry, path3D, sampleCacheKey);
+  if (cachedSamples) return cachedSamples;
+  const hasFragmentedSweeps = geometry.sweepIndices.some(
+    (sweepIndex, index) => index > 0 && geometry.sweepIndices[index - 1] === sweepIndex,
+  );
+  if (!hasFragmentedSweeps) {
+    const samples = sampleCameraPositionsOnFlightPath(path3D, photoSpacingMeters, { includeTurns: false });
+    rememberPlannedSweepSampleCache(geometry, path3D, sampleCacheKey, samples);
+    return samples;
+  }
+
+  const rawSweeps = groupFlightLinesForTraversal(
+    geometry.flightLines as number[][][],
+    geometry.lineSpacing,
+    geometry.sweepIndices,
+  );
+  if (rawSweeps.length === 0) {
+    return sampleCameraPositionsOnFlightPath(path3D, photoSpacingMeters, { includeTurns: false });
+  }
+
+  const cameraPositions: [number, number, number, number][] = [];
+
+  rawSweeps.forEach((sweep, sweepIndex) => {
+    const sweepPath3D = path3D[sweepIndex * 2];
+    const sweepAltitude = sweepPath3D?.find((point) => Number.isFinite(point[2]))?.[2];
+    if (!Number.isFinite(sweepAltitude)) return;
+    const resolvedSweepAltitude = sweepAltitude as number;
+
+    const orderedFragments = sweep.directionForward ? sweep.fragments : [...sweep.fragments].reverse();
+    const orientedFragments = orderedFragments
+      .map((fragment) => (sweep.directionForward ? fragment : [...fragment].reverse()) as [number, number][])
+      .filter((fragment) => fragment.length >= 2);
+    if (orientedFragments.length === 0) return;
+    const connectedSweepLine = geometry.connectedLines[sweepIndex * 2] as [number, number][] | undefined;
+    const adjustedFragments = orientedFragments.map((fragment) => [...fragment] as [number, number][]);
+    if (connectedSweepLine && connectedSweepLine.length >= 2) {
+      adjustedFragments[0][0] = connectedSweepLine[0];
+      adjustedFragments[adjustedFragments.length - 1][adjustedFragments[adjustedFragments.length - 1].length - 1] =
+        connectedSweepLine[connectedSweepLine.length - 1];
+    }
+
+    let totalDistance = 0;
+    let lastPhotoDistance = 0;
+    let previousFragmentEnd: [number, number] | undefined;
+    let lastCamera:
+      | [number, number, number, number]
+      | undefined;
+    let lastPoint: [number, number] | undefined;
+    let lastBearing: number | undefined;
+
+    const firstFragment = adjustedFragments[0];
+    const initialBearing = findFirstBearingForLine(firstFragment);
+    if (initialBearing === undefined) return;
+
+    const firstCamera: [number, number, number, number] = [
+      firstFragment[0][0],
+      firstFragment[0][1],
+      resolvedSweepAltitude,
+      initialBearing,
+    ];
+    cameraPositions.push(firstCamera);
+    lastCamera = firstCamera;
+
+    adjustedFragments.forEach((fragment) => {
+      if (previousFragmentEnd) {
+        totalDistance += haversineDistance(previousFragmentEnd, fragment[0]);
+        while (lastPhotoDistance + photoSpacingMeters < totalDistance) {
+          lastPhotoDistance += photoSpacingMeters;
+        }
+      }
+
+      for (let pointIndex = 1; pointIndex < fragment.length; pointIndex += 1) {
+        const previousPoint = fragment[pointIndex - 1];
+        const currentPoint = fragment[pointIndex];
+        const stepDistance = haversineDistance(previousPoint, currentPoint);
+        if (!(stepDistance > 0)) continue;
+
+        const stepStartDistance = totalDistance;
+        totalDistance += stepDistance;
+        const segmentBearing = geoBearing(previousPoint, currentPoint);
+
+        while (lastPhotoDistance + photoSpacingMeters <= totalDistance) {
+          const targetDistance = lastPhotoDistance + photoSpacingMeters;
+          const distanceIntoStep = targetDistance - stepStartDistance;
+          const interpolationRatio = distanceIntoStep / stepDistance;
+          const lng = previousPoint[0] + (currentPoint[0] - previousPoint[0]) * interpolationRatio;
+          const lat = previousPoint[1] + (currentPoint[1] - previousPoint[1]) * interpolationRatio;
+          const cameraPoint: [number, number, number, number] = [lng, lat, resolvedSweepAltitude, segmentBearing];
+          cameraPositions.push(cameraPoint);
+          lastCamera = cameraPoint;
+          lastPhotoDistance = targetDistance;
+        }
+
+        lastPoint = currentPoint;
+        lastBearing = segmentBearing;
+      }
+
+      previousFragmentEnd = fragment[fragment.length - 1];
+    });
+
+    if (lastPoint && lastBearing !== undefined && lastCamera) {
+      const tailGap = haversineDistance(
+        [lastCamera[0], lastCamera[1]],
+        lastPoint,
+      );
+      if (tailGap > 0.25 * photoSpacingMeters) {
+          const finalCamera: [number, number, number, number] = [
+            lastPoint[0],
+            lastPoint[1],
+            resolvedSweepAltitude,
+            lastBearing,
+          ];
+        cameraPositions.push(finalCamera);
+      }
+    }
+  });
+
+  rememberPlannedSweepSampleCache(geometry, path3D, sampleCacheKey, cameraPositions);
   return cameraPositions;
 }
 

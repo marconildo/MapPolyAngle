@@ -1,7 +1,7 @@
 import { DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, forwardSpacingRotated, lineSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
 import type { CameraModel, FlightParams, PlannedFlightGeometry, TerrainTile } from "@/domain/types";
-import { build3DFlightPath, calculateOptimalTerrainZoom, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnFlightPath } from "@/flight/geometry";
+import { build3DFlightPath, calculateOptimalTerrainZoom, isPointInRing, queryMinMaxElevationAlongPolylineWGS84, sampleCameraPositionsOnPlannedFlightGeometry } from "@/flight/geometry";
 import { generatePlannedFlightGeometryForPolygon, summarizePlannedFlightGeometry } from "@/flight/plannedGeometry";
 import type {
   ExactCameraTileInput,
@@ -661,10 +661,10 @@ async function getExactBearingArtifacts(
       const yawOffset = context.safeParams.cameraYawOffsetDeg ?? 0;
       const normalizeDeg = (value: number) => ((value % 360) + 360) % 360;
       const cameraPositions = photoSpacing && photoSpacing > 0
-        ? sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false })
+        ? sampleCameraPositionsOnPlannedFlightGeometry(geometry, path3d, photoSpacing)
         : [];
       const filteredPositions = context.ring.length >= 3
-        ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, context.ring))
+        ? cameraPositions.filter(([lng, lat]) => isPointInRing(lng, lat, context.ring))
         : cameraPositions;
       const poses = filteredPositions.map(([lng, lat, altMSL, yawDeg], index) => {
         const [x, y] = lngLatToMeters(lng, lat);
@@ -1370,9 +1370,9 @@ export async function evaluatePartitionSolutionExact(
       lineSpacing,
       { altitudeAGL, mode: args.altitudeMode, minClearance: args.minClearanceM, preconnected: true },
     );
-    const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing ?? 0, { includeTurns: false });
+    const cameraPositions = sampleCameraPositionsOnPlannedFlightGeometry(geometry, path3d, photoSpacing ?? 0);
     const filtered = region.ring.length >= 3
-      ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, region.ring))
+      ? cameraPositions.filter(([lng, lat]) => isPointInRing(lng, lat, region.ring))
       : cameraPositions;
     filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
       const [x, y] = lngLatToMeters(lng, lat);

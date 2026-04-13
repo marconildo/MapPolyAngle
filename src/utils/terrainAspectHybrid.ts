@@ -313,6 +313,17 @@ class WebMercatorProjector {
   }
 }
 
+const webMercatorProjectorCache = new Map<number, WebMercatorProjector>();
+
+function getWebMercatorProjector(z: number) {
+  let projector = webMercatorProjectorCache.get(z);
+  if (!projector) {
+    projector = new WebMercatorProjector(z);
+    webMercatorProjectorCache.set(z, projector);
+  }
+  return projector;
+}
+
 function getElevation(tile: TerrainTile, px: number, py: number): number {
   if (px < 0 || py < 0 || px >= tile.width || py >= tile.height) {
     return NaN;
@@ -347,7 +358,7 @@ function pointInPolygon(lng: number, lat: number, ring: LngLat[]): boolean {
 // Query elevation at a specific lng/lat coordinate using available tiles
 export function queryElevationAtPoint(lng: number, lat: number, tiles: TerrainTile[]): number {
   for (const tile of tiles) {
-    const proj = new WebMercatorProjector(tile.z);
+    const proj = getWebMercatorProjector(tile.z);
     const pixelCoords = proj.lngLatToPixel(lng, lat, tile.x, tile.y, tile.width);
 
     if (pixelCoords) {

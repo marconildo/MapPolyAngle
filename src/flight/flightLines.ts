@@ -1,13 +1,94 @@
-import { destination as geoDestination } from "@/utils/terrainAspectHybrid";
-
 import { getPolygonBounds, haversineDistance } from "./geometry";
+
+const EARTH_RADIUS_M = 6378137;
+const INTERSECTION_EPSILON_M = 1e-6;
+
+type LocalPoint = {
+  north: number;
+  east: number;
+};
+
+type SweepPoint = {
+  along: number;
+  cross: number;
+};
+
+function ensureClosedRing(ring: number[][]) {
+  if (ring.length < 2) return ring;
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (first[0] === last[0] && first[1] === last[1]) return ring;
+  return [...ring, first];
+}
+
+function toLocalPoint(
+  point: [number, number],
+  reference: [number, number],
+): LocalPoint {
+  const dLat = ((point[1] - reference[1]) * Math.PI) / 180;
+  const dLng = ((point[0] - reference[0]) * Math.PI) / 180;
+  const cosLat = Math.cos((reference[1] * Math.PI) / 180);
+  return {
+    north: dLat * EARTH_RADIUS_M,
+    east: dLng * EARTH_RADIUS_M * cosLat,
+  };
+}
+
+function fromLocalPoint(
+  point: LocalPoint,
+  reference: [number, number],
+): [number, number] {
+  const lat = reference[1] + (point.north / EARTH_RADIUS_M) * (180 / Math.PI);
+  const lng =
+    reference[0] +
+    (point.east / (EARTH_RADIUS_M * Math.cos((reference[1] * Math.PI) / 180))) * (180 / Math.PI);
+  return [lng, lat];
+}
+
+function toSweepPoint(
+  point: LocalPoint,
+  sinBearing: number,
+  cosBearing: number,
+): SweepPoint {
+  return {
+    along: point.north * cosBearing + point.east * sinBearing,
+    cross: -point.north * sinBearing + point.east * cosBearing,
+  };
+}
+
+function fromSweepPoint(
+  point: SweepPoint,
+  sinBearing: number,
+  cosBearing: number,
+): LocalPoint {
+  return {
+    north: point.along * cosBearing - point.cross * sinBearing,
+    east: point.along * sinBearing + point.cross * cosBearing,
+  };
+}
+
+function dedupeSortedIntersections(intersections: number[]) {
+  if (intersections.length <= 1) return intersections;
+
+  const deduped: number[] = [intersections[0]];
+  for (let index = 1; index < intersections.length; index += 1) {
+    const value = intersections[index];
+    if (Math.abs(value - deduped[deduped.length - 1]) <= INTERSECTION_EPSILON_M) {
+      deduped[deduped.length - 1] = (deduped[deduped.length - 1] + value) * 0.5;
+      continue;
+    }
+    deduped.push(value);
+  }
+  return deduped;
+}
 
 export function generateFlightLinesForPolygon(
   ring: number[][],
   bearingDeg: number,
   lineSpacingM: number,
 ): { flightLines: number[][][]; sweepIndices: number[]; lineSpacing: number; bounds: ReturnType<typeof getPolygonBounds> } {
-  const bounds = getPolygonBounds(ring);
+  const closedRing = ensureClosedRing(ring);
+  const bounds = getPolygonBounds(closedRing);
   const lineSpacing = lineSpacingM;
   const flightLines: number[][][] = [];
   const sweepIndices: number[] = [];
@@ -15,83 +96,62 @@ export function generateFlightLinesForPolygon(
   const centerLat = (bounds.minLat + bounds.maxLat) / 2;
   const centerLng = (bounds.minLng + bounds.maxLng) / 2;
   const diagonal = haversineDistance([bounds.minLng, bounds.minLat], [bounds.maxLng, bounds.maxLat]);
+  const referenceCoordinate: [number, number] = [centerLng, centerLat];
+  const bearingRad = (bearingDeg * Math.PI) / 180;
+  const sinBearing = Math.sin(bearingRad);
+  const cosBearing = Math.cos(bearingRad);
+  const projectedRing = closedRing.map((point) =>
+    toSweepPoint(toLocalPoint(point as [number, number], referenceCoordinate), sinBearing, cosBearing),
+  );
 
-  const numLines = Math.ceil(diagonal / lineSpacing);
-  const perpBearing = (bearingDeg + 90) % 360;
+  let minCrossTrackM = Infinity;
+  let maxCrossTrackM = -Infinity;
+  for (const point of projectedRing) {
+    minCrossTrackM = Math.min(minCrossTrackM, point.cross);
+    maxCrossTrackM = Math.max(maxCrossTrackM, point.cross);
+  }
 
-  const pointInPolygon = (lng: number, lat: number): boolean => {
-    let inside = false;
-    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-      const [xi, yi] = ring[i];
-      const [xj, yj] = ring[j];
-      const intersect = ((yi > lat) !== (yj > lat)) &&
-        (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
-      if (intersect) inside = !inside;
+  const minLineIndex = Math.ceil((minCrossTrackM - INTERSECTION_EPSILON_M) / lineSpacing);
+  const maxLineIndex = Math.floor((maxCrossTrackM + INTERSECTION_EPSILON_M) / lineSpacing);
+
+  for (let lineIndex = minLineIndex; lineIndex <= maxLineIndex; lineIndex += 1) {
+    const crossTrackM = lineIndex * lineSpacing;
+    const intersections: number[] = [];
+
+    for (let pointIndex = 0; pointIndex < projectedRing.length - 1; pointIndex += 1) {
+      const start = projectedRing[pointIndex];
+      const end = projectedRing[pointIndex + 1];
+      const crossDelta = end.cross - start.cross;
+      if (Math.abs(crossDelta) <= INTERSECTION_EPSILON_M) continue;
+
+      const minCross = Math.min(start.cross, end.cross);
+      const maxCross = Math.max(start.cross, end.cross);
+      if (crossTrackM < minCross || crossTrackM >= maxCross) continue;
+
+      const t = (crossTrackM - start.cross) / crossDelta;
+      intersections.push(start.along + t * (end.along - start.along));
     }
-    return inside;
-  };
 
-  const refineBoundaryPoint = (
-    outsidePoint: [number, number],
-    insidePoint: [number, number],
-  ): [number, number] => {
-    let lo = outsidePoint;
-    let hi = insidePoint;
+    if (intersections.length < 2) continue;
+    intersections.sort((left, right) => left - right);
+    const deduped = dedupeSortedIntersections(intersections);
+    const pairCount = deduped.length - (deduped.length % 2);
 
-    for (let iter = 0; iter < 18; iter++) {
-      const mid: [number, number] = [
-        (lo[0] + hi[0]) * 0.5,
-        (lo[1] + hi[1]) * 0.5,
-      ];
-      if (pointInPolygon(mid[0], mid[1])) {
-        hi = mid;
-      } else {
-        lo = mid;
-      }
-    }
+    for (let pairIndex = 0; pairIndex < pairCount; pairIndex += 2) {
+      const startAlongM = deduped[pairIndex];
+      const endAlongM = deduped[pairIndex + 1];
+      if (endAlongM - startAlongM <= INTERSECTION_EPSILON_M) continue;
 
-    return hi;
-  };
-
-  for (let i = -numLines; i <= numLines; i++) {
-    const distance = i * lineSpacing;
-    const [centerLineLng, centerLineLat] = geoDestination([centerLng, centerLat], perpBearing, distance);
-
-    const extendDistance = diagonal * 0.6;
-    const p1 = geoDestination([centerLineLng, centerLineLat], bearingDeg, extendDistance);
-    const p2 = geoDestination([centerLineLng, centerLineLat], (bearingDeg + 180) % 360, extendDistance);
-
-    const sampleStepM = Math.max(5, Math.min(15, lineSpacing * 0.2));
-    const samples = Math.max(120, Math.min(1200, Math.ceil((extendDistance * 2) / sampleStepM)));
-
-    let previousPoint: [number, number] = [p2[0], p2[1]];
-    let previousInside = pointInPolygon(previousPoint[0], previousPoint[1]);
-    let currentSegmentStart: [number, number] | null = previousInside ? previousPoint : null;
-
-    for (let s = 1; s <= samples; s++) {
-      const t = s / samples;
-      const currentPoint: [number, number] = [
-        p2[0] + t * (p1[0] - p2[0]),
-        p2[1] + t * (p1[1] - p2[1]),
-      ];
-      const currentInside = pointInPolygon(currentPoint[0], currentPoint[1]);
-
-      if (currentInside && !previousInside) {
-        currentSegmentStart = refineBoundaryPoint(previousPoint, currentPoint);
-      } else if (!currentInside && previousInside && currentSegmentStart) {
-        const segmentEnd = refineBoundaryPoint(currentPoint, previousPoint);
-        flightLines.push([currentSegmentStart, segmentEnd]);
-        sweepIndices.push(i);
-        currentSegmentStart = null;
-      }
-
-      if (s === samples && currentInside && currentSegmentStart) {
-        flightLines.push([currentSegmentStart, currentPoint]);
-        sweepIndices.push(i);
-      }
-
-      previousPoint = currentPoint;
-      previousInside = currentInside;
+      const startPoint = fromLocalPoint(
+        fromSweepPoint({ along: startAlongM, cross: crossTrackM }, sinBearing, cosBearing),
+        referenceCoordinate,
+      );
+      const endPoint = fromLocalPoint(
+        fromSweepPoint({ along: endAlongM, cross: crossTrackM }, sinBearing, cosBearing),
+        referenceCoordinate,
+      );
+      flightLines.push([startPoint, endPoint]);
+      sweepIndices.push(lineIndex);
     }
   }
 

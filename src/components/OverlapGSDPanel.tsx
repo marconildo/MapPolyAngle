@@ -6,7 +6,7 @@ import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import { sampleCameraPositionsOnFlightPath, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
 import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -949,17 +949,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         { altitudeAGL: altForThisPoly, mode, minClearance: minClr, preconnected: true },
       );
 
-      const cameraPositions = sampleCameraPositionsOnFlightPath(path3D, spacingForward, { includeTurns: false });
-      // Filter out cameras outside the polygon ring
       const polys = api.getPolygonsWithIds?.() || [];
       const ring = (polys.find((pp:any)=> (pp.id||'unknown')===polygonId)?.ring) as [number,number][] | undefined;
-      const inside = (lng:number,lat:number,ring:[number,number][]) => {
-        let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
-          const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
-          const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
-        } return ins;
-      };
-      const filtered = ring && ring.length>=3 ? cameraPositions.filter(([lng,lat])=> inside(lng,lat,ring)) : cameraPositions;
+      const filtered = sampleCameraPositionsOnPlannedFlightGeometry(lineData, path3D, spacingForward)
+        .filter(([lng, lat]) => !ring || ring.length < 3 || isPointInRing(lng, lat, ring));
 
       const normalizeDeg = (d: number) => ((d % 360) + 360) % 360;
       filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
@@ -1372,10 +1365,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         lineSpacing,
         { altitudeAGL, mode: altitudeMode, minClearance, preconnected: true },
       );
-      const cameraPositions = sampleCameraPositionsOnFlightPath(path3d, photoSpacing, { includeTurns: false });
-      const filtered = region.ring.length >= 3
-        ? cameraPositions.filter(([lng, lat]) => pointInRing(lng, lat, region.ring))
-        : cameraPositions;
+      const filtered = sampleCameraPositionsOnPlannedFlightGeometry(geometry, path3d, photoSpacing)
+        .filter(([lng, lat]) => region.ring.length < 3 || isPointInRing(lng, lat, region.ring));
       filtered.forEach(([lng, lat, altMSL, yawDeg]) => {
         const [x, y] = lngLatToMeters(lng, lat);
         poses.push({

@@ -26,7 +26,7 @@ import {
   renderFlightLinesForPolygon,
 } from './utils/mapbox-layers';
 import { update3DPathLayer, remove3DPathLayer, update3DCameraPointsLayer, remove3DCameraPointsLayer, update3DTriggerPointsLayer, remove3DTriggerPointsLayer } from './utils/deckgl-layers';
-import { build3DFlightPath, calculateOptimalTerrainZoom, sampleCameraPositionsOnFlightPath, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from './utils/geometry';
+import { build3DFlightPath, calculateOptimalTerrainZoom, isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, extendFlightLineForTurnRunout, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from './utils/geometry';
 import { PolygonAnalysisResult, PolygonParams } from './types';
 import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils/kml';
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, calculateGSD, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
@@ -880,17 +880,11 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
         update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
         const spacingForward = getForwardSpacingForParams(safeParams);
         if (spacingForward && spacingForward > 0) {
-          const samples = sampleCameraPositionsOnFlightPath(path3d, spacingForward, { includeTurns: false });
+          const samples = sampleCameraPositionsOnPlannedFlightGeometry(fl, path3d, spacingForward);
           const zOffset = 1;
-          const ring = res.polygon.coordinates as [number,number][];
-          const inside = (lng:number,lat:number,ring:[number,number][]) => {
-            let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
-              const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
-              const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
-            } return ins;
-          };
+          const ring = res.polygon.coordinates as [number, number][];
           const positions: [number, number, number][] = samples
-            .filter(([lng,lat]) => inside(lng,lat,ring))
+            .filter(([lng, lat]) => isPointInRing(lng, lat, ring))
             .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
           update3DTriggerPointsLayer(deckOverlayRef.current, polygonId, positions, setDeckLayers);
         } else {
@@ -1350,17 +1344,11 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           const spacingForward = getForwardSpacingForParams(safeParams);
           if (spacingForward && spacingForward > 0) {
             // 3D trigger points sampled along the 3D path
-            const samples = sampleCameraPositionsOnFlightPath(path3d, spacingForward, { includeTurns: false });
+            const samples = sampleCameraPositionsOnPlannedFlightGeometry(lines, path3d, spacingForward);
             const zOffset = 1; // lift triggers slightly above the path for visibility
-            const ring = result.polygon.coordinates as [number,number][];
-            const inside = (lng:number,lat:number,ring:[number,number][]) => {
-              let ins=false; for(let i=0,j=ring.length-1;i<ring.length;j=i++){
-                const xi=ring[i][0], yi=ring[i][1], xj=ring[j][0], yj=ring[j][1];
-                const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi); if(intersect) ins=!ins;
-              } return ins;
-            };
+            const ring = result.polygon.coordinates as [number, number][];
             const positions: [number, number, number][] = samples
-              .filter(([lng,lat]) => inside(lng,lat,ring))
+              .filter(([lng, lat]) => isPointInRing(lng, lat, ring))
               .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
             update3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, positions, setDeckLayers);
           } else {

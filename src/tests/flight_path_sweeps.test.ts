@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { build3DFlightPath } from "../components/MapFlightDirection/utils/geometry.ts";
+import { build3DFlightPath, mergeContiguous3DPathSegmentsForRender, sampleCameraPositionsOnFlightPath, sampleCameraPositionsOnPlannedFlightGeometry } from "../components/MapFlightDirection/utils/geometry.ts";
 import { generateFlightLinesForPolygon } from "../components/MapFlightDirection/utils/mapbox-layers.ts";
 import { generatePlannedFlightGeometryForPolygon } from "../flight/plannedGeometry.ts";
 import { haversineDistance } from "../flight/geometry.ts";
@@ -19,6 +19,56 @@ function headingDeg(start: [number, number], end: [number, number]) {
 
 function headingDeltaDeg(aDeg: number, bDeg: number) {
   return ((bDeg - aDeg + 180) % 360 + 360) % 360 - 180;
+}
+
+function pointInRing(lng: number, lat: number, ring: [number, number][]) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function destination(start: [number, number], bearingDeg: number, distanceM: number): [number, number] {
+  const bearingRad = (bearingDeg * Math.PI) / 180;
+  const radiusM = 6371000;
+  const angularDistance = distanceM / radiusM;
+  const lat1 = (start[1] * Math.PI) / 180;
+  const lng1 = (start[0] * Math.PI) / 180;
+
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance) +
+      Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearingRad),
+  );
+  const lng2 =
+    lng1 +
+    Math.atan2(
+      Math.sin(bearingRad) * Math.sin(angularDistance) * Math.cos(lat1),
+      Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2),
+    );
+
+  return [(lng2 * 180) / Math.PI, (lat2 * 180) / Math.PI];
+}
+
+function rectangleRing(
+  center: [number, number],
+  widthM: number,
+  heightM: number,
+  bearingDeg: number,
+): [number, number][] {
+  const halfHeightM = heightM / 2;
+  const halfWidthM = widthM / 2;
+  const topCenter = destination(center, bearingDeg, halfHeightM);
+  const bottomCenter = destination(center, bearingDeg + 180, halfHeightM);
+  const topLeft = destination(topCenter, bearingDeg - 90, halfWidthM);
+  const topRight = destination(topCenter, bearingDeg + 90, halfWidthM);
+  const bottomRight = destination(bottomCenter, bearingDeg + 90, halfWidthM);
+  const bottomLeft = destination(bottomCenter, bearingDeg - 90, halfWidthM);
+  return [topLeft, topRight, bottomRight, bottomLeft, topLeft];
 }
 
 function straightSegments(path: Line3D[]): Line3D[] {
@@ -62,6 +112,20 @@ function createSteepFixtureTile(): TerrainTile {
     width: size,
     height: size,
     data: encodeTerrainRgb(size, (_row, col) => 120 + col * 10),
+  };
+}
+
+function createUniformFixtureTile(elevationM: number): TerrainTile {
+  const zoom = 14;
+  const size = 256;
+  const { x, y } = lngLatToTile(0.01, 0.003, zoom);
+  return {
+    z: zoom,
+    x,
+    y,
+    width: size,
+    height: size,
+    data: encodeTerrainRgb(size, () => elevationM),
   };
 }
 
@@ -240,10 +304,247 @@ function runSteepTurnaroundClimbRegressionCase() {
   );
 }
 
+function runLargeAreaTurnaroundDensityRegressionCase() {
+  const largeRing = rectangleRing([16.37, 48.21], 8000, 25000, 15);
+  const geometry = generatePlannedFlightGeometryForPolygon(largeRing, 28, 45, {
+    payloadKind: "camera",
+    altitudeAGL: 120,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "MAP61_17MM",
+  });
+
+  const turnaroundPointCounts = geometry.connectedLines
+    .filter((_, index) => index % 2 === 1)
+    .map((line) => line.length);
+
+  assert.ok(turnaroundPointCounts.length > 0, "large area regression case should generate turnaround segments");
+  assert.ok(
+    turnaroundPointCounts.every((count) => count < 1200),
+    "turnaround previews should not replay the full sweep and explode point counts on large areas",
+  );
+}
+
+function runFinalSweepReconnectRegressionCase() {
+  const concaveRing: [number, number][] = [
+    [8.0, 47.0],
+    [8.012, 47.0],
+    [8.012, 47.012],
+    [8.008, 47.012],
+    [8.008, 47.004],
+    [8.004, 47.004],
+    [8.004, 47.012],
+    [8.0, 47.012],
+    [8.0, 47.0],
+  ];
+
+  const geometry = generatePlannedFlightGeometryForPolygon(concaveRing, 5, 55, {
+    payloadKind: "camera",
+    altitudeAGL: 90,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "ILX_LR1_INSPECT_85MM",
+  });
+
+  const lastTurnaroundIndex = geometry.connectedLines.length - 2;
+  const lastTurnaround = geometry.connectedLines[lastTurnaroundIndex];
+  const lastSweep = geometry.connectedLines[lastTurnaroundIndex + 1];
+  assert.ok(lastTurnaroundIndex >= 1 && lastTurnaroundIndex % 2 === 1, "regression case should include a final turnaround before the last sweep");
+  assert.ok(lastTurnaround && lastSweep, "regression case should produce both the final turnaround and last sweep");
+  assert.ok(
+    haversineDistance(
+      lastTurnaround[lastTurnaround.length - 1] as [number, number],
+      lastSweep[0] as [number, number],
+    ) < 1e-6,
+    "the final turnaround should reconnect exactly onto the stitched last sweep",
+  );
+}
+
+function runSweepRunInPreservationRegressionCase() {
+  const largeRing = rectangleRing([16.37, 48.21], 12000, 40000, 15);
+  const geometry = generatePlannedFlightGeometryForPolygon(largeRing, 28, 45, {
+    payloadKind: "camera",
+    altitudeAGL: 120,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "MAP61_17MM",
+  });
+
+  const maxStartTrimM = geometry.sweepLines.reduce((maxTrimM, sweepLine, sweepIndex) => {
+    const connectedSweep = geometry.connectedLines[sweepIndex * 2];
+    if (!connectedSweep) return maxTrimM;
+    return Math.max(
+      maxTrimM,
+      haversineDistance(
+        sweepLine[0] as [number, number],
+        connectedSweep[0] as [number, number],
+      ),
+    );
+  }, 0);
+
+  assert.ok(
+    maxStartTrimM < 6,
+    "connecting turnarounds should not trim away long sweep run-ins before image triggering starts",
+  );
+}
+
+function runConnectedSegmentContinuityRegressionCase() {
+  const largeRing = rectangleRing([16.37, 48.21], 12000, 40000, 15);
+  const geometry = generatePlannedFlightGeometryForPolygon(largeRing, 28, 45, {
+    payloadKind: "camera",
+    altitudeAGL: 120,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "MAP61_17MM",
+  });
+
+  for (let lineIndex = 0; lineIndex < geometry.connectedLines.length - 1; lineIndex += 1) {
+    const currentLine = geometry.connectedLines[lineIndex];
+    const nextLine = geometry.connectedLines[lineIndex + 1];
+    assert.ok(
+      haversineDistance(
+        currentLine[currentLine.length - 1] as [number, number],
+        nextLine[0] as [number, number],
+      ) < 1e-6,
+      "adjacent connected path segments should share exact boundary points so run-ins are not dropped",
+    );
+  }
+}
+
+function runRenderPathMergeRegressionCase() {
+  const concaveRing: [number, number][] = [
+    [8.0, 47.0],
+    [8.012, 47.0],
+    [8.012, 47.012],
+    [8.008, 47.012],
+    [8.008, 47.004],
+    [8.004, 47.004],
+    [8.004, 47.012],
+    [8.0, 47.012],
+    [8.0, 47.0],
+  ];
+
+  const geometry = generatePlannedFlightGeometryForPolygon(concaveRing, 5, 55, {
+    payloadKind: "camera",
+    altitudeAGL: 90,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "ILX_LR1_INSPECT_85MM",
+  });
+  const path3D = build3DFlightPath(
+    geometry,
+    [],
+    geometry.lineSpacing,
+    { altitudeAGL: 90, mode: "legacy", preconnected: true },
+  );
+  const mergedRenderPaths = mergeContiguous3DPathSegmentsForRender(path3D);
+
+  assert.equal(
+    mergedRenderPaths.length,
+    1,
+    "render-time path merging should collapse contiguous sweep/turn segments into a continuous 3D path",
+  );
+  assert.deepEqual(mergedRenderPaths[0][0], path3D[0][0], "merged render path should preserve the mission start point");
+  assert.deepEqual(
+    mergedRenderPaths[0][mergedRenderPaths[0].length - 1],
+    path3D[path3D.length - 1][path3D[path3D.length - 1].length - 1],
+    "merged render path should preserve the mission end point",
+  );
+}
+
+function runSweepFragmentSamplingEquivalenceCase() {
+  const concaveRing: [number, number][] = [
+    [8.0, 47.0],
+    [8.012, 47.0],
+    [8.012, 47.012],
+    [8.008, 47.012],
+    [8.008, 47.004],
+    [8.004, 47.004],
+    [8.004, 47.012],
+    [8.0, 47.012],
+    [8.0, 47.0],
+  ];
+
+  const geometry = generatePlannedFlightGeometryForPolygon(concaveRing, 90, 55, {
+    payloadKind: "camera",
+    altitudeAGL: 90,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "ILX_LR1_INSPECT_85MM",
+  });
+  const path3D = build3DFlightPath(
+    geometry,
+    [],
+    geometry.lineSpacing,
+    { altitudeAGL: 90, mode: "legacy", preconnected: true },
+  );
+
+  const fragmentAware = sampleCameraPositionsOnPlannedFlightGeometry(geometry, path3D, 40)
+    .filter(([lng, lat]) => pointInRing(lng, lat, concaveRing));
+  const filteredPreviousBehavior = sampleCameraPositionsOnFlightPath(path3D, 40, { includeTurns: false })
+    .filter(([lng, lat]) => pointInRing(lng, lat, concaveRing));
+
+  assert.equal(
+    fragmentAware.length,
+    filteredPreviousBehavior.length,
+    "fragment-aware sweep sampling should emit the same number of in-polygon camera positions as sample-then-filter",
+  );
+
+  filteredPreviousBehavior.forEach((expected, index) => {
+    const actual = fragmentAware[index];
+    assert.ok(actual, "fragment-aware sweep sampling should preserve camera position ordering");
+    assert.ok(Math.abs(actual[0] - expected[0]) < 1e-10, "camera longitude should match previous sample/filter behavior");
+    assert.ok(Math.abs(actual[1] - expected[1]) < 1e-10, "camera latitude should match previous sample/filter behavior");
+    assert.ok(Math.abs(actual[2] - expected[2]) < 1e-6, "camera altitude should match previous sample/filter behavior");
+    assert.ok(Math.abs(headingDeltaDeg(actual[3], expected[3])) < 1e-6, "camera yaw should match previous sample/filter behavior");
+  });
+}
+
+function runPreconnectedPathCacheTerrainInvalidationCase() {
+  const ring = rectangleRing([0.01, 0.003], 180, 120, 18);
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, 18, 35, {
+    payloadKind: "camera",
+    altitudeAGL: 100,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "ILX_LR1_INSPECT_85MM",
+  });
+
+  const lowTerrainPath = build3DFlightPath(
+    geometry,
+    [createUniformFixtureTile(120)],
+    geometry.lineSpacing,
+    { altitudeAGL: 100, mode: "legacy", preconnected: true },
+  );
+  const highTerrainPath = build3DFlightPath(
+    geometry,
+    [createUniformFixtureTile(620)],
+    geometry.lineSpacing,
+    { altitudeAGL: 100, mode: "legacy", preconnected: true },
+  );
+
+  const lowAltitude = lowTerrainPath[0]?.[0]?.[2];
+  const highAltitude = highTerrainPath[0]?.[0]?.[2];
+  assert.ok(Number.isFinite(lowAltitude), "low-terrain path should produce a finite altitude");
+  assert.ok(Number.isFinite(highAltitude), "high-terrain path should produce a finite altitude");
+  assert.notEqual(lowTerrainPath, highTerrainPath, "terrain changes should invalidate the cached preconnected path");
+  assert.ok(
+    (highAltitude as number) - (lowAltitude as number) > 400,
+    "identical z/x/y tiles with different terrain payloads should recompute flight altitudes",
+  );
+}
+
 runConcaveSweepGenerationCase();
 runExplicitSweepOrderingCase();
 runPlannedGeometryContractCase();
 runDynamicTurnRegressionCase();
 runSteepTurnaroundClimbRegressionCase();
+runLargeAreaTurnaroundDensityRegressionCase();
+runFinalSweepReconnectRegressionCase();
+runSweepRunInPreservationRegressionCase();
+runConnectedSegmentContinuityRegressionCase();
+runRenderPathMergeRegressionCase();
+runSweepFragmentSamplingEquivalenceCase();
+runPreconnectedPathCacheTerrainInvalidationCase();
 
 console.log("flight_path_sweeps.test.ts: all assertions passed");

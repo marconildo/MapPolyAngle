@@ -48,6 +48,17 @@ type TurnBlockGeometry = {
   turnOffAcceptanceRadiusM: number;
 };
 
+type TurnFramePoint = {
+  along: number;
+  cross: number;
+};
+
+type CachedTurnPreview = {
+  turnaroundPath: TurnFramePoint[];
+  loiterEntryPoint?: TurnFramePoint;
+  loiterExitPoint?: TurnFramePoint;
+};
+
 type FlightTurnModel = {
   defaultTurnaroundRadiusM: number;
   turnaroundRadiusFunctionSlope: number;
@@ -92,6 +103,17 @@ const FINETUNE_LOITER_LOOP_DELTA_THRESHOLD_RAD = 1.0;
 const FINETUNE_MIN_YAW_RATE_SPEED_MPS = 1.0;
 const FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M = 5.0;
 const FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M = 5.0;
+const FINETUNE_PREVIEW_POINT_SPACING_M = 2.0;
+const FINETUNE_SMOOTH_JOIN_POINT_SPACING_M = 5.0;
+const TURN_PREVIEW_CACHE_PRECISION_M = 0.1;
+const TURN_PREVIEW_CACHE_LIMIT = 2048;
+const PLANNED_GEOMETRY_CACHE_LIMIT = 128;
+
+const turnPreviewCache = new Map<string, CachedTurnPreview>();
+const plannedGeometryCache = new Map<
+  string,
+  PlannedFlightGeometry & { bounds: { minLng: number; minLat: number; maxLng: number; maxLat: number; centroid: [number, number] } }
+>();
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -121,6 +143,11 @@ const negateLocal = (value: LocalPoint): LocalPoint => ({ north: -value.north, e
 const addOffsetToLocalPoint = (point: LocalPoint, direction: LocalPoint, distanceM: number): LocalPoint =>
   addLocal(point, multiplyLocal(unitLocal(direction), distanceM));
 
+const perpendicularRightLocal = (direction: LocalPoint): LocalPoint => ({
+  north: -direction.east,
+  east: direction.north,
+});
+
 const toLocalPoint = (coordinate: LngLat, referenceCoordinate: LngLat): LocalPoint => {
   const dLat = ((coordinate[1] - referenceCoordinate[1]) * Math.PI) / 180;
   const dLon = ((coordinate[0] - referenceCoordinate[0]) * Math.PI) / 180;
@@ -149,12 +176,159 @@ const advanceLocalPoint = (start: LocalPoint, distanceM: number, bearingAngleRad
   east: start.east + distanceM * Math.sin(bearingAngleRad),
 });
 
+const simplifyPreviewPathLocal = (path: LocalPoint[], minSpacingM: number) => {
+  if (path.length <= 2 || !(minSpacingM > 0)) return path;
+
+  const simplified: LocalPoint[] = [path[0]];
+  let lastKeptPoint = path[0];
+
+  for (let index = 1; index < path.length - 1; index += 1) {
+    const candidatePoint = path[index];
+    if (normLocal(subtractLocal(candidatePoint, lastKeptPoint)) < minSpacingM) continue;
+    simplified.push(candidatePoint);
+    lastKeptPoint = candidatePoint;
+  }
+
+  const lastPoint = path[path.length - 1];
+  if (lastKeptPoint !== lastPoint) {
+    simplified.push(lastPoint);
+  }
+
+  return simplified;
+};
+
 const dedupeCoordinates = (coordinates: LngLat[]) =>
   coordinates.filter((coordinate, index) => {
     if (index === 0) return true;
     const previousCoordinate = coordinates[index - 1];
     return coordinate[0] !== previousCoordinate[0] || coordinate[1] !== previousCoordinate[1];
   });
+
+const getPlannedGeometryCacheKey = (
+  ring: LngLat[],
+  bearingDeg: number,
+  lineSpacingM: number,
+  params: FlightParams,
+  includeTurnPreview: boolean,
+) => [
+  includeTurnPreview ? "preview" : "raw",
+  normaliseDegrees(bearingDeg).toFixed(6),
+  lineSpacingM.toFixed(6),
+  params.payloadKind,
+  params.cameraKey ?? "",
+  params.lidarKey ?? "",
+  params.altitudeAGL.toFixed(3),
+  (params.speedMps ?? 0).toFixed(3),
+  ring.map(([lng, lat]) => `${lng.toFixed(10)},${lat.toFixed(10)}`).join(";"),
+].join("|");
+
+const rememberPlannedGeometry = (
+  cacheKey: string,
+  geometry: PlannedFlightGeometry & { bounds: { minLng: number; minLat: number; maxLng: number; maxLat: number; centroid: [number, number] } },
+) => {
+  if (plannedGeometryCache.has(cacheKey)) {
+    plannedGeometryCache.delete(cacheKey);
+  }
+  plannedGeometryCache.set(cacheKey, geometry);
+  if (plannedGeometryCache.size <= PLANNED_GEOMETRY_CACHE_LIMIT) return;
+  const oldestKey = plannedGeometryCache.keys().next().value;
+  if (oldestKey) plannedGeometryCache.delete(oldestKey);
+};
+
+const toTurnFramePoint = (
+  point: LocalPoint,
+  origin: LocalPoint,
+  forwardDirection: LocalPoint,
+): TurnFramePoint => {
+  const rightDirection = perpendicularRightLocal(forwardDirection);
+  const delta = subtractLocal(point, origin);
+  return {
+    along: dotLocal(delta, forwardDirection),
+    cross: dotLocal(delta, rightDirection),
+  };
+};
+
+const fromTurnFramePoint = (
+  point: TurnFramePoint,
+  origin: LocalPoint,
+  forwardDirection: LocalPoint,
+): LocalPoint => {
+  const rightDirection = perpendicularRightLocal(forwardDirection);
+  return addLocal(
+    origin,
+    addLocal(
+      multiplyLocal(forwardDirection, point.along),
+      multiplyLocal(rightDirection, point.cross),
+    ),
+  );
+};
+
+const roundTurnPreviewCacheValue = (value: number) =>
+  Math.round(value / TURN_PREVIEW_CACHE_PRECISION_M) * TURN_PREVIEW_CACHE_PRECISION_M;
+
+const serializeTurnFramePoint = (point: TurnFramePoint) =>
+  `${roundTurnPreviewCacheValue(point.along).toFixed(1)},${roundTurnPreviewCacheValue(point.cross).toFixed(1)}`;
+
+const getTurnPreviewCacheKey = (
+  geometry: TurnBlockGeometry,
+  previewStart: LocalPoint,
+  previewParams: TurnPreviewModelParams,
+  forwardDirection: LocalPoint,
+) => {
+  if (normLocal(forwardDirection) <= 1e-9) return undefined;
+
+  return [
+    serializeTurnFramePoint(toTurnFramePoint(previewStart, geometry.endSweep, forwardDirection)),
+    serializeTurnFramePoint(toTurnFramePoint(geometry.turnOff, geometry.endSweep, forwardDirection)),
+    serializeTurnFramePoint(toTurnFramePoint(geometry.loiterCenter, geometry.endSweep, forwardDirection)),
+    serializeTurnFramePoint(toTurnFramePoint(geometry.nextSweepStart, geometry.endSweep, forwardDirection)),
+    serializeTurnFramePoint(toTurnFramePoint(geometry.nextSweepEnd, geometry.endSweep, forwardDirection)),
+    roundTurnPreviewCacheValue(geometry.loiterRadiusM).toFixed(1),
+    roundTurnPreviewCacheValue(geometry.turnOffAcceptanceRadiusM).toFixed(1),
+    geometry.loiterDirection.toString(),
+    roundTurnPreviewCacheValue(previewParams.trimSpeedMps).toFixed(1),
+    roundTurnPreviewCacheValue(previewParams.turnSpeedMps).toFixed(1),
+    roundTurnPreviewCacheValue(previewParams.slowdownDistanceM).toFixed(1),
+  ].join("|");
+};
+
+const cacheTurnPreview = (
+  cacheKey: string,
+  geometry: TurnBlockGeometry,
+  forwardDirection: LocalPoint,
+  turnaroundPathLocal: LocalPoint[],
+  loiterEntryPoint?: LocalPoint,
+  loiterExitPoint?: LocalPoint,
+) => {
+  turnPreviewCache.set(cacheKey, {
+    turnaroundPath: turnaroundPathLocal.map((point) => toTurnFramePoint(point, geometry.endSweep, forwardDirection)),
+    loiterEntryPoint: loiterEntryPoint
+      ? toTurnFramePoint(loiterEntryPoint, geometry.endSweep, forwardDirection)
+      : undefined,
+    loiterExitPoint: loiterExitPoint
+      ? toTurnFramePoint(loiterExitPoint, geometry.endSweep, forwardDirection)
+      : undefined,
+  });
+  if (turnPreviewCache.size <= TURN_PREVIEW_CACHE_LIMIT) return;
+  const oldestKey = turnPreviewCache.keys().next().value;
+  if (oldestKey) turnPreviewCache.delete(oldestKey);
+};
+
+const restoreTurnPreviewFromCache = (
+  cachedPreview: CachedTurnPreview,
+  geometry: TurnBlockGeometry,
+  forwardDirection: LocalPoint,
+) => ({
+  turnaroundPathLocal: cachedPreview.turnaroundPath.map((point) =>
+    fromTurnFramePoint(point, geometry.endSweep, forwardDirection),
+  ),
+  loiterEntryPoint: cachedPreview.loiterEntryPoint
+    ? fromTurnFramePoint(cachedPreview.loiterEntryPoint, geometry.endSweep, forwardDirection)
+    : undefined,
+  loiterExitPoint: cachedPreview.loiterExitPoint
+    ? fromTurnFramePoint(cachedPreview.loiterExitPoint, geometry.endSweep, forwardDirection)
+    : undefined,
+});
 
 const projectPointOntoPolyline = (point: LngLat, line: LngLat[]) => {
   if (line.length < 2) return undefined;
@@ -407,11 +581,10 @@ const getCogErrorOffsetRad = (rollSetpointRad: number) => {
 };
 
 const estimatePreviewDurationS = (geometry: TurnBlockGeometry, previewParams: TurnPreviewModelParams) => {
-  const sweepDistanceM = normLocal(subtractLocal(geometry.endSweep, geometry.startSweep));
   const turnOffDistanceM = normLocal(subtractLocal(geometry.turnOff, geometry.endSweep));
   const reconnectDistanceM = normLocal(subtractLocal(geometry.nextSweepStart, geometry.turnOff));
   const loiterBudgetDistanceM = FINETUNE_PREVIEW_LOITER_DISTANCE_MULTIPLIER * Math.PI * geometry.loiterRadiusM;
-  const totalDistanceBudgetM = sweepDistanceM + turnOffDistanceM + reconnectDistanceM + loiterBudgetDistanceM;
+  const totalDistanceBudgetM = turnOffDistanceM + reconnectDistanceM + loiterBudgetDistanceM;
   const conservativeSpeedMps = Math.max(
     Math.min(previewParams.turnSpeedMps, previewParams.trimSpeedMps),
     FINETUNE_MIN_PREVIEW_SPEED_MPS,
@@ -653,14 +826,6 @@ const buildTurnBlockGeometry = (
   };
 };
 
-const extractPreviewLines = (previewPath: LocalPoint[], stageTransitionIndex: number, referenceCoordinate: LngLat) => {
-  const safeTransitionIndex = clamp(stageTransitionIndex, 1, previewPath.length - 2);
-  const sweepCoordinates = dedupeCoordinates(previewPath.slice(0, safeTransitionIndex + 1).map((point) => fromLocalPoint(point, referenceCoordinate)));
-  const turnaroundCoordinates = dedupeCoordinates(previewPath.slice(safeTransitionIndex).map((point) => fromLocalPoint(point, referenceCoordinate)));
-  if (sweepCoordinates.length < 2 || turnaroundCoordinates.length < 2) return undefined;
-  return { sweepLine: sweepCoordinates, turnaroundLine: turnaroundCoordinates };
-};
-
 const sampleLoiterArcBearings = (
   startBearingRad: number,
   endBearingRad: number,
@@ -745,7 +910,31 @@ const runTurnPreviewBlock = (
   previewParams: TurnPreviewModelParams,
 ) => {
   const sweepDirection = unitLocal(subtractLocal(geometry.endSweep, geometry.startSweep));
-  let currentPosition = geometry.startSweep;
+  if (normLocal(sweepDirection) <= 1e-9) return undefined;
+  const sweepDistanceM = normLocal(subtractLocal(geometry.endSweep, geometry.startSweep));
+  const previewRunInDistanceM = Math.min(
+    sweepDistanceM,
+    Math.max(geometry.loiterRadiusM * 4, previewParams.slowdownDistanceM * 2),
+  );
+  const previewStart = addOffsetToLocalPoint(geometry.endSweep, negateLocal(sweepDirection), previewRunInDistanceM);
+  const cacheKey = getTurnPreviewCacheKey(geometry, previewStart, previewParams, sweepDirection);
+  if (cacheKey) {
+    const cachedPreview = turnPreviewCache.get(cacheKey);
+    if (cachedPreview) {
+      const restored = restoreTurnPreviewFromCache(cachedPreview, geometry, sweepDirection);
+      const turnaroundCoordinates = dedupeCoordinates(
+        restored.turnaroundPathLocal.map((point) => fromLocalPoint(point, referenceCoordinate)),
+      );
+      if (turnaroundCoordinates.length >= 2) {
+        return {
+          turnaroundLine: turnaroundCoordinates,
+          loiterEntryPoint: restored.loiterEntryPoint,
+          loiterExitPoint: restored.loiterExitPoint,
+        };
+      }
+    }
+  }
+  let currentPosition = previewStart;
   let headingRad = Math.atan2(sweepDirection.east, sweepDirection.north);
   let speedMps = previewParams.trimSpeedMps;
   let rollRad = 0;
@@ -753,24 +942,30 @@ const runTurnPreviewBlock = (
   let lastLoiterAngleRad: number | undefined;
   let loiterLoops = 0;
   let stage: "end" | "turnoff" | "loiter" | "next" = "end";
-  let stageTransitionIndex = -1;
+  let turnStartIndex = -1;
   let reachedNextSweep = false;
   let previousWaypointForNext = geometry.endSweep;
   let loiterEntryPoint: LocalPoint | undefined;
   let loiterExitPoint: LocalPoint | undefined;
   const l1State = createInitialL1State(previewParams);
   const trajectory: LocalPoint[] = [currentPosition];
-  const maxSteps = Math.ceil(estimatePreviewDurationS(geometry, previewParams) / previewParams.dtS);
+  const maxSteps = Math.ceil(
+    (estimatePreviewDurationS(geometry, previewParams) +
+      previewRunInDistanceM / Math.max(previewParams.trimSpeedMps, FINETUNE_MIN_PREVIEW_SPEED_MPS)) /
+      previewParams.dtS,
+  );
 
   for (let step = 0; step < maxSteps; step += 1) {
     const groundSpeed = { north: speedMps * Math.cos(headingRad), east: speedMps * Math.sin(headingRad) };
     let rollSetpointRad = 0;
 
     if (stage === "end") {
-      ({ rollSpRad: rollSetpointRad } = navigateWaypoints(geometry.startSweep, geometry.endSweep, currentPosition, groundSpeed, l1State, previewParams));
+      ({ rollSpRad: rollSetpointRad } = navigateWaypoints(previewStart, geometry.endSweep, currentPosition, groundSpeed, l1State, previewParams));
       if (normLocal(subtractLocal(currentPosition, geometry.endSweep)) <= getAcceptanceRadius(0, l1State.l1DistanceM)) {
+        currentPosition = geometry.endSweep;
+        trajectory[trajectory.length - 1] = geometry.endSweep;
         stage = "turnoff";
-        stageTransitionIndex = trajectory.length - 1;
+        turnStartIndex = trajectory.length - 1;
       }
     } else if (stage === "turnoff") {
       ({ rollSpRad: rollSetpointRad } = navigateWaypoints(geometry.endSweep, geometry.turnOff, currentPosition, groundSpeed, l1State, previewParams));
@@ -860,11 +1055,36 @@ const runTurnPreviewBlock = (
     }
   }
 
-  if (trajectory.length < 3 || stageTransitionIndex < 1 || !reachedNextSweep) return undefined;
-  const previewLines = extractPreviewLines(trajectory, stageTransitionIndex, referenceCoordinate);
-  if (!previewLines) return undefined;
+  if (turnStartIndex < 0 || !reachedNextSweep) return undefined;
+  const turnaroundPathLocal = simplifyPreviewPathLocal(
+    trajectory.slice(Math.max(0, turnStartIndex)),
+    FINETUNE_PREVIEW_POINT_SPACING_M,
+  );
+  const nextSweepDirection = unitLocal(subtractLocal(geometry.nextSweepEnd, geometry.nextSweepStart));
+  if (turnaroundPathLocal.length >= 2 && normLocal(nextSweepDirection) > 0) {
+    const nextSweepApproach = addOffsetToLocalPoint(
+      geometry.nextSweepStart,
+      negateLocal(nextSweepDirection),
+      Math.min(12, geometry.loiterRadiusM * 0.3),
+    );
+    turnaroundPathLocal.splice(Math.max(1, turnaroundPathLocal.length - 1), 0, nextSweepApproach);
+  }
+  const turnaroundCoordinates = dedupeCoordinates(
+    turnaroundPathLocal.map((point) => fromLocalPoint(point, referenceCoordinate)),
+  );
+  if (turnaroundCoordinates.length < 2) return undefined;
+  if (cacheKey) {
+    cacheTurnPreview(
+      cacheKey,
+      geometry,
+      sweepDirection,
+      turnaroundPathLocal,
+      loiterEntryPoint,
+      loiterExitPoint,
+    );
+  }
   return {
-    ...previewLines,
+    turnaroundLine: turnaroundCoordinates,
     loiterEntryPoint,
     loiterExitPoint,
   };
@@ -887,7 +1107,12 @@ const stitchLineStart = (line: LngLat[], targetStart: LngLat) => {
 
   const projectedStart = projectPointOntoPolyline(targetStart, line);
   if (!projectedStart || projectedStart.distanceM > FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M) {
-    return [targetStart, ...line.slice(1)];
+    return line;
+  }
+
+  const projectedStartShiftM = haversineDistance(line[0], projectedStart.coordinate);
+  if (projectedStartShiftM > FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M) {
+    return line;
   }
 
   const stitchedLine = [projectedStart.coordinate, ...line.slice(projectedStart.segmentIndex + 1)];
@@ -920,7 +1145,7 @@ const buildSmoothJoinToLineStart = (
   const tangentScaleM = joinDistanceM * 0.5;
   const startTangent = multiplyLocal(unitLocal(subtractLocal(startLocal, previousLocal)), tangentScaleM);
   const endTangent = multiplyLocal(unitLocal(subtractLocal(nextLocal, endLocal)), tangentScaleM);
-  const controlPointCount = Math.max(12, Math.ceil(joinDistanceM));
+  const controlPointCount = Math.max(12, Math.ceil(joinDistanceM / FINETUNE_SMOOTH_JOIN_POINT_SPACING_M));
   const joinPoints: LngLat[] = [];
 
   for (let pointIndex = 1; pointIndex <= controlPointCount; pointIndex += 1) {
@@ -995,7 +1220,7 @@ const connectSweepLinesUsingDynamicFlightTurn = (
     }
 
     const previewLines = runTurnPreviewBlock(turnBlockGeometry, referenceCoordinate, previewParams);
-    const sweepLineForTurn = previewLines?.sweepLine ?? sweepLines[sweepIndex];
+    const sweepLineForTurn = sweepLines[sweepIndex];
     const stitchedSweepLine =
       connectedLines.length > 0 ? stitchLineStart(sweepLineForTurn, connectedLines.at(-1)!.at(-1)!) : sweepLineForTurn;
     if (connectedLines.length > 0) {
@@ -1015,6 +1240,22 @@ const connectSweepLinesUsingDynamicFlightTurn = (
       loiterExitPoint = fallbackTurn.loiterExitPoint;
     }
 
+    if (turnaroundLine && turnaroundLine.length > 0) {
+      const sweepToTurnJoin = buildSmoothJoinToLineStart(stitchedSweepLine, turnaroundLine);
+      if (sweepToTurnJoin.length > 0) {
+        turnaroundLine = dedupeCoordinates([
+          stitchedSweepLine.at(-1)!,
+          ...sweepToTurnJoin,
+          ...turnaroundLine.slice(1),
+        ]);
+      } else if (
+        stitchedSweepLine.at(-1) &&
+        (turnaroundLine[0][0] !== stitchedSweepLine.at(-1)![0] || turnaroundLine[0][1] !== stitchedSweepLine.at(-1)![1])
+      ) {
+        turnaroundLine = dedupeCoordinates([stitchedSweepLine.at(-1)!, ...turnaroundLine]);
+      }
+    }
+
     connectedLines.push(stitchedSweepLine, turnaroundLine ?? [stitchedSweepLine.at(-1)!, sweepLines[sweepIndex + 1][0]]);
     turnBlocks.push(
       toPlannedTurnBlock(turnBlockGeometry, referenceCoordinate, {
@@ -1025,9 +1266,14 @@ const connectSweepLinesUsingDynamicFlightTurn = (
   }
 
   const lastSweepLine = sweepLines.at(-1)!;
-  connectedLines.push(
-    connectedLines.length > 0 ? stitchLineStart(lastSweepLine, connectedLines.at(-1)!.at(-1)!) : lastSweepLine,
-  );
+  const stitchedLastSweepLine =
+    connectedLines.length > 0 ? stitchLineStart(lastSweepLine, connectedLines.at(-1)!.at(-1)!) : lastSweepLine;
+  if (connectedLines.length > 0) {
+    const previousTurnaroundLine = connectedLines.at(-1)!;
+    const smoothJoin = buildSmoothJoinToLineStart(previousTurnaroundLine, stitchedLastSweepLine);
+    if (smoothJoin.length > 0) previousTurnaroundLine.push(...smoothJoin);
+  }
+  connectedLines.push(stitchedLastSweepLine);
   return { connectedLines, turnaroundRadiusM: missionTurnaroundRadiusM, turnBlocks };
 };
 
@@ -1040,11 +1286,19 @@ export const generatePlannedFlightGeometryForPolygon = (
     includeTurnPreview?: boolean;
   },
 ): PlannedFlightGeometry & { bounds: { minLng: number; minLat: number; maxLng: number; maxLat: number; centroid: [number, number] } } => {
+  const includeTurnPreview = options?.includeTurnPreview ?? true;
+  const cacheKey = getPlannedGeometryCacheKey(ring, bearingDeg, lineSpacingM, params, includeTurnPreview);
+  const cachedGeometry = plannedGeometryCache.get(cacheKey);
+  if (cachedGeometry) {
+    plannedGeometryCache.delete(cacheKey);
+    plannedGeometryCache.set(cacheKey, cachedGeometry);
+    return cachedGeometry;
+  }
+
   const raw = generateFlightLinesForPolygon(ring, bearingDeg, lineSpacingM);
   const sweepLines = mergeSweepLines(raw.flightLines as LngLat[][], raw.lineSpacing, raw.sweepIndices);
-  const includeTurnPreview = options?.includeTurnPreview ?? true;
   if (!includeTurnPreview) {
-    return {
+    const geometry = {
       ...raw,
       flightLines: raw.flightLines as LngLat[][],
       sweepLines,
@@ -1055,6 +1309,8 @@ export const generatePlannedFlightGeometryForPolygon = (
       turnaroundRadiusM: 0,
       turnBlocks: [],
     };
+    rememberPlannedGeometry(cacheKey, geometry);
+    return geometry;
   }
   const canonicalSweepLines = normalizeSweepLineDirectionsForGrid(sweepLines);
   const flightTurnModel = getFlightTurnModel(params);
@@ -1071,7 +1327,7 @@ export const generatePlannedFlightGeometryForPolygon = (
     params.altitudeAGL,
   );
 
-  return {
+  const geometry = {
     ...raw,
     flightLines: raw.flightLines as LngLat[][],
     sweepLines,
@@ -1082,6 +1338,8 @@ export const generatePlannedFlightGeometryForPolygon = (
     turnaroundRadiusM,
     turnBlocks,
   };
+  rememberPlannedGeometry(cacheKey, geometry);
+  return geometry;
 };
 
 export const connectedPathLengthMeters = (geometry: Pick<PlannedFlightGeometry, "connectedLines">) => {
