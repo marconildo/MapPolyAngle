@@ -21,6 +21,38 @@ function headingDeltaDeg(aDeg: number, bDeg: number) {
   return ((bDeg - aDeg + 180) % 360 + 360) % 360 - 180;
 }
 
+function toLocalPoint(point: [number, number], reference: [number, number]) {
+  const dLat = ((point[1] - reference[1]) * Math.PI) / 180;
+  const dLng = ((point[0] - reference[0]) * Math.PI) / 180;
+  const cosLat = Math.cos((reference[1] * Math.PI) / 180);
+  return {
+    north: dLat * 6378137,
+    east: dLng * 6378137 * cosLat,
+  };
+}
+
+function projectOntoSweepFrame(
+  point: [number, number],
+  sweepStart: [number, number],
+  nextSweepPoint: [number, number],
+) {
+  const pointLocal = toLocalPoint(point, sweepStart);
+  const nextLocal = toLocalPoint(nextSweepPoint, sweepStart);
+  const sweepLength = Math.hypot(nextLocal.north, nextLocal.east);
+  const forward = {
+    north: nextLocal.north / sweepLength,
+    east: nextLocal.east / sweepLength,
+  };
+  const right = {
+    north: -forward.east,
+    east: forward.north,
+  };
+  return {
+    along: pointLocal.north * forward.north + pointLocal.east * forward.east,
+    cross: pointLocal.north * right.north + pointLocal.east * right.east,
+  };
+}
+
 function pointInRing(lng: number, lat: number, ring: [number, number][]) {
   let inside = false;
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
@@ -411,6 +443,65 @@ function runConnectedSegmentContinuityRegressionCase() {
   }
 }
 
+function runTurnaroundTailMonotonicRegressionCase() {
+  const ring = rectangleRing([16.37, 48.21], 1500, 2500, 20);
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, 287.6, 60, {
+    payloadKind: "camera",
+    altitudeAGL: 120,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "MAP61_17MM",
+  });
+
+  for (let lineIndex = 1; lineIndex < geometry.connectedLines.length - 1; lineIndex += 2) {
+    const turnaround = geometry.connectedLines[lineIndex];
+    const nextSweep = geometry.connectedLines[lineIndex + 1];
+    assert.ok(nextSweep.length >= 2, "regression case should provide the next sweep direction");
+
+    const tailFrames = turnaround
+      .slice(-4)
+      .map((point) => projectOntoSweepFrame(point as [number, number], nextSweep[0] as [number, number], nextSweep[1] as [number, number]));
+
+    for (let frameIndex = 1; frameIndex < tailFrames.length; frameIndex += 1) {
+      assert.ok(
+        tailFrames[frameIndex].along >= tailFrames[frameIndex - 1].along - 1e-6,
+        "turnaround tail should not step backward along the next sweep axis before rejoining the line",
+      );
+    }
+  }
+}
+
+function runTurnaroundTailCrossTrackBlendRegressionCase() {
+  const ring = rectangleRing([16.37, 48.21], 1500, 2500, 20);
+  const geometry = generatePlannedFlightGeometryForPolygon(ring, 283.2, 60, {
+    payloadKind: "camera",
+    altitudeAGL: 120,
+    frontOverlap: 75,
+    sideOverlap: 70,
+    cameraKey: "MAP61_17MM",
+  });
+
+  for (let lineIndex = 1; lineIndex < geometry.connectedLines.length - 1; lineIndex += 2) {
+    const turnaround = geometry.connectedLines[lineIndex];
+    const nextSweep = geometry.connectedLines[lineIndex + 1];
+    const tailFrames = turnaround
+      .slice(-8)
+      .map((point) => projectOntoSweepFrame(point as [number, number], nextSweep[0] as [number, number], nextSweep[1] as [number, number]));
+
+    for (let frameIndex = 1; frameIndex < tailFrames.length; frameIndex += 1) {
+      assert.ok(
+        Math.abs(tailFrames[frameIndex].cross) <= Math.abs(tailFrames[frameIndex - 1].cross) + 1e-6,
+        "turnaround tail cross-track offset should decay monotonically into the next sweep",
+      );
+    }
+
+    assert.ok(
+      Math.abs(tailFrames[tailFrames.length - 2].cross) < 0.1,
+      "the penultimate turnaround point should already be essentially on the next sweep corridor",
+    );
+  }
+}
+
 function runRenderPathMergeRegressionCase() {
   const concaveRing: [number, number][] = [
     [8.0, 47.0],
@@ -543,6 +634,8 @@ runLargeAreaTurnaroundDensityRegressionCase();
 runFinalSweepReconnectRegressionCase();
 runSweepRunInPreservationRegressionCase();
 runConnectedSegmentContinuityRegressionCase();
+runTurnaroundTailMonotonicRegressionCase();
+runTurnaroundTailCrossTrackBlendRegressionCase();
 runRenderPathMergeRegressionCase();
 runSweepFragmentSamplingEquivalenceCase();
 runPreconnectedPathCacheTerrainInvalidationCase();
