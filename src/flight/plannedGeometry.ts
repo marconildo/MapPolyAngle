@@ -103,6 +103,9 @@ const FINETUNE_LOITER_LOOP_DELTA_THRESHOLD_RAD = 1.0;
 const FINETUNE_MIN_YAW_RATE_SPEED_MPS = 1.0;
 const FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M = 5.0;
 const FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M = 5.0;
+const FINETUNE_NEXT_SWEEP_APPROACH_MIN_DISTANCE_M = 1.5;
+const FINETUNE_NEXT_SWEEP_APPROACH_MIN_ADVANCE_M = 2.0;
+const FINETUNE_NEXT_SWEEP_APPROACH_MAX_ADVANCE_M = 8.0;
 const FINETUNE_PREVIEW_POINT_SPACING_M = 2.0;
 const FINETUNE_SMOOTH_JOIN_POINT_SPACING_M = 5.0;
 const TURN_PREVIEW_CACHE_PRECISION_M = 0.1;
@@ -786,6 +789,8 @@ const buildSurveyGridPoints = (
 const buildTurnBlockGeometry = (
   gridPoints: LngLat[],
   sweepIndex: number,
+  currentSweepLine: LngLat[],
+  nextSweepLine: LngLat[],
   referenceCoordinate: LngLat,
   gridSpacing: number,
   defaultTurnaroundRadius: number,
@@ -800,12 +805,17 @@ const buildTurnBlockGeometry = (
   const nextSweepEndIndex = nextSweepStartIndex + 1;
   if (nextSweepEndIndex >= gridPoints.length) return undefined;
 
-  const startSweep = toLocalPoint(gridPoints[startSweepIndex], referenceCoordinate);
-  const endSweep = toLocalPoint(gridPoints[endSweepIndex], referenceCoordinate);
+  const startSweepCoordinate = currentSweepLine[0] ?? gridPoints[startSweepIndex];
+  const endSweepCoordinate = currentSweepLine.at(-1) ?? gridPoints[endSweepIndex];
+  const nextSweepStartCoordinate = nextSweepLine[0] ?? gridPoints[nextSweepStartIndex];
+  const nextSweepEndCoordinate = nextSweepLine[1] ?? nextSweepLine[0] ?? gridPoints[nextSweepEndIndex];
+
+  const startSweep = toLocalPoint(startSweepCoordinate, referenceCoordinate);
+  const endSweep = toLocalPoint(endSweepCoordinate, referenceCoordinate);
   const turnOff = toLocalPoint(gridPoints[turnOffIndex], referenceCoordinate);
   const turnCoord = toLocalPoint(gridPoints[turnCoordIndex], referenceCoordinate);
-  const nextSweepStart = toLocalPoint(gridPoints[nextSweepStartIndex], referenceCoordinate);
-  const nextSweepEnd = toLocalPoint(gridPoints[nextSweepEndIndex], referenceCoordinate);
+  const nextSweepStart = toLocalPoint(nextSweepStartCoordinate, referenceCoordinate);
+  const nextSweepEnd = toLocalPoint(nextSweepEndCoordinate, referenceCoordinate);
   const loiterRadiusM = getMissionTurnaroundRadius(gridSpacing, defaultTurnaroundRadius);
   let loiterCenter = advanceLocalPoint(turnCoord, loiterRadiusM, bearingRad(turnCoord, turnOff));
   loiterCenter = advanceLocalPoint(loiterCenter, loiterRadiusM, bearingRad(turnCoord, nextSweepStart));
@@ -916,6 +926,16 @@ const runTurnPreviewBlock = (
     sweepDistanceM,
     Math.max(geometry.loiterRadiusM * 4, previewParams.slowdownDistanceM * 2),
   );
+  const nextSweepDirection = unitLocal(subtractLocal(geometry.nextSweepEnd, geometry.nextSweepStart));
+  const hasNextSweepDirection = normLocal(nextSweepDirection) > 1e-9;
+  const nextSweepApproachDistanceM = Math.min(12, geometry.loiterRadiusM * 0.3);
+  const nextSweepApproachStart = hasNextSweepDirection
+    ? addOffsetToLocalPoint(
+        geometry.nextSweepStart,
+        negateLocal(nextSweepDirection),
+        nextSweepApproachDistanceM,
+      )
+    : geometry.nextSweepStart;
   const previewStart = addOffsetToLocalPoint(geometry.endSweep, negateLocal(sweepDirection), previewRunInDistanceM);
   const cacheKey = getTurnPreviewCacheKey(geometry, previewStart, previewParams, sweepDirection);
   if (cacheKey) {
@@ -944,7 +964,6 @@ const runTurnPreviewBlock = (
   let stage: "end" | "turnoff" | "loiter" | "next" = "end";
   let turnStartIndex = -1;
   let reachedNextSweep = false;
-  let previousWaypointForNext = geometry.endSweep;
   let loiterEntryPoint: LocalPoint | undefined;
   let loiterExitPoint: LocalPoint | undefined;
   const l1State = createInitialL1State(previewParams);
@@ -994,7 +1013,6 @@ const runTurnPreviewBlock = (
         const distanceCurrentToExitM = normLocal(subtractLocal(currentPosition, exitPoint));
         if (distanceCurrentToNextM > distanceExitToNextM && distanceCurrentToExitM < distanceCurrentToLoiterM) {
           stage = "next";
-          previousWaypointForNext = exitPoint;
           loiterExitPoint = exitPoint;
         }
       }
@@ -1010,8 +1028,8 @@ const runTurnPreviewBlock = (
       }
     } else {
       ({ rollSpRad: rollSetpointRad } = navigateWaypoints(
-        previousWaypointForNext,
-        geometry.nextSweepStart,
+        hasNextSweepDirection ? nextSweepApproachStart : geometry.nextSweepStart,
+        hasNextSweepDirection ? geometry.nextSweepEnd : geometry.nextSweepStart,
         currentPosition,
         groundSpeed,
         l1State,
@@ -1047,7 +1065,13 @@ const runTurnPreviewBlock = (
     trajectory.push(currentPosition);
 
     if (stage === "next") {
-      if (normLocal(subtractLocal(currentPosition, geometry.nextSweepStart)) < FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M) {
+      const distanceToNextSweepStartM = normLocal(subtractLocal(currentPosition, geometry.nextSweepStart));
+      const alignedWithNextSweep =
+        hasNextSweepDirection &&
+        dotLocal(subtractLocal(currentPosition, geometry.nextSweepStart), nextSweepDirection) >= -FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M &&
+        Math.abs(crossLocal(subtractLocal(currentPosition, geometry.nextSweepStart), nextSweepDirection)) <=
+          FINETUNE_NEXT_SWEEP_ALIGNMENT_DISTANCE_M;
+      if (distanceToNextSweepStartM < FINETUNE_NEXT_SWEEP_REACHED_DISTANCE_M || alignedWithNextSweep) {
         trajectory[trajectory.length - 1] = geometry.nextSweepStart;
         reachedNextSweep = true;
         break;
@@ -1056,18 +1080,17 @@ const runTurnPreviewBlock = (
   }
 
   if (turnStartIndex < 0 || !reachedNextSweep) return undefined;
-  const turnaroundPathLocal = simplifyPreviewPathLocal(
+  let turnaroundPathLocal = simplifyPreviewPathLocal(
     trajectory.slice(Math.max(0, turnStartIndex)),
     FINETUNE_PREVIEW_POINT_SPACING_M,
   );
-  const nextSweepDirection = unitLocal(subtractLocal(geometry.nextSweepEnd, geometry.nextSweepStart));
   if (turnaroundPathLocal.length >= 2 && normLocal(nextSweepDirection) > 0) {
-    const nextSweepApproach = addOffsetToLocalPoint(
+    turnaroundPathLocal = smoothTurnaroundTailIntoSweep(
+      turnaroundPathLocal,
       geometry.nextSweepStart,
-      negateLocal(nextSweepDirection),
+      nextSweepDirection,
       Math.min(12, geometry.loiterRadiusM * 0.3),
     );
-    turnaroundPathLocal.splice(Math.max(1, turnaroundPathLocal.length - 1), 0, nextSweepApproach);
   }
   const turnaroundCoordinates = dedupeCoordinates(
     turnaroundPathLocal.map((point) => fromLocalPoint(point, referenceCoordinate)),
@@ -1166,6 +1189,111 @@ const buildSmoothJoinToLineStart = (
   return dedupeCoordinates(joinPoints);
 };
 
+const blendTurnaroundEndIntoSweep = (
+  turnaroundLine: LngLat[],
+  nextSweepLine: LngLat[],
+) => {
+  if (turnaroundLine.length < 3 || nextSweepLine.length < 2) return turnaroundLine;
+
+  const referenceCoordinate = nextSweepLine[0];
+  const nextSweepStartLocal = toLocalPoint(nextSweepLine[0], referenceCoordinate);
+  const nextSweepDirection = unitLocal(
+    subtractLocal(toLocalPoint(nextSweepLine[1], referenceCoordinate), nextSweepStartLocal),
+  );
+  if (normLocal(nextSweepDirection) <= 1e-9) return turnaroundLine;
+
+  const penultimatePoint = turnaroundLine.at(-2);
+  if (!penultimatePoint) return turnaroundLine;
+  const penultimateFrame = toTurnFramePoint(
+    toLocalPoint(penultimatePoint, referenceCoordinate),
+    nextSweepStartLocal,
+    nextSweepDirection,
+  );
+  const desiredBlendDistanceM = clamp(
+    Math.max(8, Math.abs(penultimateFrame.cross) * 4),
+    8,
+    18,
+  );
+
+  let anchorIndex = turnaroundLine.length - 2;
+  for (let pointIndex = turnaroundLine.length - 2; pointIndex >= 1; pointIndex -= 1) {
+    anchorIndex = pointIndex;
+    const framePoint = toTurnFramePoint(
+      toLocalPoint(turnaroundLine[pointIndex], referenceCoordinate),
+      nextSweepStartLocal,
+      nextSweepDirection,
+    );
+    if (framePoint.along <= -desiredBlendDistanceM) {
+      break;
+    }
+  }
+
+  const turnaroundPrefix = turnaroundLine.slice(0, anchorIndex + 1);
+  const smoothTail = buildSmoothJoinToLineStart(turnaroundPrefix, nextSweepLine);
+  if (smoothTail.length === 0) return turnaroundLine;
+  return dedupeCoordinates([...turnaroundPrefix, ...smoothTail]);
+};
+
+const smoothTurnaroundTailIntoSweep = (
+  turnaroundPathLocal: LocalPoint[],
+  nextSweepStart: LocalPoint,
+  nextSweepDirection: LocalPoint,
+  preferredApproachDistanceM: number,
+) => {
+  if (turnaroundPathLocal.length < 2) return turnaroundPathLocal;
+
+  const sweepDirection = unitLocal(nextSweepDirection);
+  if (normLocal(sweepDirection) <= 1e-9) return turnaroundPathLocal;
+
+  const finalPoint = turnaroundPathLocal.at(-1)!;
+  if (normLocal(subtractLocal(finalPoint, nextSweepStart)) > 1e-6) return turnaroundPathLocal;
+
+  const previousPoint = turnaroundPathLocal.at(-2)!;
+  const previousFramePoint = toTurnFramePoint(previousPoint, nextSweepStart, sweepDirection);
+  if (previousFramePoint.along >= -FINETUNE_NEXT_SWEEP_APPROACH_MIN_DISTANCE_M) {
+    return turnaroundPathLocal;
+  }
+
+  const minAdvanceM = clamp(
+    Math.abs(previousFramePoint.along) * 0.35,
+    FINETUNE_NEXT_SWEEP_APPROACH_MIN_ADVANCE_M,
+    FINETUNE_NEXT_SWEEP_APPROACH_MAX_ADVANCE_M,
+  );
+  const minApproachAlong = previousFramePoint.along + minAdvanceM;
+  const maxApproachAlong = -FINETUNE_NEXT_SWEEP_APPROACH_MIN_DISTANCE_M;
+  if (minApproachAlong >= maxApproachAlong) {
+    return turnaroundPathLocal;
+  }
+
+  const desiredApproachAlong = -Math.max(
+    preferredApproachDistanceM,
+    FINETUNE_NEXT_SWEEP_APPROACH_MIN_DISTANCE_M,
+  );
+  const approachAlong = clamp(
+    desiredApproachAlong,
+    minApproachAlong,
+    maxApproachAlong,
+  );
+  if (approachAlong <= previousFramePoint.along + 1e-6) {
+    return turnaroundPathLocal;
+  }
+
+  const alongRatio = clamp(approachAlong / previousFramePoint.along, 0, 1);
+  const approachPoint = fromTurnFramePoint(
+    {
+      along: approachAlong,
+      cross: previousFramePoint.cross * alongRatio * alongRatio * alongRatio,
+    },
+    nextSweepStart,
+    sweepDirection,
+  );
+  if (normLocal(subtractLocal(approachPoint, previousPoint)) <= 0.5) {
+    return turnaroundPathLocal;
+  }
+
+  return [...turnaroundPathLocal.slice(0, -1), approachPoint, nextSweepStart];
+};
+
 const connectSweepLinesUsingDynamicFlightTurn = (
   sweepLines: LngLat[][],
   gridPoints: LngLat[],
@@ -1202,6 +1330,8 @@ const connectSweepLinesUsingDynamicFlightTurn = (
     const turnBlockGeometry = buildTurnBlockGeometry(
       gridPoints,
       sweepIndex,
+      sweepLines[sweepIndex]!,
+      sweepLines[sweepIndex + 1]!,
       referenceCoordinate,
       lineSpacing,
       flightTurnModel.defaultTurnaroundRadiusM,
@@ -1241,6 +1371,10 @@ const connectSweepLinesUsingDynamicFlightTurn = (
     }
 
     if (turnaroundLine && turnaroundLine.length > 0) {
+      turnaroundLine = blendTurnaroundEndIntoSweep(
+        turnaroundLine,
+        sweepLines[sweepIndex + 1]!,
+      );
       const sweepToTurnJoin = buildSmoothJoinToLineStart(stitchedSweepLine, turnaroundLine);
       if (sweepToTurnJoin.length > 0) {
         turnaroundLine = dedupeCoordinates([
