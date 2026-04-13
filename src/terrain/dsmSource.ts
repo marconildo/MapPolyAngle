@@ -1,6 +1,3 @@
-import { fromArrayBuffer, fromBlob } from "geotiff";
-import { convertCoordinates, toProj4 } from "geotiff-geokeys-to-proj4";
-import proj4 from "proj4";
 import { tileMetersBounds } from "@/overlap/mercator";
 import type { Bounds, DsmSourceDescriptor, LngLatBounds } from "./types";
 
@@ -30,10 +27,35 @@ let dsmState: DsmSourceState = {
 };
 let loadGeneration = 0;
 
+type GeoTiffDependencies = {
+  fromArrayBuffer: typeof import("geotiff")["fromArrayBuffer"];
+  fromBlob: typeof import("geotiff")["fromBlob"];
+  convertCoordinates: typeof import("geotiff-geokeys-to-proj4")["convertCoordinates"];
+  toProj4: typeof import("geotiff-geokeys-to-proj4")["toProj4"];
+  proj4: (...args: any[]) => any;
+};
+
+let geoTiffDependenciesPromise: Promise<GeoTiffDependencies> | null = null;
+
 const EXTRA_SAMPLE_ASSOC_ALPHA = 1;
 const EXTRA_SAMPLE_UNASS_ALPHA = 2;
 const INVALID_DSM_LAYOUT_MESSAGE =
   "This file is not a DSM. Upload a single-band elevation GeoTIFF; RGB/RGBA ortho imagery is not supported.";
+
+function loadGeoTiffDependencies(): Promise<GeoTiffDependencies> {
+  const promise = geoTiffDependenciesPromise ?? (geoTiffDependenciesPromise = Promise.all([
+      import("geotiff"),
+      import("geotiff-geokeys-to-proj4"),
+      import("proj4"),
+    ]).then(([geotiff, geoKeys, proj4Module]) => ({
+      fromArrayBuffer: geotiff.fromArrayBuffer,
+      fromBlob: geotiff.fromBlob,
+      convertCoordinates: geoKeys.convertCoordinates,
+      toProj4: geoKeys.toProj4,
+      proj4: ((proj4Module as unknown as { default?: unknown }).default ?? proj4Module) as (...args: any[]) => any,
+    })));
+  return promise;
+}
 
 function emit() {
   for (const listener of listeners) listener();
@@ -134,6 +156,7 @@ function validateDsmSampleLayout(image: any): void {
 }
 
 async function inspectDsmGeoTiffFile(file: File): Promise<Omit<LoadedDsmSource, "file">> {
+  const { fromArrayBuffer, fromBlob, toProj4 } = await loadGeoTiffDependencies();
   const tiff = typeof FileReader === "function"
     ? await fromBlob(file)
     : await fromArrayBuffer(await file.arrayBuffer());
@@ -155,8 +178,8 @@ async function inspectDsmGeoTiffFile(file: File): Promise<Omit<LoadedDsmSource, 
 
   const [minX, minY, maxX, maxY] = image.getBoundingBox();
   const sourceBounds = { minX, minY, maxX, maxY };
-  const footprint3857 = toProjectedBounds3857(sourceProj4, sourceBounds);
-  const footprintLngLat = toFootprintLngLat(sourceProj4, sourceBounds);
+  const footprint3857 = await toProjectedBounds3857(sourceProj4, sourceBounds);
+  const footprintLngLat = await toFootprintLngLat(sourceProj4, sourceBounds);
   const noDataRaw = image.getGDALNoData();
   const noDataValue = noDataRaw == null ? null : Number.parseFloat(String(noDataRaw));
   const descriptor: DsmSourceDescriptor = {
@@ -206,7 +229,8 @@ function sourcePointToPixel(dsm: LoadedDsmSource, sourceX: number, sourceY: numb
   };
 }
 
-function toProjectedBounds3857(sourceProj4: string, sourceBounds: Bounds): Bounds {
+async function toProjectedBounds3857(sourceProj4: string, sourceBounds: Bounds): Promise<Bounds> {
+  const { proj4 } = await loadGeoTiffDependencies();
   const sourceCorners: Array<[number, number]> = [
     [sourceBounds.minX, sourceBounds.maxY],
     [sourceBounds.maxX, sourceBounds.maxY],
@@ -219,7 +243,8 @@ function toProjectedBounds3857(sourceProj4: string, sourceBounds: Bounds): Bound
   return boundsFromPoints(projected);
 }
 
-function toFootprintLngLat(sourceProj4: string, sourceBounds: Bounds) {
+async function toFootprintLngLat(sourceProj4: string, sourceBounds: Bounds) {
+  const { proj4 } = await loadGeoTiffDependencies();
   const sourceCorners: Array<[number, number]> = [
     [sourceBounds.minX, sourceBounds.maxY],
     [sourceBounds.maxX, sourceBounds.maxY],
@@ -286,6 +311,7 @@ export async function applyActiveDsmToTerrainRgbTile(
 ): Promise<boolean> {
   const dsm = activeDsm;
   if (!dsm) return false;
+  const { convertCoordinates, proj4 } = await loadGeoTiffDependencies();
 
   const tileBounds = tileMetersBounds(z, x, y);
   const tileFootprint = {

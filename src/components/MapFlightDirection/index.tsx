@@ -34,31 +34,30 @@ import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappi
 import type { PlannedFlightGeometry } from '@/domain/types';
 import type { BearingOverride, MapFlightDirectionAPI, ImportedFlightplanArea, TerrainPartitionSolutionPreview, WingtraFreshExportConfig } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
-import { partitionPolygonByTerrainFaces } from '@/utils/terrainFacePartition';
-import { buildPartitionFrontier } from '@/utils/terrainPartitionGraph';
 import { isTerrainPartitionBackendEnabled, solveTerrainPartitionWithBackend } from '@/services/terrainPartitionBackend';
 import { isExactTerrainBackendEnabled, optimizeBearingWithBackend } from '@/services/exactTerrainBackend';
 import type { TerrainSourceSelection } from '@/terrain/types';
-import { tilesCoveringPolygon } from '@/overlap/controller';
 import type { GSDStats, LidarStripMeters, PoseMeters } from '@/overlap/types';
 import { lngLatToMeters, tileMetersBounds } from '@/overlap/mercator';
-import { optimizeBearingExact, type ExactBearingCandidate as SharedExactBearingCandidate, type ExactBearingSearchResult as SharedExactBearingSearchResult } from '@/overlap/exact-region';
-import { withBrowserExactRegionRuntime } from '@/overlap/exactBrowserRuntime';
+import type { ExactBearingCandidate as SharedExactBearingCandidate, ExactBearingSearchResult as SharedExactBearingSearchResult } from '@/overlap/exact-region';
 // @ts-ignore Turf typings are inconsistent in this repo.
 import * as turf from '@turf/turf';
 
-// NEW: Wingtra import helpers
-import { importWingtraFlightPlan } from '@/interop/wingtra/convert';
-import {
-  exportToWingtraFlightPlan,
-  replaceAreaItemsInWingtraFlightPlan,
-  areasFromState,
-  isWingtraFlightPlanTemplateExportReady,
-  resolveFreshWingtraExportPayloadOptionFromAreas,
-} from '@/interop/wingtra/convert';
 import { shouldApplyAsyncPolygonUpdate, shouldRunAsyncGeneration } from '@/state/asyncUpdateGuard';
 import { shouldConsumeClearAllEpoch } from '@/state/clearAllState';
 import { PlannedGeometryWorkerController } from '@/flight/plannedGeometryController';
+
+type ExactRegionModule = typeof import('@/overlap/exact-region');
+type ExactBrowserRuntimeModule = typeof import('@/overlap/exactBrowserRuntime');
+type TerrainFacePartitionModule = typeof import('@/utils/terrainFacePartition');
+type TerrainPartitionGraphModule = typeof import('@/utils/terrainPartitionGraph');
+type WingtraConvertModule = typeof import('@/interop/wingtra/convert');
+
+let exactRegionModulePromise: Promise<ExactRegionModule> | null = null;
+let exactBrowserRuntimeModulePromise: Promise<ExactBrowserRuntimeModule> | null = null;
+let terrainFacePartitionModulePromise: Promise<TerrainFacePartitionModule> | null = null;
+let terrainPartitionGraphModulePromise: Promise<TerrainPartitionGraphModule> | null = null;
+let wingtraConvertModulePromise: Promise<WingtraConvertModule> | null = null;
 
 const CAMERA_REGISTRY: Record<string, any> = {
   SONY_RX1R2,
@@ -81,6 +80,63 @@ const EXACT_MIN_OVERLAP_FOR_GSD = 3;
 const EXACT_OPTIMIZE_TIME_WEIGHT = 0.1;
 const TERRAIN_SPLIT_DEBUG = true;
 const GEOMETRY_RING_EPSILON_DEG = 1e-7;
+
+function loadExactRegionModule(): Promise<ExactRegionModule> {
+  if (!exactRegionModulePromise) {
+    exactRegionModulePromise = import('@/overlap/exact-region');
+  }
+  return exactRegionModulePromise;
+}
+
+function loadExactBrowserRuntimeModule(): Promise<ExactBrowserRuntimeModule> {
+  if (!exactBrowserRuntimeModulePromise) {
+    exactBrowserRuntimeModulePromise = import('@/overlap/exactBrowserRuntime');
+  }
+  return exactBrowserRuntimeModulePromise;
+}
+
+function loadTerrainFacePartitionModule(): Promise<TerrainFacePartitionModule> {
+  if (!terrainFacePartitionModulePromise) {
+    terrainFacePartitionModulePromise = import('@/utils/terrainFacePartition');
+  }
+  return terrainFacePartitionModulePromise;
+}
+
+function loadTerrainPartitionGraphModule(): Promise<TerrainPartitionGraphModule> {
+  if (!terrainPartitionGraphModulePromise) {
+    terrainPartitionGraphModulePromise = import('@/utils/terrainPartitionGraph');
+  }
+  return terrainPartitionGraphModulePromise;
+}
+
+function loadWingtraConvertModule(): Promise<WingtraConvertModule> {
+  if (!wingtraConvertModulePromise) {
+    wingtraConvertModulePromise = import('@/interop/wingtra/convert');
+  }
+  return wingtraConvertModulePromise;
+}
+
+function getPlaneHardwareVersionFromWingtraPayloadUniqueStringLocal(payloadUniqueString: string | undefined): '4' | '5' | undefined {
+  if (!payloadUniqueString) return undefined;
+  if (payloadUniqueString.endsWith('_v4')) return '4';
+  if (payloadUniqueString.endsWith('_v5')) return '5';
+  return undefined;
+}
+
+function isWingtraFlightPlanTemplateExportReadyLocal(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const maybeFlightPlan = (value as { flightPlan?: unknown }).flightPlan;
+  if (!maybeFlightPlan || typeof maybeFlightPlan !== 'object') return false;
+  const items = (maybeFlightPlan as { items?: unknown }).items;
+  const payloadUniqueString = (maybeFlightPlan as { payloadUniqueString?: unknown }).payloadUniqueString;
+  const planeHardwareVersion = (maybeFlightPlan as { planeHardware?: { hwVersion?: unknown } }).planeHardware?.hwVersion;
+  if (!Array.isArray(items)) return false;
+  if (typeof payloadUniqueString !== 'string' || payloadUniqueString.length === 0) return false;
+  if (planeHardwareVersion !== '4' && planeHardwareVersion !== '5') return false;
+  if (getPlaneHardwareVersionFromWingtraPayloadUniqueStringLocal(payloadUniqueString) !== planeHardwareVersion) return false;
+  if (!('geofence' in (value as object)) || !('safety' in (value as object))) return false;
+  return typeof (maybeFlightPlan as { creationTime?: unknown }).creationTime === 'number';
+}
 
 function splitPerfNow() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -430,7 +486,7 @@ interface Props {
   selectedPolygonId?: string | null;
 }
 
-export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>(
+const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Props>(
   (
     {
       mapboxToken,
@@ -920,6 +976,10 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     }): Promise<ExactBearingSearchResult> => {
       const safeParams = sanitizePolygonParams({ ...params, useCustomBearing: false });
       if ('customBearingDeg' in safeParams) delete (safeParams as any).customBearingDeg;
+      const [{ optimizeBearingExact }, { withBrowserExactRegionRuntime }] = await Promise.all([
+        loadExactRegionModule(),
+        loadExactBrowserRuntimeModule(),
+      ]);
       return withBrowserExactRegionRuntime(mapboxToken, async (runtime) => {
         const result = await optimizeBearingExact(runtime, {
           scopeId,
@@ -1928,6 +1988,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         console.log(`📥 Importing Wingtra flightplan...`);
         const parsed = JSON.parse(json);
         setLastImportedFlightplan(parsed);
+        const { importWingtraFlightPlan } = await loadWingtraConvertModule();
         const imported = importWingtraFlightPlan(parsed, { angleConvention: 'northCW' }); // change if you need eastCW
         const areasOut: ImportedFlightplanArea[] = [];
 
@@ -2419,11 +2480,12 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       };
     }, [mapboxToken, onError]);
 
-    const getLocalTerrainPartitionSolutions = useCallback((
+    const getLocalTerrainPartitionSolutions = useCallback(async (
       ring: [number, number][],
       tiles: any[],
       params: PolygonParams,
-    ): TerrainPartitionSolutionPreview[] => {
+    ): Promise<TerrainPartitionSolutionPreview[]> => {
+      const { buildPartitionFrontier } = await loadTerrainPartitionGraphModule();
       const { solutions } = buildPartitionFrontier(ring, tiles, params, {
         tradeoffSamples: DEFAULT_PARTITION_TRADEOFF_SAMPLES,
       });
@@ -2508,7 +2570,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
         }
       }
       const localStartedAt = splitPerfNow();
-      const local = getLocalTerrainPartitionSolutions(ring, tiles, params);
+      const local = await getLocalTerrainPartitionSolutions(ring, tiles, params);
       splitPerfLog(polygonId, 'local partition solutions computed', {
         totalMs: Math.round(splitPerfNow() - localStartedAt),
         solutionCount: local.length,
@@ -2881,6 +2943,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
       }
 
       splitPerfLog(polygonId, 'autoSplitPolygonByTerrain falling back to legacy local partitioner');
+      const { partitionPolygonByTerrainFaces } = await loadTerrainFacePartitionModule();
       const partition = partitionPolygonByTerrainFaces(ring, tiles, {
         ...params,
         useCustomBearing: false,
@@ -3056,8 +3119,14 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
 	      getBearingOverrides: () => Object.fromEntries(bearingOverridesRef.current),
 	      getImportedOriginals: () => Object.fromEntries(importedOriginalsRef.current),
 	      getLastImportedFlightplanName: () => lastImportedFlightplanNameRef.current,
-	      canExportWingtraFlightPlanDirectly: () => isWingtraFlightPlanTemplateExportReady(lastImportedFlightplan),
-	      exportWingtraFlightPlan: (config?: WingtraFreshExportConfig) => {
+	      canExportWingtraFlightPlanDirectly: () => isWingtraFlightPlanTemplateExportReadyLocal(lastImportedFlightplan),
+	      exportWingtraFlightPlan: async (config?: WingtraFreshExportConfig) => {
+        const {
+          areasFromState,
+          exportToWingtraFlightPlan,
+          replaceAreaItemsInWingtraFlightPlan,
+          resolveFreshWingtraExportPayloadOptionFromAreas,
+        } = await loadWingtraConvertModule();
         // Build area list from current state
         const polys: Array<{ ring:[number,number][]; params: PolygonParams; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
         polygonParams.forEach((params, pid) => {
@@ -3089,7 +3158,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
             'Wingtra export requires all current areas to use the same analysis payload and a compatible drone version.',
           );
         }
-        const canUseImportedTemplate = isWingtraFlightPlanTemplateExportReady(lastImportedFlightplan);
+        const canUseImportedTemplate = isWingtraFlightPlanTemplateExportReadyLocal(lastImportedFlightplan);
         let fp;
         if (canUseImportedTemplate) {
           // Deep clone original
@@ -3201,3 +3270,7 @@ export const MapFlightDirection = React.forwardRef<MapFlightDirectionAPI, Props>
     );
   }
 );
+
+MapFlightDirectionComponent.displayName = 'MapFlightDirection';
+
+export const MapFlightDirection = React.memo(MapFlightDirectionComponent);

@@ -112,5 +112,5 @@ export interface MapFlightDirectionAPI {
   canExportWingtraFlightPlanDirectly(): boolean;
 
   // Export current (possibly optimized/edited) plan as Wingtra .flightplan JSON
-  exportWingtraFlightPlan(config?: WingtraFreshExportConfig): { json: string; blob: Blob };
+  exportWingtraFlightPlan(config?: WingtraFreshExportConfig): Promise<{ json: string; blob: Blob }>;
 }
