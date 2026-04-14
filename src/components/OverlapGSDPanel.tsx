@@ -3043,23 +3043,6 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           </Button>
                         )}
 
-                        {!isPoseArea && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="ml-auto h-6 shrink-0 whitespace-nowrap border-red-300 px-1.5 text-[10px] text-red-600 hover:bg-red-50 hover:text-red-700"
-                            disabled={disableStructuralActions}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              mapRef.current?.clearPolygon?.(polygonId);
-                              scheduleGuardedTimeout(() => setSelection(null), 0);
-                            }}
-                            title="Delete polygon"
-                          >
-                            Delete
-                          </Button>
-                        )}
-
                         {!isPoseArea && isMergePrimary && (
                           <>
                             <Button
@@ -3095,6 +3078,23 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                               Cancel
                             </Button>
                           </>
+                        )}
+
+                        {!isPoseArea && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="ml-auto h-6 shrink-0 whitespace-nowrap border-red-300 px-1.5 text-[10px] text-red-600 hover:bg-red-50 hover:text-red-700"
+                            disabled={disableStructuralActions}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              mapRef.current?.clearPolygon?.(polygonId);
+                              scheduleGuardedTimeout(() => setSelection(null), 0);
+                            }}
+                            title="Delete polygon"
+                          >
+                            Delete
+                          </Button>
                         )}
                       </div>
 

@@ -179,6 +179,66 @@ function testSlightlyPerturbedSharedEdgeIsEligible() {
   assert.equal(state.warning, null);
 }
 
+function testNestedReMergedAreaCanMergeBackWithSibling() {
+  const features = [
+    polygonFeature('merged-a1', [
+      [16, 48],
+      [16.0002003, 48],
+      [16.0002003, 48.0002],
+      [16, 48.0002],
+      [16, 48],
+    ], 'terrain-face-merge'),
+    polygonFeature('a2', [
+      [16.0002, 48],
+      [16.0004, 48],
+      [16.0004, 48.0002],
+      [16.0002, 48.0002],
+      [16.0002, 48],
+    ]),
+  ];
+
+  const state = derivePolygonMergeState({
+    features,
+    primaryPolygonId: 'merged-a1',
+    selectedPolygonIds: ['merged-a1'],
+  });
+
+  assert.equal(state.mode, 'selecting');
+  assert.deepEqual(state.selectedPolygonIds, ['merged-a1']);
+  assert.deepEqual(state.eligiblePolygonIds, ['a2']);
+  assert.equal(state.warning, null);
+}
+
+function testSmallBoundaryGapCanStillMergeBack() {
+  const features = [
+    polygonFeature('merged-a1', [
+      [16, 48],
+      [16.0001997, 48],
+      [16.0001997, 48.0002],
+      [16, 48.0002],
+      [16, 48],
+    ], 'terrain-face-merge'),
+    polygonFeature('a2', [
+      [16.0002, 48],
+      [16.0004, 48],
+      [16.0004, 48.0002],
+      [16.0002, 48.0002],
+      [16.0002, 48],
+    ]),
+  ];
+
+  const state = derivePolygonMergeState({
+    features,
+    primaryPolygonId: 'merged-a1',
+    selectedPolygonIds: ['merged-a1'],
+  });
+
+  assert.equal(state.mode, 'selecting');
+  assert.deepEqual(state.selectedPolygonIds, ['merged-a1']);
+  assert.deepEqual(state.eligiblePolygonIds, ['a2']);
+  assert.equal(state.warning, null);
+}
+
 function testSplitMergeUndoRedoPreservesMetadataAndSelection() {
   const parent = polygonSnapshot('parent', square(0, 0, 2, 1), {
     altitudeAGL: 120,
@@ -335,6 +395,8 @@ testPointTouchOnlyPolygonIsRejected();
 testHoleProducingMergeIsRejected();
 testChainedMergeUpdatesEligibility();
 testSlightlyPerturbedSharedEdgeIsEligible();
+testNestedReMergedAreaCanMergeBackWithSibling();
+testSmallBoundaryGapCanStillMergeBack();
 testSplitMergeUndoRedoPreservesMetadataAndSelection();
 testClearingRedoPreservesUndoHistory();
 

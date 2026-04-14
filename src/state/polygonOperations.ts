@@ -35,6 +35,8 @@ const AREA_EPSILON_M2 = 0.01;
 const SHARED_BOUNDARY_MIN_METERS = 1;
 const COORD_EPSILON_DEG = 1e-10;
 const SHARED_BOUNDARY_TOLERANCE_KM = 0.0001;
+const SHARED_BOUNDARY_SLOP_METERS = 0.25;
+const OVERLAP_WIDTH_TOLERANCE_METERS = 0.25;
 
 function roundCoordPair(coord: [number, number]): [number, number] {
   return [Number(coord[0].toFixed(12)), Number(coord[1].toFixed(12))];
@@ -145,16 +147,82 @@ function singleOuterRingFromFeature(feature: any): [number, number][] | null {
 }
 
 function sharedBoundaryMeters(featureA: any, featureB: any): number {
+  let strictLengthMeters = 0;
   try {
     const overlap = turf.lineOverlap(featureA, featureB, {
       tolerance: SHARED_BOUNDARY_TOLERANCE_KM,
     });
-    return overlap.features.reduce((total: number, feature: any) => {
+    strictLengthMeters = overlap.features.reduce((total: number, feature: any) => {
       if (!feature?.geometry) return total;
       return total + (turf.length(feature, { units: 'kilometers' }) * 1000);
     }, 0);
   } catch {
-    return 0;
+    strictLengthMeters = 0;
+  }
+
+  const ringA = singleOuterRingFromFeature(featureA);
+  const ringB = singleOuterRingFromFeature(featureB);
+  if (!ringA || !ringB) return strictLengthMeters;
+
+  const averageLatitudeDeg = [...ringA, ...ringB].reduce((sum, coord) => sum + coord[1], 0) / (ringA.length + ringB.length);
+  const latScale = 111_320;
+  const lonScale = Math.max(1e-6, Math.cos((averageLatitudeDeg * Math.PI) / 180)) * 111_320;
+  const toLocalMeters = (coord: [number, number]) => ({
+    x: coord[0] * lonScale,
+    y: coord[1] * latScale,
+  });
+  const segmentsA = ringA.slice(0, -1).map((start, index) => [toLocalMeters(start), toLocalMeters(ringA[index + 1])] as const);
+  const segmentsB = ringB.slice(0, -1).map((start, index) => [toLocalMeters(start), toLocalMeters(ringB[index + 1])] as const);
+
+  const tolerantLengthMeters = segmentsA.reduce((total, [a0, a1]) => {
+    const ax = a1.x - a0.x;
+    const ay = a1.y - a0.y;
+    const aLen = Math.hypot(ax, ay);
+    if (aLen <= 1e-6) return total;
+    const ux = ax / aLen;
+    const uy = ay / aLen;
+
+    let bestOverlap = 0;
+    for (const [b0, b1] of segmentsB) {
+      const bx = b1.x - b0.x;
+      const by = b1.y - b0.y;
+      const bLen = Math.hypot(bx, by);
+      if (bLen <= 1e-6) continue;
+      const vx = bx / bLen;
+      const vy = by / bLen;
+      const parallelScore = Math.abs(ux * vy - uy * vx);
+      if (parallelScore > 0.08) continue;
+
+      const offset0 = Math.abs((b0.x - a0.x) * uy - (b0.y - a0.y) * ux);
+      const offset1 = Math.abs((b1.x - a0.x) * uy - (b1.y - a0.y) * ux);
+      if (Math.max(offset0, offset1) > SHARED_BOUNDARY_SLOP_METERS) continue;
+
+      const proj0 = (b0.x - a0.x) * ux + (b0.y - a0.y) * uy;
+      const proj1 = (b1.x - a0.x) * ux + (b1.y - a0.y) * uy;
+      const overlapStart = Math.max(0, Math.min(proj0, proj1));
+      const overlapEnd = Math.min(aLen, Math.max(proj0, proj1));
+      const overlapLength = overlapEnd - overlapStart;
+      if (overlapLength > bestOverlap) bestOverlap = overlapLength;
+    }
+
+    return total + bestOverlap;
+  }, 0);
+
+  return Math.max(strictLengthMeters, tolerantLengthMeters);
+}
+
+function bufferedUnionPolygonFeatures(a: any, b: any) {
+  const bufferFn = (turf as any).buffer;
+  if (typeof bufferFn !== 'function') return null;
+  try {
+    const bufferedA = bufferFn(a, SHARED_BOUNDARY_SLOP_METERS, { units: 'meters' });
+    const bufferedB = bufferFn(b, SHARED_BOUNDARY_SLOP_METERS, { units: 'meters' });
+    const union = unionPolygonFeatures(bufferedA, bufferedB);
+    if (!union) return null;
+    const unbuffered = bufferFn(union, -SHARED_BOUNDARY_SLOP_METERS, { units: 'meters' });
+    return normalizePolygonFeature(unbuffered);
+  } catch {
+    return null;
   }
 }
 
@@ -175,19 +243,24 @@ function evaluateMergeCandidate(
   unionFeature: any,
   candidateFeature: any,
 ) {
-  const intersection = intersectPolygonFeatures(unionFeature, candidateFeature);
-  const intersectionArea = intersection ? turf.area(intersection) : 0;
-  if (intersectionArea > AREA_EPSILON_M2) {
-    return { ok: false as const, reason: 'Overlapping polygons cannot be merged.' };
-  }
-
   const boundaryMeters = sharedBoundaryMeters(unionFeature, candidateFeature);
   if (boundaryMeters < SHARED_BOUNDARY_MIN_METERS) {
     return { ok: false as const, reason: 'Only polygons sharing a boundary can be merged.' };
   }
 
-  const union = unionPolygonFeatures(unionFeature, candidateFeature);
-  const ring = singleOuterRingFromFeature(union);
+  const intersection = intersectPolygonFeatures(unionFeature, candidateFeature);
+  const intersectionArea = intersection ? turf.area(intersection) : 0;
+  const overlapWidthMeters = boundaryMeters > 1e-6 ? intersectionArea / boundaryMeters : Number.POSITIVE_INFINITY;
+  if (intersectionArea > AREA_EPSILON_M2 && overlapWidthMeters > OVERLAP_WIDTH_TOLERANCE_METERS) {
+    return { ok: false as const, reason: 'Overlapping polygons cannot be merged.' };
+  }
+
+  let union = unionPolygonFeatures(unionFeature, candidateFeature);
+  let ring = singleOuterRingFromFeature(union);
+  if (!union || !ring) {
+    union = bufferedUnionPolygonFeatures(unionFeature, candidateFeature);
+    ring = singleOuterRingFromFeature(union);
+  }
   if (!union || !ring) {
     return { ok: false as const, reason: 'Merge would create holes or multiple polygons.' };
   }
