@@ -43,6 +43,55 @@ export interface WingtraFreshExportConfig {
   payloadName?: string;
 }
 
+export interface PolygonImportedOriginal {
+  bearingDeg: number;
+  lineSpacingM: number;
+}
+
+export interface PolygonFeatureSnapshot {
+  type: 'Feature';
+  id: string;
+  properties: Record<string, any>;
+  geometry: {
+    type: 'Polygon';
+    coordinates: [[number, number][]];
+  };
+}
+
+export interface PolygonSnapshot {
+  feature: PolygonFeatureSnapshot;
+  params?: FlightParams;
+  override?: BearingOverride;
+  importedOriginal?: PolygonImportedOriginal;
+}
+
+export interface PolygonOperationTransaction {
+  kind: 'split' | 'merge';
+  label: string;
+  before: PolygonSnapshot[];
+  after: PolygonSnapshot[];
+  selectionBefore: string | null;
+  selectionAfter: string | null;
+}
+
+export interface PolygonMergeState {
+  mode: 'idle' | 'selecting';
+  primaryPolygonId: string | null;
+  selectedPolygonIds: string[];
+  eligiblePolygonIds: string[];
+  previewRing: [number, number][] | null;
+  canConfirm: boolean;
+  warning: string | null;
+}
+
+export interface PolygonHistoryState {
+  isApplyingOperation: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoLabel?: string;
+  redoLabel?: string;
+}
+
 export interface MapFlightDirectionAPI {
   // Core map operations
   clearAllDrawings(): void;
@@ -63,6 +112,15 @@ export interface MapFlightDirectionAPI {
     polygonId: string,
     solution: TerrainPartitionSolutionPreview,
   ): Promise<{ createdIds: string[]; replaced: boolean }>;
+  startPolygonMerge(polygonId: string): void;
+  cancelPolygonMerge(): void;
+  canStartPolygonMerge(polygonId: string): boolean;
+  togglePolygonMergeCandidate(polygonId: string): void;
+  confirmPolygonMerge(): Promise<{ mergedPolygonId: string | null; replaced: boolean }>;
+  undoPolygonOperation(): Promise<boolean>;
+  redoPolygonOperation(): Promise<boolean>;
+  canUndoPolygonOperation(): boolean;
+  canRedoPolygonOperation(): boolean;
   startPolygonDrawing(): void;
   getMap(): MapboxMap | undefined;
 
@@ -107,7 +165,7 @@ export interface MapFlightDirectionAPI {
   revertPolygonToImportedDirection(polygonId: string): void;         // re-apply file heading/spacing
   runFullAnalysis(polygonId: string): void;                          // run complete analysis pipeline (as if manually drawn)
   getBearingOverrides(): Record<string, BearingOverride>;
-  getImportedOriginals(): Record<string, { bearingDeg: number; lineSpacingM: number }>;
+  getImportedOriginals(): Record<string, PolygonImportedOriginal>;
   getLastImportedFlightplanName(): string | undefined;
   canExportWingtraFlightPlanDirectly(): boolean;
 

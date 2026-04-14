@@ -27,6 +27,22 @@ export function createHomeClearAllState() {
     overrides: {} as Record<string, unknown>,
     importedPoseCount: 0,
     selectedPolygonId: null as string | null,
+    mergeState: {
+      mode: 'idle' as const,
+      primaryPolygonId: null as string | null,
+      selectedPolygonIds: [] as string[],
+      eligiblePolygonIds: [] as string[],
+      previewRing: null as [number, number][] | null,
+      canConfirm: false,
+      warning: null as string | null,
+    },
+    historyState: {
+      isApplyingOperation: false,
+      canUndo: false,
+      canRedo: false,
+      undoLabel: undefined as string | undefined,
+      redoLabel: undefined as string | undefined,
+    },
   };
 }
 

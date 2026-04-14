@@ -21,6 +21,7 @@
     "test:async-update-guard": "npx --yes tsx src/tests/async_update_guard.test.ts",
     "test:overlay-clear": "npx --yes tsx src/tests/overlay_clear.test.ts",
     "test:metric-aggregation": "npx --yes tsx src/tests/metric_aggregation.test.ts",
+    "test:polygon-operations": "npx --yes tsx src/tests/polygon_operations.test.ts",
     "test:flight-path-sweeps": "npx --yes tsx src/tests/flight_path_sweeps.test.ts",
     "test:exact-core": "npx --yes tsx src/tests/exact_core.test.ts",
     "test:exact-region": "npx --yes tsx src/tests/exact_region.test.ts",
