@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useState, useRef, useCallback, useMemo } from 'react';
-import type { BearingOverride, MapFlightDirectionAPI } from '@/components/MapFlightDirection/api';
+import type { BearingOverride, MapFlightDirectionAPI, PolygonHistoryState, PolygonMergeState } from '@/components/MapFlightDirection/api';
 import type { PolygonAnalysisResult } from '@/components/MapFlightDirection/types';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal, ChevronUp } from 'lucide-react';
+import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal, ChevronUp, Undo2, Redo2 } from 'lucide-react';
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
@@ -115,6 +115,22 @@ export default function Home() {
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
   const [overrides, setOverrides] = useState<Record<string, BearingOverride>>({});
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
+  const [mergeState, setMergeState] = useState<PolygonMergeState>({
+    mode: 'idle',
+    primaryPolygonId: null,
+    selectedPolygonIds: [],
+    eligiblePolygonIds: [],
+    previewRing: null,
+    canConfirm: false,
+    warning: null,
+  });
+  const [historyState, setHistoryState] = useState<PolygonHistoryState>({
+    isApplyingOperation: false,
+    canUndo: false,
+    canRedo: false,
+    undoLabel: undefined,
+    redoLabel: undefined,
+  });
   const [terrainSourceState, setTerrainSourceState] = useState<TerrainSourceState>(() => getTerrainSourceState());
   const [imageryOverlayState, setImageryOverlayState] = useState<ImageryOverlayState>(() => getImageryOverlayState());
   const [showTerrainSource, setShowTerrainSource] = useState(false);
@@ -421,6 +437,22 @@ export default function Home() {
     clearGSDRef.current?.();
   }, []);
 
+  const handleMergeStateChange = useCallback((state: PolygonMergeState) => {
+    setMergeState(state);
+  }, []);
+
+  const handleHistoryStateChange = useCallback((state: PolygonHistoryState) => {
+    setHistoryState(state);
+  }, []);
+
+  const handleUndoPolygonOperation = useCallback(() => {
+    void mapRef.current?.undoPolygonOperation?.();
+  }, []);
+
+  const handleRedoPolygonOperation = useCallback(() => {
+    void mapRef.current?.redoPolygonOperation?.();
+  }, []);
+
   const handleTerrainSourceReady = useCallback((readyTerrainSource: TerrainSourceState['source']) => {
     const readyKey = `${readyTerrainSource.mode}:${readyTerrainSource.datasetId ?? ''}`;
     lastReadyTerrainKeyRef.current = readyKey;
@@ -455,6 +487,8 @@ export default function Home() {
     setOverrides(clearedState.overrides as Record<string, BearingOverride>);
     setImportedPoseCount(clearedState.importedPoseCount);
     setSelectedPolygonId(clearedState.selectedPolygonId);
+    setMergeState(clearedState.mergeState);
+    setHistoryState(clearedState.historyState);
   }, [cancelPendingCoverageAutoRun]);
 
   const fitMapToGeoTiffDescriptor = useCallback((descriptor: Pick<GeoTiffSourceDescriptor, 'footprintLngLat'>) => {
@@ -853,6 +887,8 @@ export default function Home() {
             polygonAnalyses={polygonResults}
             overrides={overrides}
             importedOriginals={importedOriginals}
+            mergeState={mergeState}
+            historyState={historyState}
             selectedPolygonId={selectedPolygonId}
             onSelectPolygon={setSelectedPolygonId}
           />
@@ -882,6 +918,30 @@ export default function Home() {
             )}
           </div>
           <div className="flex min-w-0 flex-1 items-center gap-2 md:w-auto md:flex-none md:justify-end">
+            <Button
+              size="sm"
+              variant="outline"
+              className={headerButtonClassName}
+              onClick={handleUndoPolygonOperation}
+              disabled={historyState.isApplyingOperation || !historyState.canUndo}
+              title={historyState.undoLabel ? `Undo ${historyState.undoLabel}` : 'Undo'}
+            >
+              <Undo2 className="w-3 h-3 mr-1" />
+              Undo
+            </Button>
+
+            <Button
+              size="sm"
+              variant="outline"
+              className={headerButtonClassName}
+              onClick={handleRedoPolygonOperation}
+              disabled={historyState.isApplyingOperation || !historyState.canRedo}
+              title={historyState.redoLabel ? `Redo ${historyState.redoLabel}` : 'Redo'}
+            >
+              <Redo2 className="w-3 h-3 mr-1" />
+              Redo
+            </Button>
+
             {/* Consolidated Import dropdown */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -1099,7 +1159,7 @@ export default function Home() {
 
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
-          <div className="absolute top-2 right-2 z-40 w-[500px] max-w-[90vw] max-h-[calc(100vh-120px)] overflow-y-auto">
+          <div className="absolute top-2 right-2 z-40 w-[540px] max-w-[92vw] max-h-[calc(100vh-120px)] overflow-y-auto">
 
           {/* Unified Analysis Panel */}
           <Card className="backdrop-blur-md bg-white/95">
@@ -1132,6 +1192,8 @@ export default function Home() {
             onFlightLinesUpdated={handleFlightLinesUpdated}
             onClearGSD={handleClearGsd}
             onPolygonSelected={setSelectedPolygonId}
+            onMergeStateChange={handleMergeStateChange}
+            onHistoryStateChange={handleHistoryStateChange}
             selectedPolygonId={selectedPolygonId}
           />
         </Suspense>

@@ -61,6 +61,22 @@ function testHomeClearAllStateResetsSelectionAndDialogState() {
   assert.deepEqual(cleared.overrides, {});
   assert.equal(cleared.importedPoseCount, 0);
   assert.equal(cleared.selectedPolygonId, null);
+  assert.deepEqual(cleared.mergeState, {
+    mode: 'idle',
+    primaryPolygonId: null,
+    selectedPolygonIds: [],
+    eligiblePolygonIds: [],
+    previewRing: null,
+    canConfirm: false,
+    warning: null,
+  });
+  assert.deepEqual(cleared.historyState, {
+    isApplyingOperation: false,
+    canUndo: false,
+    canRedo: false,
+    undoLabel: undefined,
+    redoLabel: undefined,
+  });
 }
 
 function testClearAllEpochIsConsumedOnlyOncePerValue() {

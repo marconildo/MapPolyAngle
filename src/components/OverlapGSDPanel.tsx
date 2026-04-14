@@ -13,7 +13,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
-import type { BearingOverride, MapFlightDirectionAPI, TerrainPartitionSolutionPreview } from "@/components/MapFlightDirection/api";
+import type { BearingOverride, MapFlightDirectionAPI, PolygonHistoryState, PolygonMergeState, TerrainPartitionSolutionPreview } from "@/components/MapFlightDirection/api";
 import type { FlightParams, LidarReturnMode, TerrainTile } from "@/domain/types";
 import { extractPoses, wgs84ToWebMercator, extractCameraModel } from "@/utils/djiGeotags";
 import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/types";
@@ -40,6 +40,8 @@ type Props = {
   polygonAnalyses: PolygonAnalysisResult[];
   overrides: Record<string, BearingOverride>;
   importedOriginals: Record<string, { bearingDeg: number; lineSpacingM: number }>;
+  mergeState: PolygonMergeState;
+  historyState: PolygonHistoryState;
   selectedPolygonId?: string | null;
   onSelectPolygon?: (id: string | null) => void;
 };
@@ -272,7 +274,7 @@ function lidarStripMayAffectTile(
     minYs > bounds.maxY
   );
 }
-export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, mergeState, historyState, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
     SONY_RX1R3,
@@ -2860,6 +2862,11 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
             const areaAcres = stats?.areaAcres ?? 0;
             const isSelected = activeSelectedId === polygonId;
             const isPoseArea = polygonId === '__POSES__';
+            const isMergeMode = mergeState.mode === 'selecting';
+            const isMergePrimary = isMergeMode && mergeState.primaryPolygonId === polygonId;
+            const isPolygonOperationApplying = historyState.isApplyingOperation;
+            const disableStructuralActions = isMergeMode || isPolygonOperationApplying;
+            const canStartMerge = !isPoseArea && !disableStructuralActions && !!mapRef.current?.canStartPolygonMerge?.(polygonId);
 
             return (
               <Card
@@ -2878,6 +2885,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                     type="button"
                     className="flex w-full items-center justify-between gap-3 text-left"
                     onClick={() => {
+                      if (isMergeMode || isPolygonOperationApplying) return;
                       if (isSelected) {
                         setSelection(null);
                         return;
@@ -2898,12 +2906,13 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
                   {isSelected && (
                     <>
-                      <div className="flex flex-wrap gap-1.5 sm:gap-2">
+                      <div className="flex flex-nowrap items-center gap-1 overflow-x-auto pb-1">
                         {!isPoseArea && (
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 whitespace-nowrap px-1.5 text-[10px] sm:text-[11px]"
+                            className="h-6 shrink-0 whitespace-nowrap px-1.5 text-[10px]"
+                            disabled={disableStructuralActions}
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelection(polygonId);
@@ -2919,7 +2928,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           <Button
                             size="sm"
                             variant="secondary"
-                            className="h-6 whitespace-nowrap border border-input bg-background px-1.5 text-[10px] hover:bg-accent hover:text-accent-foreground sm:text-[11px]"
+                            className="h-6 shrink-0 whitespace-nowrap border border-input bg-background px-1.5 text-[10px] hover:bg-accent hover:text-accent-foreground"
+                            disabled={disableStructuralActions}
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelection(polygonId);
@@ -2936,8 +2946,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 whitespace-nowrap px-1.5 text-[10px] sm:text-[11px]"
-                            disabled={!!splittingPolygonIds[polygonId]}
+                            className="h-6 shrink-0 whitespace-nowrap px-1.5 text-[10px]"
+                            disabled={!!splittingPolygonIds[polygonId] || disableStructuralActions}
                             onClick={async (e) => {
                               e.stopPropagation();
                               setSelection(polygonId);
@@ -2993,18 +3003,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                                   return next;
                                 });
                               }
-                            }}
+                          }}
                             title="Auto split this area into a few terrain-aligned faces"
                           >
-                            {!!splittingPolygonIds[polygonId] ? 'Splitting' : 'Auto Split'}
+                            {!!splittingPolygonIds[polygonId] ? 'Auto Split' : 'Auto Split'}
                           </Button>
                         )}
 
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-6 whitespace-nowrap px-1.5 text-[10px] sm:text-[11px]"
-                          disabled={isPoseArea}
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 shrink-0 whitespace-nowrap px-1.5 text-[10px]"
+                          disabled={isPoseArea || disableStructuralActions}
                           onClick={(e) => {
                             e.stopPropagation();
                             mapRef.current?.optimizePolygonDirection?.(polygonId);
@@ -3015,11 +3025,30 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                           Auto Direction
                         </Button>
 
+                        {!isPoseArea && !isMergeMode && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 shrink-0 whitespace-nowrap border-blue-300 px-1.5 text-[10px] text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+                            disabled={!canStartMerge}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelection(polygonId);
+                              highlightPolygon(polygonId);
+                              mapRef.current?.startPolygonMerge?.(polygonId);
+                            }}
+                            title="Merge this autosplit area with touching autosplit neighbors"
+                          >
+                            Merge
+                          </Button>
+                        )}
+
                         {!isPoseArea && (
                           <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 whitespace-nowrap border-red-300 px-1.5 text-[10px] text-red-600 hover:bg-red-50 hover:text-red-700 sm:ml-auto sm:text-[11px]"
+                            className="ml-auto h-6 shrink-0 whitespace-nowrap border-red-300 px-1.5 text-[10px] text-red-600 hover:bg-red-50 hover:text-red-700"
+                            disabled={disableStructuralActions}
                             onClick={(e) => {
                               e.stopPropagation();
                               mapRef.current?.clearPolygon?.(polygonId);
@@ -3030,7 +3059,51 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                             Delete
                           </Button>
                         )}
+
+                        {!isPoseArea && isMergePrimary && (
+                          <>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 shrink-0 whitespace-nowrap border-blue-300 px-1.5 text-[10px] text-blue-700 hover:bg-blue-50 hover:text-blue-800"
+                              disabled={isPolygonOperationApplying || !mergeState.canConfirm}
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                const result = await mapRef.current?.confirmPolygonMerge?.();
+                                if (result?.replaced) {
+                                  resetComputedAnalysisState();
+                                  setSelection(result.mergedPolygonId ?? null);
+                                }
+                              }}
+                              title="Merge the selected autosplit polygons"
+                            >
+                              Merge {mergeState.selectedPolygonIds.length}
+                            </Button>
+
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 shrink-0 whitespace-nowrap px-1.5 text-[10px]"
+                              disabled={isPolygonOperationApplying}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                mapRef.current?.cancelPolygonMerge?.();
+                                setSelection(polygonId);
+                              }}
+                              title="Cancel merge mode"
+                            >
+                              Cancel
+                            </Button>
+                          </>
+                        )}
                       </div>
+
+                      {isMergePrimary && (
+                        <div className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-[11px] text-blue-800">
+                          Select touching autosplit polygons on the map to add them to this merge preview.
+                          {mergeState.warning ? ` ${mergeState.warning}` : ''}
+                        </div>
+                      )}
 
                       {metricStats ? (() => {
                         const displayStats = metricSummaryValues(metricStats);
