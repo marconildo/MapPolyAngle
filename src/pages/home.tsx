@@ -143,6 +143,7 @@ export default function Home() {
   }>(null);
   const [exportNameDialogOpen, setExportNameDialogOpen] = useState(false);
   const [exportNameDraft, setExportNameDraft] = useState('exported');
+  const [isExportingFlightplan, setIsExportingFlightplan] = useState(false);
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
   const [clearAllEpoch, setClearAllEpoch] = useState(0);
@@ -660,20 +661,23 @@ export default function Home() {
   }, []);
 
   const handleExportWingtra = useCallback(() => {
+    if (isExportingFlightplan) return;
     const api = mapRef.current;
     if (!api?.exportWingtraFlightPlan) return;
 
     const suggestedName = stripFlightplanExtension(api.getLastImportedFlightplanName?.());
     setExportNameDraft(suggestedName);
     setExportNameDialogOpen(true);
-  }, []);
+  }, [isExportingFlightplan]);
 
   const handleConfirmWingtraExport = useCallback(() => {
+    if (isExportingFlightplan) return;
     void (async () => {
       const api = mapRef.current;
       if (!api?.exportWingtraFlightPlan) return;
 
       try {
+        setIsExportingFlightplan(true);
         const { blob } = await api.exportWingtraFlightPlan();
         downloadFlightplanBlob(blob, normalizeFlightplanFilename(exportNameDraft));
         setExportNameDialogOpen(false);
@@ -683,9 +687,11 @@ export default function Home() {
           title: 'Export failed',
           description: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        setIsExportingFlightplan(false);
       }
     })();
-  }, [exportNameDraft]);
+  }, [exportNameDraft, isExportingFlightplan]);
 
   if (!mapboxToken) {
     return (
@@ -977,13 +983,20 @@ export default function Home() {
             {/* Consolidated Export dropdown */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline" className={headerButtonClassName} title="Export data">
-                  <Download className="w-3 h-3 mr-1" /> Export ▾
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className={headerButtonClassName}
+                  title={isExportingFlightplan ? 'Export in progress' : 'Export data'}
+                  disabled={isExportingFlightplan}
+                >
+                  {isExportingFlightplan ? <LoadingSpinner size="sm" /> : <Download className="w-3 h-3 mr-1" />}
+                  {isExportingFlightplan ? 'Exporting…' : 'Export ▾'}
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-48">
                 <DropdownMenuLabel>Export</DropdownMenuLabel>
-                <DropdownMenuItem onSelect={handleExportWingtra}>
+                <DropdownMenuItem onSelect={handleExportWingtra} disabled={isExportingFlightplan}>
                   Wingtra Flightplan
                 </DropdownMenuItem>
                 {/* Future export targets */}
@@ -1022,7 +1035,13 @@ export default function Home() {
           </div>
         )}
 
-        <Dialog open={exportNameDialogOpen} onOpenChange={setExportNameDialogOpen}>
+        <Dialog
+          open={exportNameDialogOpen}
+          onOpenChange={(nextOpen) => {
+            if (isExportingFlightplan) return;
+            setExportNameDialogOpen(nextOpen);
+          }}
+        >
           <DialogContent className="sm:max-w-md">
             <DialogHeader>
               <DialogTitle>Export Wingtra Flightplan</DialogTitle>
@@ -1034,8 +1053,9 @@ export default function Home() {
                 value={exportNameDraft}
                 onChange={(event) => setExportNameDraft(event.target.value)}
                 placeholder="exported"
+                disabled={isExportingFlightplan}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
+                  if (event.key === 'Enter' && !isExportingFlightplan) {
                     event.preventDefault();
                     handleConfirmWingtraExport();
                   }
@@ -1044,13 +1064,30 @@ export default function Home() {
               <div className="text-xs text-slate-500">
                 Saved as <span className="font-mono">{normalizeFlightplanFilename(exportNameDraft)}</span>
               </div>
+              {isExportingFlightplan ? (
+                <div className="flex items-center gap-2 text-xs text-slate-600">
+                  <LoadingSpinner size="sm" />
+                  <span>Optimizing sequence and preparing export…</span>
+                </div>
+              ) : null}
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setExportNameDialogOpen(false)}>
+              <Button
+                variant="outline"
+                onClick={() => setExportNameDialogOpen(false)}
+                disabled={isExportingFlightplan}
+              >
                 Cancel
               </Button>
-              <Button onClick={handleConfirmWingtraExport}>
-                Export
+              <Button onClick={handleConfirmWingtraExport} disabled={isExportingFlightplan}>
+                {isExportingFlightplan ? (
+                  <>
+                    <LoadingSpinner size="sm" />
+                    Exporting…
+                  </>
+                ) : (
+                  'Export'
+                )}
               </Button>
             </DialogFooter>
           </DialogContent>

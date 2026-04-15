@@ -986,6 +986,21 @@ def optimize_area_sequence_endpoint(
     request: MissionOptimizeAreaSequenceRequest,
 ) -> MissionOptimizeAreaSequenceResponse:
     request_id = uuid.uuid4().hex[:12]
+    started_at = time.perf_counter()
+    area_ids = [area.polygonId for area in request.areas]
+    logger.info(
+        "[terrain-split-sequence][%s] start areaCount=%d areaIds=%s terrainMode=%s datasetId=%s altitudeMode=%s minClearanceM=%.1f maxHeightAboveGroundM=%.1f exactSearchMaxAreas=%d transferCostOverride=%s",
+        request_id,
+        len(request.areas),
+        ",".join(area_ids) if area_ids else "<none>",
+        request.terrainSource.mode,
+        request.terrainSource.datasetId or "<none>",
+        request.altitudeMode,
+        float(request.minClearanceM),
+        float(request.maxHeightAboveGroundM),
+        int(request.exactSearchMaxAreas),
+        "yes" if request.transferCost is not None else "no",
+    )
     try:
         grid_step_m = choose_grid_step_m(
             sum(float(ring_to_polygon_mercator(area.ring).area) for area in request.areas)
@@ -998,8 +1013,25 @@ def optimize_area_sequence_endpoint(
             dsm_store=DSM_DATASET_STORE,
             lazy_load_missing=True,
         )
-        return optimize_area_sequence(request, dem, request_id=request_id)
+        response = optimize_area_sequence(request, dem, request_id=request_id)
+        logger.info(
+            "[terrain-split-sequence][%s] done elapsedMs=%.1f solveMode=%s exact=%s areas=%d connections=%d totalTransferCost=%.3f",
+            request_id,
+            (time.perf_counter() - started_at) * 1000.0,
+            response.solveMode,
+            "true" if response.solvedExactly else "false",
+            len(response.areas),
+            len(response.connections),
+            float(response.totalTransferCost),
+        )
+        return response
     except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[terrain-split-sequence][%s] failed elapsedMs=%.1f areaCount=%d",
+            request_id,
+            (time.perf_counter() - started_at) * 1000.0,
+            len(request.areas),
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

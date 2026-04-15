@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -34,6 +35,8 @@ CONNECTION_COIL_POINT_SPACING_M = 8.0
 CONNECTION_CLIMB_PER_METER = 0.25
 ALTITUDE_EPSILON_M = 0.25
 ALTITUDE_STEP_EPSILON_M = 0.5
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -2247,6 +2250,13 @@ def optimize_area_sequence(
             totalTransferTimeSec=0.0,
             totalTransferCost=0.0,
         )
+        logger.info(
+            "[terrain-split-sequence][%s] single-area passthrough polygonId=%s bearingDeg=%.1f",
+            request_id,
+            only_area.polygonId,
+            forward.bearing_deg,
+        )
+        return response
 
     traversal_options_by_area: list[dict[bool, _TraversalOption]] = []
     for area_index, area in enumerate(request.areas):
@@ -2312,7 +2322,7 @@ def optimize_area_sequence(
         total_transfer_time_sec += float(edge.model.transferTimeSec)
         total_transfer_cost += float(edge.model.transferCost)
 
-    return MissionOptimizeAreaSequenceResponse(
+    response = MissionOptimizeAreaSequenceResponse(
         requestId=request_id,
         solveMode=solve_mode,
         solvedExactly=solved_exactly,
@@ -2322,3 +2332,18 @@ def optimize_area_sequence(
         totalTransferTimeSec=total_transfer_time_sec,
         totalTransferCost=total_transfer_cost,
     )
+    logger.info(
+        "[terrain-split-sequence][%s] solved mode=%s exact=%s areaCount=%d order=%s totalTransferCost=%.3f totalTransferTimeSec=%.3f totalTransferDistanceM=%.1f",
+        request_id,
+        solve_mode,
+        "true" if solved_exactly else "false",
+        len(area_models),
+        " -> ".join(
+            f"{area.polygonId}({'flip' if area.flipped else 'fwd'})"
+            for area in area_models
+        ),
+        total_transfer_cost,
+        total_transfer_time_sec,
+        total_transfer_distance_m,
+    )
+    return response
