@@ -1,6 +1,7 @@
 import type { FlightParams } from '@/domain/types';
 import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { TerrainSourceSelection } from '@/terrain/types';
+import { configuredBackendBaseUrl, normalizedConfiguredBackendBaseUrl } from '@/services/backendBaseUrl';
 
 export interface TerrainPartitionBackendRequest {
   polygonId?: string;
@@ -20,14 +21,6 @@ interface TerrainPartitionBackendResponse {
   solutions: TerrainPartitionSolutionPreview[];
 }
 
-function configuredBackendBaseUrl(): string | undefined {
-  const fromImportMeta = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_TERRAIN_PARTITION_BACKEND_URL;
-  const fromProcess = typeof process !== 'undefined' ? process.env.VITE_TERRAIN_PARTITION_BACKEND_URL : undefined;
-  return [fromImportMeta, fromProcess].find(
-    (value): value is string => typeof value === 'string' && value.trim().length > 0
-  );
-}
-
 function configuredBackendDebugEnabled(): boolean {
   const fromImportMeta = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_TERRAIN_PARTITION_BACKEND_DEBUG;
   const fromProcess = typeof process !== 'undefined' ? process.env.VITE_TERRAIN_PARTITION_BACKEND_DEBUG : undefined;
@@ -45,7 +38,7 @@ export function isTerrainPartitionBackendEnabled(): boolean {
 export async function solveTerrainPartitionWithBackend(
   request: TerrainPartitionBackendRequest,
 ): Promise<TerrainPartitionSolutionPreview[]> {
-  const backendBaseUrl = configuredBackendBaseUrl();
+  const backendBaseUrl = normalizedConfiguredBackendBaseUrl();
   if (!isTerrainPartitionBackendEnabled()) {
     throw new Error('Terrain partition backend is not configured.');
   }
@@ -53,7 +46,7 @@ export async function solveTerrainPartitionWithBackend(
     ...request,
     debug: request.debug ?? configuredBackendDebugEnabled(),
   };
-  const endpoint = `${backendBaseUrl!.replace(/\/$/, '')}/v1/partition/solve`;
+  const endpoint = `${backendBaseUrl!}/v1/partition/solve`;
   console.log('[terrain-split][backend-request] POST /v1/partition/solve', {
     polygonId: effectiveRequest.polygonId ?? null,
     payloadKind: effectiveRequest.payloadKind,

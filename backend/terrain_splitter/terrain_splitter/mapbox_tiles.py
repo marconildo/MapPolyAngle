@@ -115,6 +115,17 @@ class TerrainDEM:
             self.tiles[(x, y)] = loaded
         return loaded
 
+    def close(self) -> None:
+        close_fn = getattr(self._tile_loader, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def sample_mercator(self, x: float, y: float) -> float:
         world = 2.0 * math.pi * 6378137.0
         tiles_per_axis = 2**self.z
@@ -265,6 +276,47 @@ def _fetch_single_terrain_tile(
     )
 
 
+class _LazyTerrainTileLoader:
+    def __init__(
+        self,
+        cache: TerrainTileCache,
+        token: str,
+        zoom: int,
+        *,
+        terrain_source: TerrainSourceModel | None = None,
+        dsm_store: object | None = None,
+    ) -> None:
+        self._cache = cache
+        self._token = token
+        self._zoom = zoom
+        self._terrain_source = terrain_source
+        self._dsm_store = dsm_store
+        self._client: httpx.Client | None = None
+
+    def __call__(self, x: int, y: int) -> TerrainTile | None:
+        tiles_per_axis = 2**self._zoom
+        if x < 0 or y < 0 or x >= tiles_per_axis or y >= tiles_per_axis:
+            return None
+        if self._client is None:
+            self._client = httpx.Client(follow_redirects=True)
+        return _fetch_single_terrain_tile(
+            self._cache,
+            self._token,
+            self._zoom,
+            x,
+            y,
+            terrain_source=self._terrain_source,
+            dsm_store=self._dsm_store,
+            client=self._client,
+        )
+
+    def close(self) -> None:
+        if self._client is None:
+            return
+        self._client.close()
+        self._client = None
+
+
 def fetch_dem_for_rings(
     rings: list[list[tuple[float, float]]],
     cache_dir: Path,
@@ -323,19 +375,13 @@ def fetch_dem_for_rings(
 
     tile_loader = None
     if lazy_load_missing:
-        def tile_loader(x: int, y: int) -> TerrainTile | None:
-            tiles_per_axis = 2**zoom
-            if x < 0 or y < 0 or x >= tiles_per_axis or y >= tiles_per_axis:
-                return None
-            return _fetch_single_terrain_tile(
-                cache,
-                token,
-                zoom,
-                x,
-                y,
-                terrain_source=terrain_source,
-                dsm_store=dsm_store,
-            )
+        tile_loader = _LazyTerrainTileLoader(
+            cache,
+            token,
+            zoom,
+            terrain_source=terrain_source,
+            dsm_store=dsm_store,
+        )
 
     dem = TerrainDEM(zoom, tiles, tile_loader=tile_loader)
     return dem, zoom

@@ -32,6 +32,7 @@ import { parseKmlPolygons, calculateKmlBounds, extractKmlFromKmz } from '@/utils
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, calculateGSD, forwardSpacingRotated, lineSpacingRotated } from '@/domain/camera';
 import { DEFAULT_LIDAR, DEFAULT_LIDAR_MAX_RANGE_M, LIDAR_REGISTRY, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarLineSpacing, lidarSinglePassDensity, lidarSwathWidth } from '@/domain/lidar';
 import type { PlannedFlightGeometry } from '@/domain/types';
+import type { ExportedArea } from '@/interop/wingtra/types';
 import type {
   BearingOverride,
   ImportedFlightplanArea,
@@ -45,6 +46,7 @@ import type {
 } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 import { isTerrainPartitionBackendEnabled, solveTerrainPartitionWithBackend } from '@/services/terrainPartitionBackend';
+import type { MissionAreaSequenceBackendRequest, MissionAreaSequenceBackendChoice } from '@/services/areaSequenceBackend';
 import { isAreaSequenceBackendEnabled, optimizeAreaSequenceWithBackend } from '@/services/areaSequenceBackend';
 import { isExactTerrainBackendEnabled, optimizeBearingWithBackend } from '@/services/exactTerrainBackend';
 import type { TerrainSourceSelection } from '@/terrain/types';
@@ -210,6 +212,113 @@ function clampNumber(value: number | undefined, min: number, max: number, fallba
 function normalizeBearing(value?: number): number | undefined {
   if (!Number.isFinite(value)) return undefined;
   return (((value as number) % 360) + 360) % 360;
+}
+
+type WingtraExportPolygonState = {
+  polygonId: string;
+  ring: [number, number][];
+  params: PolygonParams;
+  bearingDeg: number;
+  axialBearingDeg: number;
+  lineSpacingM?: number;
+  triggerDistanceM?: number;
+};
+
+type WingtraAreasFromState = (polys: Array<{
+  ring: [number, number][];
+  params: PolygonParams;
+  bearingDeg: number;
+  lineSpacingM?: number;
+  triggerDistanceM?: number;
+}>) => ExportedArea[];
+
+function buildWingtraFallbackAreas(
+  areasFromState: WingtraAreasFromState,
+  polys: WingtraExportPolygonState[],
+): ExportedArea[] {
+  return areasFromState(
+    polys.map(({ ring, params, bearingDeg, lineSpacingM, triggerDistanceM }) => ({
+      ring,
+      params,
+      bearingDeg,
+      lineSpacingM,
+      triggerDistanceM,
+    })),
+  );
+}
+
+function buildWingtraAxialAreasByPolygonId(
+  areasFromState: WingtraAreasFromState,
+  polys: WingtraExportPolygonState[],
+): Map<string, ExportedArea> {
+  return new Map(
+    polys.map((poly) => [
+      poly.polygonId,
+      areasFromState([{
+        ring: poly.ring,
+        params: poly.params,
+        bearingDeg: poly.axialBearingDeg,
+        lineSpacingM: poly.lineSpacingM,
+        triggerDistanceM: poly.triggerDistanceM,
+      }])[0]!,
+    ] as const),
+  );
+}
+
+function buildAreaSequenceBackendRequest(
+  polys: WingtraExportPolygonState[],
+  {
+    terrainSource,
+    altitudeMode,
+    minClearanceM,
+    turnExtendM,
+    maxHeightAboveGroundM,
+    fallbackCruiseSpeedMps,
+  }: {
+    terrainSource: TerrainSourceSelection;
+    altitudeMode: 'legacy' | 'min-clearance';
+    minClearanceM: number;
+    turnExtendM: number;
+    maxHeightAboveGroundM: number;
+    fallbackCruiseSpeedMps: number;
+  },
+): MissionAreaSequenceBackendRequest {
+  return {
+    areas: polys.map((poly) => ({
+      polygonId: poly.polygonId,
+      ring: poly.ring,
+      bearingDeg: poly.axialBearingDeg,
+      payloadKind: isLidarParams(poly.params) ? 'lidar' : 'camera',
+      params: isLidarParams(poly.params) || (Number.isFinite(poly.params.speedMps) && (poly.params.speedMps as number) > 0)
+        ? poly.params
+        : { ...poly.params, speedMps: fallbackCruiseSpeedMps },
+    })),
+    terrainSource,
+    altitudeMode,
+    minClearanceM,
+    turnExtendM,
+    maxHeightAboveGroundM,
+  };
+}
+
+function applyOptimizedAreaSequenceChoices(
+  choices: MissionAreaSequenceBackendChoice[],
+  axialAreasByPolygonId: Map<string, ExportedArea>,
+): ExportedArea[] {
+  return [...choices]
+    .sort((left, right) => left.orderIndex - right.orderIndex)
+    .map((choice) => {
+      const baseArea = axialAreasByPolygonId.get(choice.polygonId);
+      if (!baseArea) {
+        throw new Error(`Missing export area for polygon ${choice.polygonId}.`);
+      }
+      return {
+        ...baseArea,
+        angleDeg: choice.flipped
+          ? (normalizeBearing(baseArea.angleDeg + 180) ?? baseArea.angleDeg)
+          : baseArea.angleDeg,
+      };
+    });
 }
 
 const DECK_FLIGHT_LAYER_ID_PREFIXES = [
@@ -3667,15 +3776,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           resolveFreshWingtraExportPayloadOptionFromAreas,
         } = await loadWingtraConvertModule();
         // Build area list from current state
-        const polys: Array<{
-          polygonId: string;
-          ring: [number, number][];
-          params: PolygonParams;
-          bearingDeg: number;
-          axialBearingDeg: number;
-          lineSpacingM?: number;
-          triggerDistanceM?: number;
-        }> = [];
+        const polys: WingtraExportPolygonState[] = [];
         polygonParams.forEach((params, pid) => {
           const res = polygonResults.get(pid);
           const collection = drawRef.current?.getAll();
@@ -3696,25 +3797,8 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             triggerDistanceM: params.triggerDistanceM,
           });
         });
-        const fallbackAreas = areasFromState(polys.map(({ ring, params, bearingDeg, lineSpacingM, triggerDistanceM }) => ({
-          ring,
-          params,
-          bearingDeg,
-          lineSpacingM,
-          triggerDistanceM,
-        })));
-        const axialAreasByPolygonId = new Map(
-          polys.map((poly) => [
-            poly.polygonId,
-            areasFromState([{
-              ring: poly.ring,
-              params: poly.params,
-              bearingDeg: poly.axialBearingDeg,
-              lineSpacingM: poly.lineSpacingM,
-              triggerDistanceM: poly.triggerDistanceM,
-            }])[0]!,
-          ] as const),
-        );
+        const fallbackAreas = buildWingtraFallbackAreas(areasFromState, polys);
+        const axialAreasByPolygonId = buildWingtraAxialAreasByPolygonId(areasFromState, polys);
         let areas = fallbackAreas;
         if (areas.length === 0) {
           throw new Error('Draw or import at least one area before exporting a Wingtra flightplan.');
@@ -3723,36 +3807,17 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
         const exportSequenceCruiseSpeedMps = resolveWingtraExportCruiseSpeedMps(lastImportedFlightplan);
         if (areas.length > 1 && isAreaSequenceBackendEnabled()) {
           try {
-            const sequenceResult = await optimizeAreaSequenceWithBackend({
-              areas: polys.map((poly) => ({
-                polygonId: poly.polygonId,
-                ring: poly.ring,
-                bearingDeg: poly.axialBearingDeg,
-                payloadKind: isLidarParams(poly.params) ? 'lidar' : 'camera',
-                params: isLidarParams(poly.params) || (Number.isFinite(poly.params.speedMps) && (poly.params.speedMps as number) > 0)
-                  ? poly.params
-                  : { ...poly.params, speedMps: exportSequenceCruiseSpeedMps },
-              })),
-              terrainSource,
-              altitudeMode,
-              minClearanceM,
-              turnExtendM,
-              maxHeightAboveGroundM: exportSequenceMaxHeightAboveGroundM,
-            });
-            const optimizedAreas = [...sequenceResult.areas]
-              .sort((left, right) => left.orderIndex - right.orderIndex)
-              .map((choice) => {
-                const baseArea = axialAreasByPolygonId.get(choice.polygonId);
-                if (!baseArea) {
-                  throw new Error(`Missing export area for polygon ${choice.polygonId}.`);
-                }
-                return {
-                  ...baseArea,
-                  angleDeg: choice.flipped
-                    ? (normalizeBearing(baseArea.angleDeg + 180) ?? baseArea.angleDeg)
-                    : baseArea.angleDeg,
-                };
-              });
+            const sequenceResult = await optimizeAreaSequenceWithBackend(
+              buildAreaSequenceBackendRequest(polys, {
+                terrainSource,
+                altitudeMode,
+                minClearanceM,
+                turnExtendM,
+                maxHeightAboveGroundM: exportSequenceMaxHeightAboveGroundM,
+                fallbackCruiseSpeedMps: exportSequenceCruiseSpeedMps,
+              }),
+            );
+            const optimizedAreas = applyOptimizedAreaSequenceChoices(sequenceResult.areas, axialAreasByPolygonId);
             if (optimizedAreas.length === areas.length) {
               areas = optimizedAreas;
             }

@@ -1,5 +1,6 @@
 import type { FlightParams } from '@/domain/types';
 import type { TerrainSourceSelection } from '@/terrain/types';
+import { configuredBackendBaseUrl, normalizedConfiguredBackendBaseUrl } from '@/services/backendBaseUrl';
 
 export interface MissionAreaSequenceBackendArea {
   polygonId: string;
@@ -32,14 +33,6 @@ interface MissionAreaSequenceBackendResponse {
   areas: MissionAreaSequenceBackendChoice[];
 }
 
-function configuredBackendBaseUrl(): string | undefined {
-  const fromImportMeta = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_TERRAIN_PARTITION_BACKEND_URL;
-  const fromProcess = typeof process !== 'undefined' ? process.env.VITE_TERRAIN_PARTITION_BACKEND_URL : undefined;
-  return [fromImportMeta, fromProcess].find(
-    (value): value is string => typeof value === 'string' && value.trim().length > 0,
-  );
-}
-
 export function isAreaSequenceBackendEnabled(): boolean {
   const backendBaseUrl = configuredBackendBaseUrl();
   return typeof backendBaseUrl === 'string' && backendBaseUrl.trim().length > 0;
@@ -48,12 +41,12 @@ export function isAreaSequenceBackendEnabled(): boolean {
 export async function optimizeAreaSequenceWithBackend(
   request: MissionAreaSequenceBackendRequest,
 ): Promise<MissionAreaSequenceBackendResponse> {
-  const backendBaseUrl = configuredBackendBaseUrl();
+  const backendBaseUrl = normalizedConfiguredBackendBaseUrl();
   if (!isAreaSequenceBackendEnabled()) {
     throw new Error('Area sequence backend is not configured.');
   }
 
-  const response = await fetch(`${backendBaseUrl!.replace(/\/$/, '')}/v1/mission/optimize-area-sequence`, {
+  const response = await fetch(`${backendBaseUrl!}/v1/mission/optimize-area-sequence`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
