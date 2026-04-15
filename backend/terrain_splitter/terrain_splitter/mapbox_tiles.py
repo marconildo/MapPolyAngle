@@ -6,6 +6,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import httpx
 import numpy as np
@@ -95,9 +96,35 @@ class TerrainTile:
 
 
 class TerrainDEM:
-    def __init__(self, z: int, tiles: dict[tuple[int, int], TerrainTile]):
+    def __init__(
+        self,
+        z: int,
+        tiles: dict[tuple[int, int], TerrainTile],
+        tile_loader: Callable[[int, int], TerrainTile | None] | None = None,
+    ):
         self.z = z
         self.tiles = tiles
+        self._tile_loader = tile_loader
+
+    def get_or_load_tile(self, x: int, y: int) -> TerrainTile | None:
+        tile = self.tiles.get((x, y))
+        if tile is not None or self._tile_loader is None:
+            return tile
+        loaded = self._tile_loader(x, y)
+        if loaded is not None:
+            self.tiles[(x, y)] = loaded
+        return loaded
+
+    def close(self) -> None:
+        close_fn = getattr(self._tile_loader, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def sample_mercator(self, x: float, y: float) -> float:
         world = 2.0 * math.pi * 6378137.0
@@ -105,7 +132,7 @@ class TerrainDEM:
         tile_span = world / tiles_per_axis
         tx = int(math.floor((x + world / 2.0) / tile_span))
         ty = int(math.floor((world / 2.0 - y) / tile_span))
-        tile = self.tiles.get((tx, ty))
+        tile = self.get_or_load_tile(tx, ty)
         if tile is None:
             return float("nan")
         size = tile.elevation.shape[0]
@@ -158,18 +185,161 @@ def fetch_dem_for_ring(
     terrain_source: TerrainSourceModel | None = None,
     dsm_store: object | None = None,
 ) -> tuple[TerrainDEM, int]:
+    dem, zoom = fetch_dem_for_rings(
+        [ring],
+        cache_dir,
+        grid_step_m=grid_step_m,
+        terrain_source=terrain_source,
+        dsm_store=dsm_store,
+        lazy_load_missing=False,
+    )
+    return dem, zoom
+
+
+def _padded_ring_bounds_mercator(
+    ring: list[tuple[float, float]],
+    *,
+    padding_m: float,
+) -> tuple[float, float, float, float]:
     mercator = [lnglat_to_mercator(lng, lat) for lng, lat in ring]
     xs = [coord[0] for coord in mercator]
     ys = [coord[1] for coord in mercator]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
+    return (
+        min_x - padding_m,
+        min_y - padding_m,
+        max_x + padding_m,
+        max_y + padding_m,
+    )
+
+
+def _decode_terrain_tile(
+    z: int,
+    x: int,
+    y: int,
+    payload: bytes,
+    *,
+    terrain_source: TerrainSourceModel | None = None,
+    dsm_store: object | None = None,
+) -> TerrainTile:
+    image = Image.open(io.BytesIO(payload))
+    elevation = _terrain_rgb_to_elevation(image)
+    bounds = tile_bounds_mercator(z, x, y)
+    tile = TerrainTile(
+        z=z,
+        x=x,
+        y=y,
+        elevation=elevation,
+        min_x=bounds[0],
+        min_y=bounds[1],
+        max_x=bounds[2],
+        max_y=bounds[3],
+    )
+    if dsm_store is not None:
+        apply_fn = getattr(dsm_store, "apply_terrain_source_to_tile", None)
+        if callable(apply_fn):
+            apply_fn(terrain_source, tile)
+    return tile
+
+
+def _fetch_single_terrain_tile(
+    cache: TerrainTileCache,
+    token: str,
+    z: int,
+    x: int,
+    y: int,
+    *,
+    terrain_source: TerrainSourceModel | None = None,
+    dsm_store: object | None = None,
+    client: httpx.Client | None = None,
+) -> TerrainTile:
+    if client is not None:
+        payload = cache.get_or_fetch(client, token, z, x, y)
+        return _decode_terrain_tile(
+            z,
+            x,
+            y,
+            payload,
+            terrain_source=terrain_source,
+            dsm_store=dsm_store,
+        )
+    with httpx.Client(follow_redirects=True) as one_off_client:
+        payload = cache.get_or_fetch(one_off_client, token, z, x, y)
+    return _decode_terrain_tile(
+        z,
+        x,
+        y,
+        payload,
+        terrain_source=terrain_source,
+        dsm_store=dsm_store,
+    )
+
+
+class _LazyTerrainTileLoader:
+    def __init__(
+        self,
+        cache: TerrainTileCache,
+        token: str,
+        zoom: int,
+        *,
+        terrain_source: TerrainSourceModel | None = None,
+        dsm_store: object | None = None,
+    ) -> None:
+        self._cache = cache
+        self._token = token
+        self._zoom = zoom
+        self._terrain_source = terrain_source
+        self._dsm_store = dsm_store
+        self._client: httpx.Client | None = None
+
+    def __call__(self, x: int, y: int) -> TerrainTile | None:
+        tiles_per_axis = 2**self._zoom
+        if x < 0 or y < 0 or x >= tiles_per_axis or y >= tiles_per_axis:
+            return None
+        if self._client is None:
+            self._client = httpx.Client(follow_redirects=True)
+        return _fetch_single_terrain_tile(
+            self._cache,
+            self._token,
+            self._zoom,
+            x,
+            y,
+            terrain_source=self._terrain_source,
+            dsm_store=self._dsm_store,
+            client=self._client,
+        )
+
+    def close(self) -> None:
+        if self._client is None:
+            return
+        self._client.close()
+        self._client = None
+
+
+def fetch_dem_for_rings(
+    rings: list[list[tuple[float, float]]],
+    cache_dir: Path,
+    grid_step_m: float | None = None,
+    terrain_source: TerrainSourceModel | None = None,
+    dsm_store: object | None = None,
+    *,
+    lazy_load_missing: bool = True,
+) -> tuple[TerrainDEM, int]:
+    valid_rings = [ring for ring in rings if len(ring) >= 3]
+    if not valid_rings:
+        raise ValueError("At least one ring with 3 or more coordinates is required.")
+
     padding = max(200.0, (grid_step_m or 40.0) * 2.0)
-    min_x -= padding
-    min_y -= padding
-    max_x += padding
-    max_y += padding
     zoom = choose_terrain_zoom(grid_step_m or 40.0)
-    xs_range, ys_range = mercator_bounds_to_tile_range(min_x, min_y, max_x, max_y, zoom)
+    tile_coords: set[tuple[int, int]] = set()
+    for ring in valid_rings:
+        min_x, min_y, max_x, max_y = _padded_ring_bounds_mercator(ring, padding_m=padding)
+        xs_range, ys_range = mercator_bounds_to_tile_range(min_x, min_y, max_x, max_y, zoom)
+        for x in xs_range:
+            for y in ys_range:
+                tile_coords.add((x, y))
+
     terrain_source_label = (
         f"{terrain_source.mode}:{terrain_source.datasetId}"
         if terrain_source is not None and terrain_source.datasetId
@@ -178,40 +348,40 @@ def fetch_dem_for_ring(
         else "mapbox"
     )
     logger.info(
-        "[terrain-split-backend] dem fetch choose zoom=%d gridStepM=%.1f paddingM=%.1f tileCount=%d xTiles=%d..%d yTiles=%d..%d terrainSource=%s",
+        "[terrain-split-backend] dem fetch choose zoom=%d gridStepM=%.1f paddingM=%.1f preloadTileCount=%d ringCount=%d terrainSource=%s lazyLoadMissing=%s",
         zoom,
         float(grid_step_m or 40.0),
         padding,
-        len(xs_range) * len(ys_range),
-        xs_range.start,
-        xs_range.stop - 1,
-        ys_range.start,
-        ys_range.stop - 1,
+        len(tile_coords),
+        len(valid_rings),
         terrain_source_label,
+        "true" if lazy_load_missing else "false",
     )
     token = mapbox_token()
     cache = TerrainTileCache(cache_dir)
     tiles: dict[tuple[int, int], TerrainTile] = {}
     with httpx.Client(follow_redirects=True) as client:
-        for x in xs_range:
-            for y in ys_range:
-                payload = cache.get_or_fetch(client, token, zoom, x, y)
-                image = Image.open(io.BytesIO(payload))
-                elevation = _terrain_rgb_to_elevation(image)
-                bounds = tile_bounds_mercator(zoom, x, y)
-                tiles[(x, y)] = TerrainTile(
-                    z=zoom,
-                    x=x,
-                    y=y,
-                    elevation=elevation,
-                    min_x=bounds[0],
-                    min_y=bounds[1],
-                    max_x=bounds[2],
-                    max_y=bounds[3],
-                )
-    dem = TerrainDEM(zoom, tiles)
-    if dsm_store is not None:
-        apply_fn = getattr(dsm_store, "apply_terrain_source_to_dem", None)
-        if callable(apply_fn):
-            apply_fn(terrain_source, dem)
+        for x, y in sorted(tile_coords):
+            tiles[(x, y)] = _fetch_single_terrain_tile(
+                cache,
+                token,
+                zoom,
+                x,
+                y,
+                terrain_source=terrain_source,
+                dsm_store=dsm_store,
+                client=client,
+            )
+
+    tile_loader = None
+    if lazy_load_missing:
+        tile_loader = _LazyTerrainTileLoader(
+            cache,
+            token,
+            zoom,
+            terrain_source=terrain_source,
+            dsm_store=dsm_store,
+        )
+
+    dem = TerrainDEM(zoom, tiles, tile_loader=tile_loader)
     return dem, zoom

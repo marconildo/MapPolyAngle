@@ -222,10 +222,10 @@ async function main() {
   assert.ok(cameraCandidate, "camera exact region evaluation should return a candidate");
   assert.equal(cameraCandidate.metricKind, "gsd");
   approxEqual(cameraCandidate.bearingDeg, 90);
-  approxEqual(cameraCandidate.exactCost, 1.3204852520228987);
-  approxEqual(cameraCandidate.qualityCost, 0.008206533755698275);
-  approxEqual(cameraCandidate.missionTimeSec, 2363.578868956986);
-  approxEqual(cameraCandidate.stats.mean, 0.012879733491310297);
+  approxEqual(cameraCandidate.exactCost, 1.3259692230118365);
+  approxEqual(cameraCandidate.qualityCost, 0.008119844657775368);
+  approxEqual(cameraCandidate.missionTimeSec, 2373.59045307571);
+  approxEqual(cameraCandidate.stats.mean, 0.012879512189621372);
   assert.equal(cameraCandidate.stats.count, 728);
   assert.equal(cameraCandidate.stats.histogram.length, 1);
   assert.equal(cameraCandidate.qualityBreakdown.modelVersion, "camera-region-v1");
@@ -243,10 +243,10 @@ async function main() {
   assert.ok(lidarCandidate, "lidar exact region evaluation should return a candidate");
   assert.equal(lidarCandidate.metricKind, "density");
   approxEqual(lidarCandidate.bearingDeg, 90);
-  approxEqual(lidarCandidate.exactCost, 5.633151031841947);
-  approxEqual(lidarCandidate.qualityCost, 6.007852105822266);
-  approxEqual(lidarCandidate.missionTimeSec, 406.95144588343203);
-  approxEqual(lidarCandidate.stats.mean, 26.662644939809407);
+  approxEqual(lidarCandidate.exactCost, 5.641167085388158);
+  approxEqual(lidarCandidate.qualityCost, 6.016771435812384);
+  approxEqual(lidarCandidate.missionTimeSec, 406.93102768262224);
+  approxEqual(lidarCandidate.stats.mean, 26.667487393142114);
   assert.equal(lidarCandidate.stats.count, 728);
   assert.equal(lidarCandidate.stats.histogram[0]?.bin, 0);
   assert.equal(lidarCandidate.qualityBreakdown.modelVersion, "lidar-region-v1");
@@ -270,7 +270,7 @@ async function main() {
   assert.equal(globalOptimize.best?.bearingDeg, globalBest.bearingDeg);
   assert.equal(globalOptimize.best?.exactCost, globalBest.exactCost);
   approxEqual(globalOptimize.best!.bearingDeg, 90);
-  approxEqual(globalOptimize.best!.exactCost, 1.3204852520228987);
+  approxEqual(globalOptimize.best!.exactCost, 1.3259692230118365);
 
   const localOptimize = await optimizeBearingExact(runtime, {
     ...baseArgs,
@@ -283,8 +283,8 @@ async function main() {
   assert.ok(localOptimize.best, "local optimize should select a best candidate");
   assert.equal(localOptimize.evaluated.length, 10);
   approxEqual(localOptimize.best.bearingDeg, 72);
-  approxEqual(localOptimize.best.exactCost, 1.6141692512417503);
-  approxEqual(localOptimize.best.qualityCost, 0.006037061090581317);
+  approxEqual(localOptimize.best.exactCost, 1.6235215595657575);
+  approxEqual(localOptimize.best.qualityCost, 0.005820561760900072);
   for (const candidate of localOptimize.evaluated) {
     assert.ok(axialDistanceDeg(candidate.bearingDeg, localOptimize.seedBearingDeg) <= 30.0001);
   }
@@ -397,14 +397,14 @@ async function main() {
   assert.equal(reranked.solutions[1].signature, "bad");
   approxEqual(reranked.solutions[0].regions[0].bearingDeg, 90);
   approxEqual(reranked.solutions[1].regions[0].bearingDeg, 179);
-  approxEqual(reranked.solutions[0].regions[0].exactScore ?? Number.NaN, 1.3205278427494913);
-  approxEqual(reranked.solutions[1].regions[0].exactScore ?? Number.NaN, 1.7987439826004457);
-  approxEqual(reranked.solutions[0].exactScore ?? Number.NaN, 11.664622700686188);
-  approxEqual(reranked.solutions[1].exactScore ?? Number.NaN, 11.768516945463329);
+  approxEqual(reranked.solutions[0].regions[0].exactScore ?? Number.NaN, 1.3259692230118365);
+  approxEqual(reranked.solutions[1].regions[0].exactScore ?? Number.NaN, 1.8233536741405434);
+  approxEqual(reranked.solutions[0].exactScore ?? Number.NaN, 11.664341671458846);
+  approxEqual(reranked.solutions[1].exactScore ?? Number.NaN, 11.766320052080799);
   assert.equal(reranked.solutions[0].regions[0].exactSeedBearingDeg, goodSeed);
   assert.equal(reranked.solutions[1].regions[0].exactSeedBearingDeg, badSeed);
-  approxEqual(reranked.previewsBySignature.good.stats.mean, 0.012879733491310297);
-  approxEqual(reranked.previewsBySignature.bad.stats.mean, 0.012877623429061374);
+  approxEqual(reranked.previewsBySignature.good.stats.mean, 0.012879512189621372);
+  approxEqual(reranked.previewsBySignature.bad.stats.mean, 0.0129949159492933);
   assert.ok(reranked.previewsBySignature.good);
   assert.ok(reranked.previewsBySignature.bad);
   assert.ok(reranked.debugBySignature?.good);

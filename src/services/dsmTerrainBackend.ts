@@ -1,11 +1,7 @@
 import type { DsmSourceDescriptor, TerrainSourceSelection } from '@/terrain/types';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
-
-declare global {
-  // Test-only override used by tsx/node tests outside the Vite runtime.
-  var __TERRAIN_BACKEND_URL_FOR_TESTS__: string | undefined;
-}
+import { configuredBackendBaseUrl, requireConfiguredBackendBaseUrl } from '@/services/backendBaseUrl';
 
 export interface DsmTerrainBackendDataset {
   datasetId: string | null;
@@ -42,21 +38,8 @@ interface DsmPrepareUploadRequiredResponse {
 
 type DsmPrepareUploadResponse = DsmPrepareUploadExistingResponse | DsmPrepareUploadRequiredResponse;
 
-function configuredBackendBaseUrl(): string | undefined {
-  const fromImportMeta = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_TERRAIN_PARTITION_BACKEND_URL;
-  const fromGlobal = globalThis.__TERRAIN_BACKEND_URL_FOR_TESTS__;
-  const fromProcess = typeof process !== 'undefined' ? process.env.VITE_TERRAIN_PARTITION_BACKEND_URL : undefined;
-  return [fromImportMeta, fromGlobal, fromProcess].find(
-    (value): value is string => typeof value === 'string' && value.trim().length > 0
-  );
-}
-
 function backendBase(): string {
-  const backendBaseUrl = configuredBackendBaseUrl();
-  if (typeof backendBaseUrl !== 'string' || backendBaseUrl.trim().length === 0) {
-    throw new Error('Terrain backend is not configured.');
-  }
-  return backendBaseUrl.replace(/\/$/, '');
+  return requireConfiguredBackendBaseUrl('Terrain backend is not configured.');
 }
 
 async function readErrorText(response: Response): Promise<string> {

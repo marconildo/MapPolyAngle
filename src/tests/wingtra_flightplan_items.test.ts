@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   exportToWingtraFlightPlan,
+  importWingtraFlightPlan,
   isWingtraFlightPlanTemplateExportReady,
   replaceAreaItemsInWingtraFlightPlan,
   resolveFreshWingtraExportPayloadOptionFromAreas,
@@ -145,6 +146,8 @@ function runFreshExportIncludesMinimumWicDraftFields() {
   assert.ok((exported.flightPlan as { elevationData?: unknown }).elevationData);
   assert.ok(exported.geofence);
   assert.ok(exported.safety);
+  assert.equal((exported.safety as { maxGroundClearance?: unknown })?.maxGroundClearance, 200);
+  assert.equal((exported.flightPlan as { cruiseSpeed?: unknown }).cruiseSpeed, 15.375008);
   assert.ok(isWingtraFlightPlanTemplateExportReady(exported));
 }
 
@@ -185,8 +188,25 @@ function runHardwareVersionSelectsMatchingWingtraPayload() {
   assert.equal(v5Option?.payloadUniqueString, "MAPSTAROblique_v5");
 }
 
+function runCameraImportPreservesCruiseSpeed() {
+  const template = exportToWingtraFlightPlan([makeArea(47.0, 12)], {
+    payloadKind: "camera",
+    payloadUniqueString: "MAPSTAROblique_v5",
+    payloadName: "MAPSTAROblique",
+    defaults: {
+      cruiseSpeed: 17.25,
+    },
+  });
+
+  const imported = importWingtraFlightPlan(template, { angleConvention: "northCW" });
+  assert.equal(imported.items.length, 1);
+  assert.equal(imported.items[0]?.payloadKind, "camera");
+  assert.equal(imported.items[0]?.speedMps, 17.25);
+}
+
 runFreshExportIncludesMinimumWicDraftFields();
 runTemplateReadinessRejectsMissingMinimumFields();
 runHardwareVersionSelectsMatchingWingtraPayload();
+runCameraImportPreservesCruiseSpeed();
 
 console.log("wingtra_flightplan_items.test.ts: all assertions passed");

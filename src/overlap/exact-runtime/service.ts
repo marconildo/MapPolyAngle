@@ -545,13 +545,18 @@ function createTerrainBatchClientFromEnv() {
 
 let sharedNodeExactTileEvaluator: NodeWorkerBackedExactTileEvaluator | null = null;
 
+export function disposeExactRuntimeSharedResources() {
+  sharedNodeExactTileEvaluator?.dispose?.();
+  sharedNodeExactTileEvaluator = null;
+}
+
 function getSharedExactTileEvaluator() {
   const poolSize = resolveExactRuntimeTilePoolSize();
   if (poolSize <= 1) {
     return { tileEvaluator: new DirectExactTileEvaluator(), candidateConcurrency: 1 };
   }
   if (!sharedNodeExactTileEvaluator || sharedNodeExactTileEvaluator.concurrency !== poolSize) {
-    sharedNodeExactTileEvaluator?.dispose?.();
+    disposeExactRuntimeSharedResources();
     sharedNodeExactTileEvaluator = new NodeWorkerBackedExactTileEvaluator(poolSize);
   }
   return {

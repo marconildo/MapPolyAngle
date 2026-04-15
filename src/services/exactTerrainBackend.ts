@@ -1,5 +1,6 @@
 import type { FlightParams } from "@/domain/types";
 import type { TerrainSourceSelection } from "@/terrain/types";
+import { configuredBackendBaseUrl, normalizedConfiguredBackendBaseUrl } from "@/services/backendBaseUrl";
 
 export interface ExactBearingBackendRequest {
   polygonId?: string;
@@ -27,19 +28,19 @@ export interface ExactBearingBackendResponse {
   diagnostics?: Record<string, number>;
 }
 
-const backendBaseUrl = import.meta.env.VITE_TERRAIN_PARTITION_BACKEND_URL as string | undefined;
-
 export function isExactTerrainBackendEnabled(): boolean {
+  const backendBaseUrl = configuredBackendBaseUrl();
   return typeof backendBaseUrl === "string" && backendBaseUrl.trim().length > 0;
 }
 
 export async function optimizeBearingWithBackend(
   request: ExactBearingBackendRequest,
 ): Promise<ExactBearingBackendResponse> {
+  const backendBaseUrl = normalizedConfiguredBackendBaseUrl();
   if (!isExactTerrainBackendEnabled()) {
     throw new Error("Exact terrain backend is not configured.");
   }
-  const response = await fetch(`${backendBaseUrl!.replace(/\/$/, "")}/v1/exact/optimize-bearing`, {
+  const response = await fetch(`${backendBaseUrl!}/v1/exact/optimize-bearing`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),

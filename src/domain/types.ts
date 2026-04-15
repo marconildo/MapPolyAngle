@@ -58,7 +58,7 @@ export interface FlightParams {
   lidarKey?: string;    // optional lidar identifier (maps to models in domain/lidar)
   triggerDistanceM?: number; // optional: explicit trigger distance from import
   cameraYawOffsetDeg?: number; // optional: rotate camera about Z (e.g. 90 to swap width/height)
-  speedMps?: number;    // lidar cruise speed, defaults to the payload model default
+  speedMps?: number;    // optional cruise speed, used for lidar analysis and fixed-wing export sequencing
   lidarReturnMode?: LidarReturnMode; // lidar return mode used for density estimates
   mappingFovDeg?: number; // lidar mapping sector in degrees; Wingtra lidar defaults to 90
   lidarFrameRateHz?: number; // lidar spin / frame rate used for beam sampling

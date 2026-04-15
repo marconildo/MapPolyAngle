@@ -615,6 +615,7 @@ export function importWingtraFlightPlan(
         terrainFollowing: !!area.terrainFollowing,
         cameraKey: payloadInfo.cameraKey,
         planeHardwareVersion,
+        speedMps: Number.isFinite(cruiseSpeedMps) && cruiseSpeedMps > 0 ? cruiseSpeedMps : undefined,
         wingtraRaw: area,
       });
     }

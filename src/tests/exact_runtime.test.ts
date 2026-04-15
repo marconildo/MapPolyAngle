@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { PNG } from "pngjs";
 
-import { handleExactRuntimeRequest } from "../overlap/exact-runtime/service.ts";
+import { disposeExactRuntimeSharedResources, handleExactRuntimeRequest } from "../overlap/exact-runtime/service.ts";
 import { handler } from "../overlap/exact-runtime/lambda.ts";
 import type {
   ExactRuntimeEnvelopeResponse,
@@ -139,6 +139,25 @@ async function readSingleJsonLine(proc: ReturnType<typeof spawn>) {
       clearTimeout(timeout);
       reject(new Error(`Sidecar exited before responding (code=${code}). ${stderr}`.trim()));
     });
+  });
+}
+
+async function terminateChildProcess(proc: ReturnType<typeof spawn>) {
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      proc.off("exit", onExit);
+      resolve();
+    }, 1000);
+    timeout.unref();
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    proc.once("exit", onExit);
+    proc.kill("SIGKILL");
   });
 }
 
@@ -304,11 +323,12 @@ async function main() {
         assert.ok(envelope.response.tiles[0].demPngBase64);
       }
     } finally {
-      proc.kill("SIGKILL");
+      await terminateChildProcess(proc);
     }
 
     console.log("exact_runtime tests passed");
   } finally {
+    disposeExactRuntimeSharedResources();
     await server.close();
   }
 }
