@@ -2229,7 +2229,7 @@ def optimize_area_sequence(
             altitude_mode=request.altitudeMode,
             min_clearance_m=float(request.minClearanceM),
         )
-        return MissionOptimizeAreaSequenceResponse(
+        response = MissionOptimizeAreaSequenceResponse(
             requestId=request_id,
             solveMode="exact-dp",
             solvedExactly=True,
