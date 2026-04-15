@@ -9,7 +9,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { LoadingSpinner } from '@/components/ui/loading-spinner';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal, ChevronUp, Undo2, Redo2 } from 'lucide-react';
+import { Map, Trash2, AlertCircle, Upload, Download, SlidersHorizontal, ChevronUp, Undo2, Redo2, LoaderCircle } from 'lucide-react';
 import type { PolygonParams } from '@/components/MapFlightDirection/types';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { toast } from "@/hooks/use-toast";
@@ -990,8 +990,14 @@ export default function Home() {
                   title={isExportingFlightplan ? 'Export in progress' : 'Export data'}
                   disabled={isExportingFlightplan}
                 >
-                  {isExportingFlightplan ? <LoadingSpinner size="sm" /> : <Download className="w-3 h-3 mr-1" />}
-                  {isExportingFlightplan ? 'Exporting…' : 'Export ▾'}
+                  <span className="inline-flex w-full items-center justify-center gap-1.5">
+                    {isExportingFlightplan ? (
+                      <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Download className="h-3 w-3" />
+                    )}
+                    <span>{isExportingFlightplan ? 'Exporting' : 'Export ▾'}</span>
+                  </span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-48">
@@ -1065,9 +1071,8 @@ export default function Home() {
                 Saved as <span className="font-mono">{normalizeFlightplanFilename(exportNameDraft)}</span>
               </div>
               {isExportingFlightplan ? (
-                <div className="flex items-center gap-2 text-xs text-slate-600">
-                  <LoadingSpinner size="sm" />
-                  <span>Optimizing sequence and preparing export…</span>
+                <div className="text-xs text-slate-600">
+                  <span>Optimizing sequence and preparing export</span>
                 </div>
               ) : null}
             </div>
@@ -1079,11 +1084,15 @@ export default function Home() {
               >
                 Cancel
               </Button>
-              <Button onClick={handleConfirmWingtraExport} disabled={isExportingFlightplan}>
+              <Button
+                onClick={handleConfirmWingtraExport}
+                disabled={isExportingFlightplan}
+                className={isExportingFlightplan ? 'relative min-w-[12rem]' : undefined}
+              >
                 {isExportingFlightplan ? (
                   <>
-                    <LoadingSpinner size="sm" />
-                    Exporting…
+                    <LoaderCircle className="absolute left-3 h-4 w-4 animate-spin text-primary-foreground" />
+                    <span className="inline-flex w-full justify-center">Exporting</span>
                   </>
                 ) : (
                   'Export'
