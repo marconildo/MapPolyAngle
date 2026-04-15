@@ -32,7 +32,14 @@ from .exact_bridge import create_exact_runtime_bridge
 from .features import compute_feature_field
 from .geometry import ring_to_polygon_mercator
 from .grid import build_grid
-from .mapbox_tiles import TerrainTileCache, choose_grid_step_m, fetch_dem_for_ring, mapbox_token
+from .mapbox_tiles import (
+    TerrainTileCache,
+    choose_grid_step_m,
+    fetch_dem_for_ring,
+    fetch_dem_for_rings,
+    mapbox_token,
+)
+from .mission_optimizer import optimize_area_sequence
 from .schemas import (
     DebugArtifacts,
     DsmFinalizeUploadRequest,
@@ -42,6 +49,8 @@ from .schemas import (
     DsmStatusResponse,
     ExactOptimizeBearingRequest,
     ExactOptimizeBearingResponse,
+    MissionOptimizeAreaSequenceRequest,
+    MissionOptimizeAreaSequenceResponse,
     PartitionSolutionPreviewModel,
     PartitionSolveRequest,
     PartitionSolveResponse,
@@ -968,6 +977,28 @@ def optimize_bearing_exact(request: ExactOptimizeBearingRequest) -> ExactOptimiz
             lineSpacingM=payload.get("lineSpacingM"),
             diagnostics=best.get("diagnostics") or {},
         )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/v1/mission/optimize-area-sequence", response_model=MissionOptimizeAreaSequenceResponse)
+def optimize_area_sequence_endpoint(
+    request: MissionOptimizeAreaSequenceRequest,
+) -> MissionOptimizeAreaSequenceResponse:
+    request_id = uuid.uuid4().hex[:12]
+    try:
+        grid_step_m = choose_grid_step_m(
+            sum(float(ring_to_polygon_mercator(area.ring).area) for area in request.areas)
+        )
+        dem, _zoom = fetch_dem_for_rings(
+            [area.ring for area in request.areas],
+            CACHE_DIR,
+            grid_step_m=grid_step_m,
+            terrain_source=request.terrainSource,
+            dsm_store=DSM_DATASET_STORE,
+            lazy_load_missing=True,
+        )
+        return optimize_area_sequence(request, dem, request_id=request_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

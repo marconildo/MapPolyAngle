@@ -13,6 +13,9 @@ DsmProcessingStatus = Literal["ready"]
 PartitionRankingSource = Literal["surrogate", "backend-exact", "frontend-exact"]
 ExactMetricKind = Literal["gsd", "density"]
 DsmPrepareUploadStatus = Literal["existing", "upload-required"]
+MissionSolveMode = Literal["exact-dp", "greedy-fallback"]
+LoiterDirection = Literal["climb", "descent"]
+ManeuverDirection = Literal["clockwise", "counterclockwise"]
 
 
 class FlightParamsModel(BaseModel):
@@ -278,3 +281,140 @@ class ExactOptimizeBearingResponse(BaseModel):
     seedBearingDeg: float
     lineSpacingM: float | None = None
     diagnostics: dict[str, float] = Field(default_factory=dict)
+
+
+class MissionAreaTraversalRequestModel(BaseModel):
+    altitudeAGL: float = Field(..., gt=0)
+    startPoint: tuple[float, float]
+    endPoint: tuple[float, float]
+    startTerrainElevationWgs84M: float
+    endTerrainElevationWgs84M: float
+    startAltitudeWgs84M: float
+    endAltitudeWgs84M: float
+    leadIn: "MissionTraversalLoiterModel"
+    leadOut: "MissionTraversalLoiterModel"
+
+
+class MissionTraversalLoiterModel(BaseModel):
+    centerPoint: tuple[float, float]
+    radiusM: float = Field(..., gt=0)
+    direction: ManeuverDirection
+
+
+class MissionAreaRequest(BaseModel):
+    polygonId: str = Field(..., min_length=1)
+    ring: list[tuple[float, float]]
+    bearingDeg: float
+    payloadKind: PayloadKind
+    params: FlightParamsModel
+    forwardTraversal: MissionAreaTraversalRequestModel | None = None
+    flippedTraversal: MissionAreaTraversalRequestModel | None = None
+
+    @model_validator(mode="after")
+    def validate_ring_and_payload(self) -> "MissionAreaRequest":
+        if len(self.ring) < 3:
+            raise ValueError("Area ring must have at least 3 coordinates.")
+        if self.params.payloadKind != self.payloadKind:
+            self.params.payloadKind = self.payloadKind
+        self.polygonId = self.polygonId.strip()
+        if not self.polygonId:
+            raise ValueError("polygonId is required.")
+        if (self.forwardTraversal is None) != (self.flippedTraversal is None):
+            raise ValueError("forwardTraversal and flippedTraversal must be provided together.")
+        return self
+
+
+class MissionOptimizeAreaSequenceRequest(BaseModel):
+    areas: list[MissionAreaRequest]
+    terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
+    altitudeMode: AltitudeMode = "legacy"
+    minClearanceM: float = Field(60, ge=0)
+    turnExtendM: float = Field(96, ge=0)  # deprecated compatibility field; current optimizer ignores it
+    maxHeightAboveGroundM: float = Field(120, gt=0)
+    exactSearchMaxAreas: int = Field(12, ge=1, le=16)
+    transferCost: "MissionTransferCostModel" = Field(default_factory=lambda: MissionTransferCostModel())
+
+    @model_validator(mode="after")
+    def validate_areas(self) -> "MissionOptimizeAreaSequenceRequest":
+        if len(self.areas) == 0:
+            raise ValueError("At least one area is required.")
+        polygon_ids = [area.polygonId for area in self.areas]
+        if len(set(polygon_ids)) != len(polygon_ids):
+            raise ValueError("polygonId values must be unique.")
+        return self
+
+
+class MissionAreaTraversalModel(BaseModel):
+    polygonId: str
+    orderIndex: int = Field(..., ge=0)
+    flipped: bool = False
+    bearingDeg: float
+    startPoint: tuple[float, float]
+    endPoint: tuple[float, float]
+    startAltitudeWgs84M: float
+    endAltitudeWgs84M: float
+
+
+class MissionConnectionLoiterStepModel(BaseModel):
+    point: tuple[float, float]
+    targetAltitudeWgs84M: float
+    terrainElevationWgs84M: float
+    heightAboveGroundM: float
+    direction: LoiterDirection
+    loopCount: int | None = Field(default=None, ge=1)
+
+
+class MissionConnectionModel(BaseModel):
+    fromPolygonId: str
+    toPolygonId: str
+    connectionMode: Literal["wic", "wic-adjusted", "stepped-fallback", "direct-fallback"] = "wic"
+    fromFlipped: bool = False
+    toFlipped: bool = False
+    line: list[tuple[float, float]]
+    trajectory: list[tuple[float, float]]
+    trajectory3D: list[tuple[float, float, float]] = Field(default_factory=list)
+    loiterSteps: list[MissionConnectionLoiterStepModel] = Field(default_factory=list)
+    requestedMaxHeightAboveGroundM: float = Field(..., gt=0)
+    transferDistanceM: float = Field(..., ge=0)
+    transferTimeSec: float = Field(..., ge=0)
+    transferCost: float = Field(..., ge=0)
+    transferMinClearanceM: float = Field(..., ge=0)
+    startAltitudeWgs84M: float
+    endAltitudeWgs84M: float
+    resolvedMaxHeightAboveGroundM: float = Field(..., gt=0)
+    transferHorizontalDistanceM: float = Field(..., ge=0)
+    transferClimbM: float = Field(..., ge=0)
+    transferDescentM: float = Field(..., ge=0)
+    transferHorizontalTimeSec: float = Field(..., ge=0)
+    transferClimbTimeSec: float = Field(..., ge=0)
+    transferDescentTimeSec: float = Field(..., ge=0)
+    transferHorizontalSpeedMps: float = Field(..., gt=0)
+    transferClimbRateMps: float = Field(..., gt=0)
+    transferDescentRateMps: float = Field(..., gt=0)
+    transferHorizontalEnergyRate: float = Field(..., ge=0)
+    transferClimbEnergyRate: float = Field(..., ge=0)
+    transferDescentEnergyRate: float = Field(..., ge=0)
+
+
+class MissionTransferCostModel(BaseModel):
+    mode: Literal["fixed-wing-energy"] = "fixed-wing-energy"
+    horizontalSpeedMps: float | None = Field(default=None, gt=0)
+    climbRateMps: float = Field(4.0, gt=0)
+    descentRateMps: float = Field(6.0, gt=0)
+    horizontalEnergyRate: float = Field(1.0, ge=0)
+    climbEnergyRate: float = Field(2.5, ge=0)
+    descentEnergyRate: float = Field(0.6, ge=0)
+
+
+class MissionOptimizeAreaSequenceResponse(BaseModel):
+    requestId: str
+    solveMode: MissionSolveMode
+    solvedExactly: bool
+    areas: list[MissionAreaTraversalModel]
+    connections: list[MissionConnectionModel] = Field(default_factory=list)
+    totalTransferDistanceM: float = Field(..., ge=0)
+    totalTransferTimeSec: float = Field(..., ge=0)
+    totalTransferCost: float = Field(..., ge=0)
+
+
+MissionOptimizeAreaSequenceRequest.model_rebuild()
