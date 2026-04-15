@@ -45,6 +45,7 @@ import type {
 } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 import { isTerrainPartitionBackendEnabled, solveTerrainPartitionWithBackend } from '@/services/terrainPartitionBackend';
+import { isAreaSequenceBackendEnabled, optimizeAreaSequenceWithBackend } from '@/services/areaSequenceBackend';
 import { isExactTerrainBackendEnabled, optimizeBearingWithBackend } from '@/services/exactTerrainBackend';
 import type { TerrainSourceSelection } from '@/terrain/types';
 import type { GSDStats, LidarStripMeters, PoseMeters } from '@/overlap/types';
@@ -101,6 +102,8 @@ const DEFAULT_FRONT_OVERLAP = 70;
 const DEFAULT_SIDE_OVERLAP = 70;
 const DEFAULT_PARTITION_TRADEOFF_SAMPLES = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85];
 const DEFAULT_PARTITION_TARGET_TRADEOFF = 0.8;
+const DEFAULT_EXPORT_SEQUENCE_MAX_HEIGHT_ABOVE_GROUND_M = 200;
+const DEFAULT_WINGTRA_EXPORT_CRUISE_SPEED_MPS = 15.375008;
 const EXACT_OPTIMIZE_ZOOM = 14;
 const EXACT_MIN_OVERLAP_FOR_GSD = 3;
 const EXACT_OPTIMIZE_TIME_WEIGHT = 0.1;
@@ -162,6 +165,28 @@ function isWingtraFlightPlanTemplateExportReadyLocal(value: unknown): boolean {
   if (getPlaneHardwareVersionFromWingtraPayloadUniqueStringLocal(payloadUniqueString) !== planeHardwareVersion) return false;
   if (!('geofence' in (value as object)) || !('safety' in (value as object))) return false;
   return typeof (maybeFlightPlan as { creationTime?: unknown }).creationTime === 'number';
+}
+
+function resolveWingtraTemplateMaxGroundClearanceM(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = (value as { safety?: { maxGroundClearance?: unknown } }).safety?.maxGroundClearance;
+  const numeric = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function resolveWingtraExportMaxHeightAboveGroundM(value: unknown): number {
+  return resolveWingtraTemplateMaxGroundClearanceM(value) ?? DEFAULT_EXPORT_SEQUENCE_MAX_HEIGHT_ABOVE_GROUND_M;
+}
+
+function resolveWingtraTemplateCruiseSpeedMps(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = (value as { flightPlan?: { cruiseSpeed?: unknown } }).flightPlan?.cruiseSpeed;
+  const numeric = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function resolveWingtraExportCruiseSpeedMps(value: unknown): number {
+  return resolveWingtraTemplateCruiseSpeedMps(value) ?? DEFAULT_WINGTRA_EXPORT_CRUISE_SPEED_MPS;
 }
 
 function splitPerfNow() {
@@ -324,13 +349,16 @@ function isLidarParams(params?: PolygonParams | null): boolean {
 function sanitizePolygonParams(params: PolygonParams): PolygonParams {
   const payloadKind = params.payloadKind ?? DEFAULT_PAYLOAD_KIND;
   const isLidar = payloadKind === 'lidar';
+  const preservedSpeedMps = Number.isFinite(params.speedMps) && (params.speedMps as number) > 0
+    ? Math.max(0.1, params.speedMps as number)
+    : undefined;
   return {
     ...params,
     payloadKind,
     altitudeAGL: Math.max(1, Number.isFinite(params.altitudeAGL) ? params.altitudeAGL : DEFAULT_ALTITUDE_AGL),
     frontOverlap: isLidar ? 0 : clampNumber(params.frontOverlap, 0, 95, DEFAULT_FRONT_OVERLAP),
     sideOverlap: clampNumber(params.sideOverlap, 0, 95, DEFAULT_SIDE_OVERLAP),
-    speedMps: isLidar ? Math.max(0.1, Number.isFinite(params.speedMps) ? params.speedMps! : DEFAULT_LIDAR.defaultSpeedMps) : undefined,
+    speedMps: isLidar ? (preservedSpeedMps ?? DEFAULT_LIDAR.defaultSpeedMps) : preservedSpeedMps,
     mappingFovDeg: isLidar ? clampNumber(params.mappingFovDeg, 1, 180, DEFAULT_LIDAR.effectiveHorizontalFovDeg) : undefined,
     maxLidarRangeM: isLidar ? Math.max(1, Number.isFinite(params.maxLidarRangeM) ? params.maxLidarRangeM! : DEFAULT_LIDAR_MAX_RANGE_M) : undefined,
     lidarReturnMode: isLidar ? (params.lidarReturnMode ?? 'single') : undefined,
@@ -2572,6 +2600,9 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           if (!id) continue;
           newIds.push(id);
           newRings.push(item.ring as [number, number][]);
+          const importedSpeedMps = Number.isFinite(item.speedMps) && (item.speedMps as number) > 0
+            ? Math.max(0.1, item.speedMps as number)
+            : undefined;
 
           const payloadKind = item.payloadKind ?? imported.payloadKind ?? DEFAULT_PAYLOAD_KIND;
           const lidarKey = item.lidarKey || imported.payloadLidarKey || DEFAULT_LIDAR.key;
@@ -2603,7 +2634,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
               lidarKey: payloadKind === 'lidar' ? lidarKey : undefined,
               triggerDistanceM: item.triggerDistanceM,
               cameraYawOffsetDeg,
-              speedMps: payloadKind === 'lidar' ? item.speedMps : undefined,
+              speedMps: importedSpeedMps,
               lidarReturnMode: payloadKind === 'lidar' ? item.lidarReturnMode : undefined,
               mappingFovDeg: payloadKind === 'lidar' ? item.mappingFovDeg : undefined,
               maxLidarRangeM: payloadKind === 'lidar' ? item.maxLidarRangeM : undefined,
@@ -2628,7 +2659,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
               cameraKey: payloadKind === 'camera' ? cameraKey : undefined,
               lidarKey: payloadKind === 'lidar' ? lidarKey : undefined,
               cameraYawOffsetDeg,
-              speedMps: payloadKind === 'lidar' ? item.speedMps : undefined,
+              speedMps: importedSpeedMps,
               lidarReturnMode: payloadKind === 'lidar' ? item.lidarReturnMode : undefined,
               mappingFovDeg: payloadKind === 'lidar' ? item.mappingFovDeg : undefined,
               maxLidarRangeM: payloadKind === 'lidar' ? item.maxLidarRangeM : undefined,
@@ -2652,7 +2683,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
               cameraKey: payloadKind === 'camera' ? cameraKey : undefined,
               lidarKey: payloadKind === 'lidar' ? lidarKey : undefined,
               cameraYawOffsetDeg,
-              speedMps: payloadKind === 'lidar' ? item.speedMps : undefined,
+              speedMps: importedSpeedMps,
               lidarReturnMode: payloadKind === 'lidar' ? item.lidarReturnMode : undefined,
               mappingFovDeg: payloadKind === 'lidar' ? item.mappingFovDeg : undefined,
               maxLidarRangeM: payloadKind === 'lidar' ? item.maxLidarRangeM : undefined,
@@ -3636,7 +3667,15 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           resolveFreshWingtraExportPayloadOptionFromAreas,
         } = await loadWingtraConvertModule();
         // Build area list from current state
-        const polys: Array<{ ring:[number,number][]; params: PolygonParams; bearingDeg:number; lineSpacingM?:number; triggerDistanceM?:number }> = [];
+        const polys: Array<{
+          polygonId: string;
+          ring: [number, number][];
+          params: PolygonParams;
+          bearingDeg: number;
+          axialBearingDeg: number;
+          lineSpacingM?: number;
+          triggerDistanceM?: number;
+        }> = [];
         polygonParams.forEach((params, pid) => {
           const res = polygonResults.get(pid);
           const collection = drawRef.current?.getAll();
@@ -3644,13 +3683,82 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           const ring = res?.polygon.coordinates || (feature?.geometry as any)?.coordinates?.[0];
           if (!ring) return;
           const override = bearingOverrides.get(pid);
-          const bearingDeg = override ? override.bearingDeg : (res?.result.contourDirDeg ?? 0);
+          const bearingDeg = normalizeBearing(override ? override.bearingDeg : (res?.result.contourDirDeg ?? 0)) ?? 0;
+          const axialBearingDeg = normalizeAxialBearingDeg(bearingDeg);
           const lineSpacingM = override?.lineSpacingM || (polygonFlightLines.get(pid)?.lineSpacing);
-          polys.push({ ring: ring as any, params, bearingDeg, lineSpacingM, triggerDistanceM: params.triggerDistanceM });
+          polys.push({
+            polygonId: pid,
+            ring: ring as any,
+            params,
+            bearingDeg,
+            axialBearingDeg,
+            lineSpacingM,
+            triggerDistanceM: params.triggerDistanceM,
+          });
         });
-        const areas = areasFromState(polys);
+        const fallbackAreas = areasFromState(polys.map(({ ring, params, bearingDeg, lineSpacingM, triggerDistanceM }) => ({
+          ring,
+          params,
+          bearingDeg,
+          lineSpacingM,
+          triggerDistanceM,
+        })));
+        const axialAreasByPolygonId = new Map(
+          polys.map((poly) => [
+            poly.polygonId,
+            areasFromState([{
+              ring: poly.ring,
+              params: poly.params,
+              bearingDeg: poly.axialBearingDeg,
+              lineSpacingM: poly.lineSpacingM,
+              triggerDistanceM: poly.triggerDistanceM,
+            }])[0]!,
+          ] as const),
+        );
+        let areas = fallbackAreas;
         if (areas.length === 0) {
           throw new Error('Draw or import at least one area before exporting a Wingtra flightplan.');
+        }
+        const exportSequenceMaxHeightAboveGroundM = resolveWingtraExportMaxHeightAboveGroundM(lastImportedFlightplan);
+        const exportSequenceCruiseSpeedMps = resolveWingtraExportCruiseSpeedMps(lastImportedFlightplan);
+        if (areas.length > 1 && isAreaSequenceBackendEnabled()) {
+          try {
+            const sequenceResult = await optimizeAreaSequenceWithBackend({
+              areas: polys.map((poly) => ({
+                polygonId: poly.polygonId,
+                ring: poly.ring,
+                bearingDeg: poly.axialBearingDeg,
+                payloadKind: isLidarParams(poly.params) ? 'lidar' : 'camera',
+                params: isLidarParams(poly.params) || (Number.isFinite(poly.params.speedMps) && (poly.params.speedMps as number) > 0)
+                  ? poly.params
+                  : { ...poly.params, speedMps: exportSequenceCruiseSpeedMps },
+              })),
+              terrainSource,
+              altitudeMode,
+              minClearanceM,
+              turnExtendM,
+              maxHeightAboveGroundM: exportSequenceMaxHeightAboveGroundM,
+            });
+            const optimizedAreas = [...sequenceResult.areas]
+              .sort((left, right) => left.orderIndex - right.orderIndex)
+              .map((choice) => {
+                const baseArea = axialAreasByPolygonId.get(choice.polygonId);
+                if (!baseArea) {
+                  throw new Error(`Missing export area for polygon ${choice.polygonId}.`);
+                }
+                return {
+                  ...baseArea,
+                  angleDeg: choice.flipped
+                    ? (normalizeBearing(baseArea.angleDeg + 180) ?? baseArea.angleDeg)
+                    : baseArea.angleDeg,
+                };
+              });
+            if (optimizedAreas.length === areas.length) {
+              areas = optimizedAreas;
+            }
+          } catch (error) {
+            console.warn('Wingtra export area sequencing failed; falling back to current order.', error);
+          }
         }
         const payloadKind = config?.payloadKind ?? areas[0]?.payloadKind ?? 'camera';
         const resolvedPayloadOption =
@@ -3715,6 +3823,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       importKmlFromText, importWingtraFromText,
       optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons, resetAllDrawingsState,
       syncFlightLinesVisibility,
+      altitudeMode, minClearanceM, terrainSource, turnExtendM,
       lastImportedFlightplan
     ]);
 

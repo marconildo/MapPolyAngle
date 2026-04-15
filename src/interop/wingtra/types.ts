@@ -78,7 +78,7 @@ export interface ImportedArea {
   cameraKey?: string;         // internal camera registry key (e.g. SONY_RX1R2, MAP61_17MM)
   lidarKey?: string;          // internal lidar registry key (e.g. WINGTRA_LIDAR_XT32M2X)
   planeHardwareVersion?: PlaneHardwareVersion;
-  speedMps?: number;          // cruise speed used for lidar density estimates
+  speedMps?: number;          // cruise speed carried through from the flightplan (or lidar model defaults)
   lidarReturnMode?: LidarReturnMode;
   mappingFovDeg?: number;
   maxLidarRangeM?: number;
