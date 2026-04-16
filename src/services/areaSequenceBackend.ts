@@ -10,6 +10,13 @@ export interface MissionAreaSequenceBackendArea {
   params: FlightParams;
 }
 
+export interface MissionSequenceEndpoint {
+  point: [number, number];
+  altitudeWgs84M: number;
+  headingDeg?: number;
+  loiterRadiusM?: number;
+}
+
 export interface MissionAreaSequenceBackendRequest {
   areas: MissionAreaSequenceBackendArea[];
   terrainSource: TerrainSourceSelection;
@@ -17,6 +24,8 @@ export interface MissionAreaSequenceBackendRequest {
   minClearanceM: number;
   turnExtendM: number;
   maxHeightAboveGroundM: number;
+  startEndpoint?: MissionSequenceEndpoint;
+  endEndpoint?: MissionSequenceEndpoint;
 }
 
 export interface MissionAreaSequenceBackendChoice {

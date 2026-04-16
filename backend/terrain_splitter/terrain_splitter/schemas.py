@@ -324,6 +324,13 @@ class MissionAreaRequest(BaseModel):
         return self
 
 
+class MissionSequenceEndpointModel(BaseModel):
+    point: tuple[float, float]
+    altitudeWgs84M: float
+    headingDeg: float | None = None
+    loiterRadiusM: float | None = Field(default=None, gt=0)
+
+
 class MissionOptimizeAreaSequenceRequest(BaseModel):
     areas: list[MissionAreaRequest]
     terrainSource: TerrainSourceModel = Field(default_factory=TerrainSourceModel)
@@ -331,8 +338,10 @@ class MissionOptimizeAreaSequenceRequest(BaseModel):
     minClearanceM: float = Field(60, ge=0)
     turnExtendM: float = Field(96, ge=0)  # deprecated compatibility field; current optimizer ignores it
     maxHeightAboveGroundM: float = Field(120, gt=0)
-    exactSearchMaxAreas: int = Field(12, ge=1, le=16)
+    exactSearchMaxAreas: int = Field(15, ge=1, le=16)
     transferCost: "MissionTransferCostModel" = Field(default_factory=lambda: MissionTransferCostModel())
+    startEndpoint: MissionSequenceEndpointModel | None = None
+    endEndpoint: MissionSequenceEndpointModel | None = None
 
     @model_validator(mode="after")
     def validate_areas(self) -> "MissionOptimizeAreaSequenceRequest":
@@ -412,6 +421,8 @@ class MissionOptimizeAreaSequenceResponse(BaseModel):
     solvedExactly: bool
     areas: list[MissionAreaTraversalModel]
     connections: list[MissionConnectionModel] = Field(default_factory=list)
+    startConnection: MissionConnectionModel | None = None
+    endConnection: MissionConnectionModel | None = None
     totalTransferDistanceM: float = Field(..., ge=0)
     totalTransferTimeSec: float = Field(..., ge=0)
     totalTransferCost: float = Field(..., ge=0)

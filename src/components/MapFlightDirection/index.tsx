@@ -19,7 +19,9 @@ import {
   clearAllFlightLines,
   removeTriggerPointsForPolygon,
   clearAllTriggerPoints,
+  clearMissionSequenceEndpoints,
   setProcessingPerimeterPolygons,
+  setMissionSequenceEndpoints,
   setSelectedPolygonHighlight,
   setNonSelectedPolygonDimMask,
   setFlightLineSelectionEmphasis,
@@ -46,7 +48,11 @@ import type {
 } from './api';
 import { fetchTilesForPolygon } from './utils/terrain';
 import { isTerrainPartitionBackendEnabled, solveTerrainPartitionWithBackend } from '@/services/terrainPartitionBackend';
-import type { MissionAreaSequenceBackendRequest, MissionAreaSequenceBackendChoice } from '@/services/areaSequenceBackend';
+import type {
+  MissionAreaSequenceBackendRequest,
+  MissionAreaSequenceBackendChoice,
+  MissionSequenceEndpoint,
+} from '@/services/areaSequenceBackend';
 import { isAreaSequenceBackendEnabled, optimizeAreaSequenceWithBackend } from '@/services/areaSequenceBackend';
 import { isExactTerrainBackendEnabled, optimizeBearingWithBackend } from '@/services/exactTerrainBackend';
 import type { TerrainSourceSelection } from '@/terrain/types';
@@ -274,6 +280,8 @@ function buildAreaSequenceBackendRequest(
     turnExtendM,
     maxHeightAboveGroundM,
     fallbackCruiseSpeedMps,
+    startEndpoint,
+    endEndpoint,
   }: {
     terrainSource: TerrainSourceSelection;
     altitudeMode: 'legacy' | 'min-clearance';
@@ -281,6 +289,8 @@ function buildAreaSequenceBackendRequest(
     turnExtendM: number;
     maxHeightAboveGroundM: number;
     fallbackCruiseSpeedMps: number;
+    startEndpoint?: MissionSequenceEndpoint;
+    endEndpoint?: MissionSequenceEndpoint;
   },
 ): MissionAreaSequenceBackendRequest {
   return {
@@ -298,6 +308,8 @@ function buildAreaSequenceBackendRequest(
     minClearanceM,
     turnExtendM,
     maxHeightAboveGroundM,
+    startEndpoint,
+    endEndpoint,
   };
 }
 
@@ -2902,6 +2914,28 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       }
     }, [mapboxToken, addRingAsDrawFeature, cancelPolygonMerge, invalidatePolygonOperationHistory, polygonFlightLines, polygonParams, fitMapToRings, analyzePolygon, isAsyncGenerationStillValid, onFlightLinesUpdated, onError, buildFlightLinesForPolygonAsync]);
 
+    useEffect(() => {
+      let cancelled = false;
+
+      const syncImportedMissionEndpoints = async () => {
+        const map = mapRef.current;
+        if (!map) return;
+        if (!lastImportedFlightplan) {
+          clearMissionSequenceEndpoints(map);
+          return;
+        }
+        const { extractWingtraSequenceEndpoints } = await loadWingtraConvertModule();
+        if (cancelled) return;
+        setMissionSequenceEndpoints(map, extractWingtraSequenceEndpoints(lastImportedFlightplan));
+      };
+
+      void syncImportedMissionEndpoints();
+
+      return () => {
+        cancelled = true;
+      };
+    }, [lastImportedFlightplan]);
+
     const handleFlightplanFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = e.target.files;
       if (!files) return;
@@ -3609,6 +3643,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       if (mapRef.current) {
         clearAllFlightLines(mapRef.current);
         clearAllTriggerPoints(mapRef.current);
+        clearMissionSequenceEndpoints(mapRef.current);
       }
       setPolygonResults(new Map());
       polygonResultsRef.current = new Map();
@@ -3771,8 +3806,10 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
 	      exportWingtraFlightPlan: async (config?: WingtraFreshExportConfig) => {
         const {
           areasFromState,
+          extractWingtraSequenceEndpoints,
           exportToWingtraFlightPlan,
           replaceAreaItemsInWingtraFlightPlan,
+          replaceAreaItemsInWingtraFlightPlanForOptimizedSequence,
           resolveFreshWingtraExportPayloadOptionFromAreas,
         } = await loadWingtraConvertModule();
         // Build area list from current state
@@ -3805,7 +3842,12 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
         }
         const exportSequenceMaxHeightAboveGroundM = resolveWingtraExportMaxHeightAboveGroundM(lastImportedFlightplan);
         const exportSequenceCruiseSpeedMps = resolveWingtraExportCruiseSpeedMps(lastImportedFlightplan);
-        if (areas.length > 1 && isAreaSequenceBackendEnabled()) {
+        const sequenceEndpoints = extractWingtraSequenceEndpoints(lastImportedFlightplan);
+        let usedOptimizedSequenceExport = false;
+        const shouldRunAreaSequenceOptimization =
+          isAreaSequenceBackendEnabled()
+          && (areas.length > 1 || !!sequenceEndpoints.startEndpoint || !!sequenceEndpoints.endEndpoint);
+        if (shouldRunAreaSequenceOptimization) {
           try {
             const sequenceResult = await optimizeAreaSequenceWithBackend(
               buildAreaSequenceBackendRequest(polys, {
@@ -3815,11 +3857,14 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
                 turnExtendM,
                 maxHeightAboveGroundM: exportSequenceMaxHeightAboveGroundM,
                 fallbackCruiseSpeedMps: exportSequenceCruiseSpeedMps,
+                startEndpoint: sequenceEndpoints.startEndpoint,
+                endEndpoint: sequenceEndpoints.endEndpoint,
               }),
             );
             const optimizedAreas = applyOptimizedAreaSequenceChoices(sequenceResult.areas, axialAreasByPolygonId);
             if (optimizedAreas.length === areas.length) {
               areas = optimizedAreas;
+              usedOptimizedSequenceExport = true;
             }
           } catch (error) {
             console.warn('Wingtra export area sequencing failed; falling back to current order.', error);
@@ -3844,12 +3889,17 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
         if (canUseImportedTemplate) {
           // Deep clone original
             fp = JSON.parse(JSON.stringify(lastImportedFlightplan));
-          // Replace only area items and preserve non-area mission items like takeoff, loiter, and landing.
-          fp = replaceAreaItemsInWingtraFlightPlan(fp, areas, {
-            payloadKind,
-            payloadUniqueString: resolvedPayloadOption.payloadUniqueString,
-            payloadName: resolvedPayloadOption.payloadName,
-          });
+          fp = usedOptimizedSequenceExport
+            ? replaceAreaItemsInWingtraFlightPlanForOptimizedSequence(fp, areas, {
+                payloadKind,
+                payloadUniqueString: resolvedPayloadOption.payloadUniqueString,
+                payloadName: resolvedPayloadOption.payloadName,
+              })
+            : replaceAreaItemsInWingtraFlightPlan(fp, areas, {
+                payloadKind,
+                payloadUniqueString: resolvedPayloadOption.payloadUniqueString,
+                payloadName: resolvedPayloadOption.payloadName,
+              });
           fp.flightPlan.payload = resolvedPayloadOption.payloadName;
           fp.flightPlan.payloadUniqueString = resolvedPayloadOption.payloadUniqueString;
           const hwVersion =

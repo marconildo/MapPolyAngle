@@ -989,7 +989,7 @@ def optimize_area_sequence_endpoint(
     started_at = time.perf_counter()
     area_ids = [area.polygonId for area in request.areas]
     logger.info(
-        "[terrain-split-sequence][%s] start areaCount=%d areaIds=%s terrainMode=%s datasetId=%s altitudeMode=%s minClearanceM=%.1f maxHeightAboveGroundM=%.1f exactSearchMaxAreas=%d transferCostOverride=%s",
+        "[terrain-split-sequence][%s] start areaCount=%d areaIds=%s terrainMode=%s datasetId=%s altitudeMode=%s minClearanceM=%.1f maxHeightAboveGroundM=%.1f exactSearchMaxAreas=%d transferCostOverride=%s startEndpoint=%s endEndpoint=%s",
         request_id,
         len(request.areas),
         ",".join(area_ids) if area_ids else "<none>",
@@ -1000,6 +1000,8 @@ def optimize_area_sequence_endpoint(
         float(request.maxHeightAboveGroundM),
         int(request.exactSearchMaxAreas),
         "yes" if request.transferCost is not None else "no",
+        "yes" if request.startEndpoint is not None else "no",
+        "yes" if request.endEndpoint is not None else "no",
     )
     try:
         grid_step_m = choose_grid_step_m(
@@ -1014,6 +1016,11 @@ def optimize_area_sequence_endpoint(
             lazy_load_missing=True,
         )
         response = optimize_area_sequence(request, dem, request_id=request_id)
+        total_connection_count = len(response.connections)
+        if response.startConnection is not None:
+            total_connection_count += 1
+        if response.endConnection is not None:
+            total_connection_count += 1
         logger.info(
             "[terrain-split-sequence][%s] done elapsedMs=%.1f solveMode=%s exact=%s areas=%d connections=%d totalTransferCost=%.3f",
             request_id,
@@ -1021,7 +1028,7 @@ def optimize_area_sequence_endpoint(
             response.solveMode,
             "true" if response.solvedExactly else "false",
             len(response.areas),
-            len(response.connections),
+            total_connection_count,
             float(response.totalTransferCost),
         )
         return response

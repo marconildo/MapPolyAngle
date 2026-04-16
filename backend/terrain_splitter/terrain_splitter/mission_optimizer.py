@@ -24,6 +24,7 @@ from .schemas import (
     MissionConnectionModel,
     MissionOptimizeAreaSequenceRequest,
     MissionOptimizeAreaSequenceResponse,
+    MissionSequenceEndpointModel,
     MissionTransferCostModel,
     MissionTraversalLoiterModel,
 )
@@ -408,6 +409,72 @@ def _build_fallback_loiter_descriptor(
         center_mercator=center_mercator,
         radius_m=max(1.0, radius_m),
         direction=direction,
+    )
+
+
+def _point_offset_along_bearing(
+    point: tuple[float, float],
+    bearing_deg: float,
+    distance_m: float,
+) -> tuple[float, float]:
+    x, y = lnglat_to_mercator(*point)
+    bearing_rad = math.radians(_normalize360(bearing_deg))
+    return mercator_to_lnglat(
+        x + distance_m * math.sin(bearing_rad),
+        y + distance_m * math.cos(bearing_rad),
+    )
+
+
+def _build_endpoint_traversal_option(
+    endpoint: MissionSequenceEndpointModel,
+    params: FlightParamsModel,
+    dem: TerrainDEM,
+    *,
+    role: str,
+) -> _TraversalOption:
+    point = (float(endpoint.point[0]), float(endpoint.point[1]))
+    heading_deg = float(endpoint.headingDeg) if endpoint.headingDeg is not None else 0.0
+    radius_m = max(
+        DEFAULT_CONNECTION_TURN_RADIUS_M,
+        float(endpoint.loiterRadiusM) if endpoint.loiterRadiusM is not None else DEFAULT_CONNECTION_TURN_RADIUS_M,
+    )
+    terrain_m = _sample_terrain_at_lnglat(point[0], point[1], dem)
+    altitude_wgs84_m = float(endpoint.altitudeWgs84M)
+    altitude_agl = max(0.0, altitude_wgs84_m - terrain_m)
+    heading_anchor_distance_m = min(20.0, max(5.0, radius_m * 0.5))
+    if role == "start":
+        start_point = _point_offset_along_bearing(point, heading_deg + 180.0, heading_anchor_distance_m)
+        end_point = point
+        maneuver_direction = "clockwise"
+    else:
+        start_point = point
+        end_point = _point_offset_along_bearing(point, heading_deg, heading_anchor_distance_m)
+        maneuver_direction = "counterclockwise"
+    lead = _build_fallback_loiter_descriptor(
+        point,
+        heading_deg,
+        radius_m,
+        direction=maneuver_direction,
+    )
+    start_mercator = lnglat_to_mercator(*start_point)
+    end_mercator = lnglat_to_mercator(*end_point)
+    return _TraversalOption(
+        polygon_id="__depot_start__" if role == "start" else "__depot_end__",
+        area_index=-1,
+        flipped=False,
+        bearing_deg=heading_deg,
+        params=params,
+        altitude_agl=altitude_agl,
+        start_point=start_point,
+        end_point=end_point,
+        start_mercator=start_mercator,
+        end_mercator=end_mercator,
+        start_terrain_m=terrain_m,
+        end_terrain_m=terrain_m,
+        start_altitude_wgs84_m=altitude_wgs84_m,
+        end_altitude_wgs84_m=altitude_wgs84_m,
+        lead_in=lead,
+        lead_out=lead,
     )
 
 
@@ -2087,22 +2154,59 @@ def build_connection_candidate(
     )
 
 
+def _build_endpoint_connection_candidate(
+    endpoint: MissionSequenceEndpointModel,
+    area_option: _TraversalOption,
+    dem: TerrainDEM,
+    *,
+    role: str,
+    max_height_above_ground_m: float,
+    transfer_cost: MissionTransferCostModel | None = None,
+) -> _ConnectionCandidate:
+    endpoint_option = _build_endpoint_traversal_option(endpoint, area_option.params, dem, role=role)
+    if role == "start":
+        return build_connection_candidate(
+            endpoint_option,
+            area_option,
+            dem,
+            max_height_above_ground_m=max_height_above_ground_m,
+            transfer_cost=transfer_cost,
+        )
+    return build_connection_candidate(
+        area_option,
+        endpoint_option,
+        dem,
+        max_height_above_ground_m=max_height_above_ground_m,
+        transfer_cost=transfer_cost,
+    )
+
+
 def _total_path_cost(
     sequence: list[tuple[int, bool]],
     edge_lookup: dict[tuple[int, bool, int, bool], _ConnectionCandidate],
+    start_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+    end_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
 ) -> float:
+    if not sequence:
+        return 0.0
     total = 0.0
+    if start_edge_lookup is not None:
+        total += start_edge_lookup[sequence[0]].objective_cost
     for (from_area, from_flip), (to_area, to_flip) in zip(sequence, sequence[1:]):
         total += edge_lookup[(from_area, from_flip, to_area, to_flip)].objective_cost
+    if end_edge_lookup is not None:
+        total += end_edge_lookup[sequence[-1]].objective_cost
     return total
 
 
 def _solve_exact_path(
     area_count: int,
     edge_lookup: dict[tuple[int, bool, int, bool], _ConnectionCandidate],
+    start_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+    end_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
 ) -> list[tuple[int, bool]]:
-    if area_count <= 1:
-        return [(0, False)] if area_count == 1 else []
+    if area_count <= 0:
+        return []
 
     full_mask = (1 << area_count) - 1
     dp: dict[tuple[int, int, bool], float] = {}
@@ -2111,7 +2215,7 @@ def _solve_exact_path(
     for area_index in range(area_count):
         for flipped in (False, True):
             key = (1 << area_index, area_index, flipped)
-            dp[key] = 0.0
+            dp[key] = start_edge_lookup[(area_index, flipped)].objective_cost if start_edge_lookup is not None else 0.0
             previous[key] = None
 
     for mask in range(1, full_mask + 1):
@@ -2141,8 +2245,11 @@ def _solve_exact_path(
         for flipped in (False, True):
             key = (full_mask, area_index, flipped)
             cost = dp.get(key)
-            if cost is not None and cost < best_cost:
-                best_cost = cost
+            if cost is None:
+                continue
+            total_cost = cost + (end_edge_lookup[(area_index, flipped)].objective_cost if end_edge_lookup is not None else 0.0)
+            if total_cost < best_cost:
+                best_cost = total_cost
                 best_key = key
 
     if best_key is None:
@@ -2160,9 +2267,11 @@ def _solve_exact_path(
 def _solve_greedy_path(
     area_count: int,
     edge_lookup: dict[tuple[int, bool, int, bool], _ConnectionCandidate],
+    start_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+    end_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
 ) -> list[tuple[int, bool]]:
-    if area_count <= 1:
-        return [(0, False)] if area_count == 1 else []
+    if area_count <= 0:
+        return []
 
     best_sequence: list[tuple[int, bool]] | None = None
     best_cost = math.inf
@@ -2195,7 +2304,7 @@ def _solve_greedy_path(
                     candidate = list(sequence)
                     area_index, flipped = candidate[position]
                     candidate[position] = (area_index, not flipped)
-                    if _total_path_cost(candidate, edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup):
+                    if _total_path_cost(candidate, edge_lookup, start_edge_lookup, end_edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup):
                         sequence = candidate
                         improved = True
 
@@ -2203,10 +2312,10 @@ def _solve_greedy_path(
                 for right_index in range(left_index + 1, len(sequence)):
                     candidate = list(sequence)
                     candidate[left_index], candidate[right_index] = candidate[right_index], candidate[left_index]
-                    if _total_path_cost(candidate, edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup):
+                    if _total_path_cost(candidate, edge_lookup, start_edge_lookup, end_edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup):
                         sequence = candidate
 
-            sequence_cost = _total_path_cost(sequence, edge_lookup)
+            sequence_cost = _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup)
             if sequence_cost < best_cost:
                 best_cost = sequence_cost
                 best_sequence = sequence
@@ -2220,44 +2329,6 @@ def optimize_area_sequence(
     *,
     request_id: str,
 ) -> MissionOptimizeAreaSequenceResponse:
-    if len(request.areas) == 1:
-        only_area = request.areas[0]
-        forward, _ = build_area_traversal_options(
-            0,
-            only_area,
-            dem,
-            altitude_mode=request.altitudeMode,
-            min_clearance_m=float(request.minClearanceM),
-        )
-        response = MissionOptimizeAreaSequenceResponse(
-            requestId=request_id,
-            solveMode="exact-dp",
-            solvedExactly=True,
-            areas=[
-                MissionAreaTraversalModel(
-                    polygonId=only_area.polygonId,
-                    orderIndex=0,
-                    flipped=False,
-                    bearingDeg=forward.bearing_deg,
-                    startPoint=forward.start_point,
-                    endPoint=forward.end_point,
-                    startAltitudeWgs84M=forward.start_altitude_wgs84_m,
-                    endAltitudeWgs84M=forward.end_altitude_wgs84_m,
-                )
-            ],
-            connections=[],
-            totalTransferDistanceM=0.0,
-            totalTransferTimeSec=0.0,
-            totalTransferCost=0.0,
-        )
-        logger.info(
-            "[terrain-split-sequence][%s] single-area passthrough polygonId=%s bearingDeg=%.1f",
-            request_id,
-            only_area.polygonId,
-            forward.bearing_deg,
-        )
-        return response
-
     traversal_options_by_area: list[dict[bool, _TraversalOption]] = []
     for area_index, area in enumerate(request.areas):
         forward, flipped = build_area_traversal_options(
@@ -2284,20 +2355,56 @@ def optimize_area_sequence(
                         transfer_cost=request.transferCost,
                     )
 
+    start_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None
+    if request.startEndpoint is not None:
+        start_edge_lookup = {}
+        for area_index, options in enumerate(traversal_options_by_area):
+            for flipped in (False, True):
+                start_edge_lookup[(area_index, flipped)] = _build_endpoint_connection_candidate(
+                    request.startEndpoint,
+                    options[flipped],
+                    dem,
+                    role="start",
+                    max_height_above_ground_m=float(request.maxHeightAboveGroundM),
+                    transfer_cost=request.transferCost,
+                )
+
+    end_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None
+    if request.endEndpoint is not None:
+        end_edge_lookup = {}
+        for area_index, options in enumerate(traversal_options_by_area):
+            for flipped in (False, True):
+                end_edge_lookup[(area_index, flipped)] = _build_endpoint_connection_candidate(
+                    request.endEndpoint,
+                    options[flipped],
+                    dem,
+                    role="end",
+                    max_height_above_ground_m=float(request.maxHeightAboveGroundM),
+                    transfer_cost=request.transferCost,
+                )
+
     if len(request.areas) <= request.exactSearchMaxAreas:
-        sequence = _solve_exact_path(len(request.areas), edge_lookup)
+        sequence = _solve_exact_path(len(request.areas), edge_lookup, start_edge_lookup, end_edge_lookup)
         solve_mode = "exact-dp"
         solved_exactly = True
     else:
-        sequence = _solve_greedy_path(len(request.areas), edge_lookup)
+        sequence = _solve_greedy_path(len(request.areas), edge_lookup, start_edge_lookup, end_edge_lookup)
         solve_mode = "greedy-fallback"
         solved_exactly = False
 
     area_models: list[MissionAreaTraversalModel] = []
     connection_models: list[MissionConnectionModel] = []
+    start_connection_model: MissionConnectionModel | None = None
+    end_connection_model: MissionConnectionModel | None = None
     total_transfer_distance_m = 0.0
     total_transfer_time_sec = 0.0
     total_transfer_cost = 0.0
+
+    if sequence and start_edge_lookup is not None:
+        start_connection_model = start_edge_lookup[sequence[0]].model
+        total_transfer_distance_m += float(start_connection_model.transferDistanceM)
+        total_transfer_time_sec += float(start_connection_model.transferTimeSec)
+        total_transfer_cost += float(start_connection_model.transferCost)
 
     for order_index, (area_index, flipped) in enumerate(sequence):
         option = traversal_options_by_area[area_index][flipped]
@@ -2322,12 +2429,20 @@ def optimize_area_sequence(
         total_transfer_time_sec += float(edge.model.transferTimeSec)
         total_transfer_cost += float(edge.model.transferCost)
 
+    if sequence and end_edge_lookup is not None:
+        end_connection_model = end_edge_lookup[sequence[-1]].model
+        total_transfer_distance_m += float(end_connection_model.transferDistanceM)
+        total_transfer_time_sec += float(end_connection_model.transferTimeSec)
+        total_transfer_cost += float(end_connection_model.transferCost)
+
     response = MissionOptimizeAreaSequenceResponse(
         requestId=request_id,
         solveMode=solve_mode,
         solvedExactly=solved_exactly,
         areas=area_models,
         connections=connection_models,
+        startConnection=start_connection_model,
+        endConnection=end_connection_model,
         totalTransferDistanceM=total_transfer_distance_m,
         totalTransferTimeSec=total_transfer_time_sec,
         totalTransferCost=total_transfer_cost,

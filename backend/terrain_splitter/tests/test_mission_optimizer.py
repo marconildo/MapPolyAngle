@@ -16,6 +16,7 @@ from terrain_splitter.schemas import (
     MissionAreaRequest,
     MissionAreaTraversalRequestModel,
     MissionOptimizeAreaSequenceRequest,
+    MissionSequenceEndpointModel,
     MissionTraversalLoiterModel,
 )
 
@@ -117,6 +118,21 @@ def _make_provided_area(
 
 def _inverse_direction(direction: str) -> str:
     return "counterclockwise" if direction == "clockwise" else "clockwise"
+
+
+def _endpoint(
+    point: tuple[float, float],
+    *,
+    altitude_wgs84_m: float,
+    heading_deg: float = 0.0,
+    loiter_radius_m: float = 30.0,
+) -> MissionSequenceEndpointModel:
+    return MissionSequenceEndpointModel(
+        point=point,
+        altitudeWgs84M=altitude_wgs84_m,
+        headingDeg=heading_deg,
+        loiterRadiusM=loiter_radius_m,
+    )
 
 
 def test_two_area_exact_solver_picks_lower_cost_flip() -> None:
@@ -708,6 +724,93 @@ def test_solver_falls_back_to_greedy_when_exact_limit_is_low() -> None:
     assert response.solveMode == "greedy-fallback"
     assert response.solvedExactly is False
     assert sorted(area.polygonId for area in response.areas) == ["A", "B", "C"]
+
+
+def test_single_area_solver_accounts_for_optional_start_and_end_endpoints() -> None:
+    dem = FlatDem()
+    area = _make_provided_area(
+        "solo",
+        ring_origin_lng=0.0,
+        ring_origin_lat=0.0,
+        start_point=(7.0000, 47.0000),
+        end_point=(7.0100, 47.0000),
+        lead_in_center=(7.0000, 46.9997),
+        lead_out_center=(7.0100, 46.9997),
+        lead_in_radius_m=25.0,
+        lead_out_radius_m=25.0,
+        altitude_agl=80.0,
+        altitude_wgs84_m=180.0,
+    )
+    request = MissionOptimizeAreaSequenceRequest(
+        areas=[area],
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+        exactSearchMaxAreas=1,
+        startEndpoint=_endpoint((7.0000, 47.0000), altitude_wgs84_m=180.0, heading_deg=90.0),
+        endEndpoint=_endpoint((7.0100, 47.0000), altitude_wgs84_m=180.0, heading_deg=90.0),
+    )
+
+    response = optimize_area_sequence(request, dem, request_id="req-single-endpoints")
+
+    options = build_area_traversal_options(0, area, dem, altitude_mode="legacy", min_clearance_m=60.0)
+    start_costs = {
+        flipped: mission_optimizer._build_endpoint_connection_candidate(
+            request.startEndpoint,
+            options[1 if flipped else 0],
+            dem,
+            role="start",
+            max_height_above_ground_m=120.0,
+        ).objective_cost
+        for flipped in (False, True)
+    }
+    end_costs = {
+        flipped: mission_optimizer._build_endpoint_connection_candidate(
+            request.endEndpoint,
+            options[1 if flipped else 0],
+            dem,
+            role="end",
+            max_height_above_ground_m=120.0,
+        ).objective_cost
+        for flipped in (False, True)
+    }
+    expected_flipped = min((False, True), key=lambda flipped: start_costs[flipped] + end_costs[flipped])
+
+    assert response.solveMode == "exact-dp"
+    assert response.solvedExactly is True
+    assert len(response.areas) == 1
+    assert response.areas[0].flipped is expected_flipped
+    assert response.startConnection is not None
+    assert response.endConnection is not None
+    assert math.isclose(
+        response.totalTransferCost,
+        response.startConnection.transferCost + response.endConnection.transferCost,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    )
+
+
+def test_exact_solver_accepts_one_sided_endpoint_constraints() -> None:
+    dem = FlatDem()
+    areas = [
+        _make_area("A", 0.0000, 0.0000),
+        _make_area("B", 0.0030, 0.0000),
+    ]
+    request = MissionOptimizeAreaSequenceRequest(
+        areas=areas,
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+        exactSearchMaxAreas=12,
+        startEndpoint=_endpoint((6.9990, 47.0000), altitude_wgs84_m=180.0, heading_deg=90.0),
+    )
+
+    response = optimize_area_sequence(request, dem, request_id="req-start-only")
+
+    assert response.startConnection is not None
+    assert response.endConnection is None
+    assert response.startConnection.fromPolygonId == "__depot_start__"
+    assert response.totalTransferCost >= response.startConnection.transferCost
 
 
 def test_connection_builder_handles_same_direction_overlap_with_auxiliary_arc() -> None:
