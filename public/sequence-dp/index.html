@@ -229,9 +229,11 @@
         <p class="deck">
           This article explains the sequencing layer in the mission planner: once a large mapping site has already
           been partitioned into smaller survey areas and each area already has an optimized local bearing, we still
-          need to decide the order in which those areas should be flown and whether each one should be reversed. The
-          live user-facing planner for this workflow is
-          <a href="https://map-poly-angle.vercel.app/" target="_blank" rel="noreferrer">Map Poly Angle</a>.
+          need to decide the order in which those areas should be flown and whether each one should be reversed. This
+          blog focuses on that solution approach. If you want to jump ahead and try the workflow yourself, you can use
+          it in
+          <a href="https://map-poly-angle.vercel.app/" target="_blank" rel="noreferrer">Map Poly Angle</a>; the
+          sequencing optimization runs at export.
         </p>
       </header>
 
@@ -369,6 +371,12 @@
           then tries to make the resulting mission cheaper to fly by reducing long transfers, avoidable climbs, and
           bad area-to-area ordering.
         </p>
+        <p>
+          In other words, the sequencing layer receives a compressed version of the mission rather than the full
+          geometric planning problem. Each area has already been reduced to a small set of traversal modes, so the
+          remaining optimization can focus on one question: given <em>N</em> fixed survey areas, each with two
+          traversal modes, what ordering and per-area mode choice minimizes the total inter-area connector cost?
+        </p>
         <ol class="pipeline-list">
           <li>Start from a large region that needs to be mapped accurately.</li>
           <li>Partition it into smaller terrain-aware survey areas.</li>
@@ -414,6 +422,12 @@
         <p class="section-kicker">3. Why DP is relevant here</p>
         <h2>This sequencing problem has exactly the structure DP likes</h2>
         <p>
+          The global problem is TSP-like, but not identical to the textbook tour formulation. We are solving for an
+          <strong>open path</strong>, not a cycle: the mission may start at any area and end at any area, with no
+          return-to-start constraint. That matters because the optimizer scores only the transfer legs between survey
+          areas after local bearing optimization has already finished.
+        </p>
+        <p>
           For <strong>11 areas</strong>, a brute-force solver would examine every permutation of areas
           and every independent flip assignment. That is <strong>81,749,606,400</strong> mission variants.
           Each area contributes one position in the permutation and one binary flip choice.
@@ -435,8 +449,8 @@
         <h2>Once the areas are fixed, the sequence optimizer becomes a subset DP</h2>
         <p>
           Each area contributes exactly two traversal modes: <strong>forward</strong> and <strong>flipped</strong>.
-          Flipping does not change the already-optimized sweep orientation. It only swaps which end of the survey
-          pattern is the entry and which end is the exit.
+          Both modes share the same already-optimized internal strip geometry; flip only changes which end of that
+          fixed pattern is used as ingress and which end is used as egress.
         </p>
         <div class="formula-grid">
           <div class="formula-box">
@@ -447,7 +461,7 @@
           <div class="formula-box">
             <div class="section-kicker">Base case</div>
             <div class="equation"><span style="font-style:italic">DP</span>[{i}, i, f] = 0</div>
-            <p>Starting on any area incurs no inter-area transfer cost.</p>
+            <p>In this formulation, we optimize only inter-area transfer legs and allow the mission to start at any area, so the single-area base cost is zero.</p>
           </div>
           <div class="formula-box">
             <div class="section-kicker">Transition</div>
@@ -456,8 +470,9 @@
           </div>
         </div>
         <p>
-          In implementation terms this is a Held-Karp-style bitmask DP for a Hamiltonian path, with one extra binary
-          dimension per area to represent the flip choice.
+          If launch or depot positioning needs to be modeled, that cost would enter through the base case or an
+          additional endpoint term. In implementation terms this is a Held-Karp-style bitmask DP for a Hamiltonian
+          path, with one extra binary dimension per area to represent the flip choice.
         </p>
       </section>
 
@@ -483,8 +498,10 @@
         <h2>DP does not remove the combinatorics, but it compresses them dramatically</h2>
         <p>
           The brute-force space for 11 areas is 81,749,606,400 candidates. The DP
-          collapses those into 45,056 distinct states by merging route prefixes that reach the same
-          visited-set / terminal-area / flip-state summary.
+          collapses those into 22,528 valid states by merging route prefixes that reach the same
+          visited-set / terminal-area / flip-state summary. For this formulation, the exact state count is
+          <strong>N · 2<sup>N</sup></strong>: each subset contributes one state for every possible terminal area
+          inside that subset, and each of those terminal choices already carries the forward-versus-flipped mode.
         </p>
         <div class="metric-grid">
           <div class="metric-box">
@@ -494,10 +511,15 @@
           </div>
           <div class="metric-box">
             <div class="metric-label">DP state count</div>
-            <div class="metric-value">45,056</div>
-            <div class="metric-detail">Approximately 2 · N · 2<sup>N</sup> states for this formulation.</div>
+            <div class="metric-value">22,528</div>
+            <div class="metric-detail">Exactly N · 2<sup>N</sup> valid states for this DP state definition.</div>
           </div>
         </div>
+        <p>
+          In product terms, that growth is why the export backend uses exact DP only for small to medium missions.
+          The recurrence has the usual <strong>O(N<sup>2</sup> 2<sup>N</sup>)</strong> scaling, so beyond a chosen
+          threshold we switch to a greedy fallback to keep export latency bounded.
+        </p>
       </section>
 
       
