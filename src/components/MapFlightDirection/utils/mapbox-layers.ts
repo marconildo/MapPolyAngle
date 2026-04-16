@@ -67,6 +67,9 @@ const SELECTED_POLYGON_INNER_LAYER_ID = 'selected-polygon-highlight-inner';
 const NON_SELECTED_POLYGONS_SOURCE_ID = 'non-selected-polygons-dim-source';
 const NON_SELECTED_POLYGONS_FILL_LAYER_ID = 'non-selected-polygons-dim-fill';
 const NON_SELECTED_POLYGONS_LINE_LAYER_ID = 'non-selected-polygons-dim-line';
+const MISSION_ENDPOINTS_SOURCE_ID = 'mission-sequence-endpoints-source';
+const MISSION_ENDPOINTS_MARKER_LAYER_ID = 'mission-sequence-endpoints-marker';
+const MISSION_ENDPOINTS_LABEL_LAYER_ID = 'mission-sequence-endpoints-label';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -81,6 +84,14 @@ function ensureClosedRing(ring: [number, number][]): [number, number][] {
   const [lastLng, lastLat] = ring[ring.length - 1];
   if (firstLng === lastLng && firstLat === lastLat) return ring;
   return [...ring, [firstLng, firstLat]];
+}
+
+function pointsAreNear(
+  left: [number, number],
+  right: [number, number],
+  epsilonDeg = 1e-7,
+) {
+  return Math.abs(left[0] - right[0]) <= epsilonDeg && Math.abs(left[1] - right[1]) <= epsilonDeg;
 }
 
 function buildProcessingPulseGradient(phase: number) {
@@ -313,6 +324,94 @@ export function clearDsmFootprintPolygon(map: MapboxMap) {
   try { if (map.getLayer(DSM_FOOTPRINT_LINE_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_LINE_LAYER_ID); } catch {}
   try { if (map.getLayer(DSM_FOOTPRINT_FILL_LAYER_ID)) map.removeLayer(DSM_FOOTPRINT_FILL_LAYER_ID); } catch {}
   try { if (map.getSource(DSM_FOOTPRINT_SOURCE_ID)) map.removeSource(DSM_FOOTPRINT_SOURCE_ID); } catch {}
+}
+
+export function setMissionSequenceEndpoints(
+  map: MapboxMap,
+  endpoints: {
+    startEndpoint?: { point: [number, number] };
+    endEndpoint?: { point: [number, number] };
+  } | null,
+) {
+  if (!endpoints?.startEndpoint && !endpoints?.endEndpoint) {
+    clearMissionSequenceEndpoints(map);
+    return;
+  }
+
+  const uniquePoints: [number, number][] = [];
+  for (const point of [endpoints.startEndpoint?.point, endpoints.endEndpoint?.point]) {
+    if (!point) continue;
+    if (uniquePoints.some((existing) => pointsAreNear(existing, point))) continue;
+    uniquePoints.push(point);
+  }
+
+  const features = uniquePoints.map((point) => ({
+    type: 'Feature',
+    geometry: {
+      type: 'Point',
+      coordinates: point,
+    },
+    properties: {
+      label: 'H',
+      radius: 6,
+    },
+  }));
+
+  const data = {
+    type: 'FeatureCollection',
+    features,
+  } as const;
+
+  if (map.getSource(MISSION_ENDPOINTS_SOURCE_ID)) {
+    (map.getSource(MISSION_ENDPOINTS_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(MISSION_ENDPOINTS_SOURCE_ID, {
+      type: 'geojson',
+      data,
+    } as any);
+  }
+
+  const beforeId = getDrawLayerAnchor(map);
+  if (!map.getLayer(MISSION_ENDPOINTS_MARKER_LAYER_ID)) {
+    map.addLayer({
+      id: MISSION_ENDPOINTS_MARKER_LAYER_ID,
+      type: 'circle',
+      source: MISSION_ENDPOINTS_SOURCE_ID,
+      paint: {
+        'circle-radius': ['get', 'radius'],
+        'circle-color': '#14b8a6',
+        'circle-stroke-width': 2,
+        'circle-stroke-color': '#ffffff',
+        'circle-opacity': 0.96,
+      },
+    }, beforeId);
+  }
+  if (!map.getLayer(MISSION_ENDPOINTS_LABEL_LAYER_ID)) {
+    map.addLayer({
+      id: MISSION_ENDPOINTS_LABEL_LAYER_ID,
+      type: 'symbol',
+      source: MISSION_ENDPOINTS_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'label'],
+        'text-size': 10,
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-anchor': 'center',
+        'text-allow-overlap': true,
+        'text-ignore-placement': true,
+      },
+      paint: {
+        'text-color': '#ffffff',
+        'text-halo-color': '#ffffff',
+        'text-halo-width': 0,
+      }
+    }, beforeId);
+  }
+}
+
+export function clearMissionSequenceEndpoints(map: MapboxMap) {
+  try { if (map.getLayer(MISSION_ENDPOINTS_LABEL_LAYER_ID)) map.removeLayer(MISSION_ENDPOINTS_LABEL_LAYER_ID); } catch {}
+  try { if (map.getLayer(MISSION_ENDPOINTS_MARKER_LAYER_ID)) map.removeLayer(MISSION_ENDPOINTS_MARKER_LAYER_ID); } catch {}
+  try { if (map.getSource(MISSION_ENDPOINTS_SOURCE_ID)) map.removeSource(MISSION_ENDPOINTS_SOURCE_ID); } catch {}
 }
 
 export function setNonSelectedPolygonDimMask(

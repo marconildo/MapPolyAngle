@@ -192,6 +192,135 @@ function isWingtraAreaItem(value: unknown): value is WingtraAreaItem {
   return maybeItem.type === "ComplexItem" && maybeItem.complexItemType === "area";
 }
 
+function isWingtraTakeoffItem(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const maybeItem = value as { type?: unknown; complexItemType?: unknown; simpleItemType?: unknown };
+  return (
+    (maybeItem.type === "ComplexItem" && maybeItem.complexItemType === "takeoff")
+    || (maybeItem.type === "SimpleItem" && maybeItem.simpleItemType === "takeoff")
+  );
+}
+
+function isWingtraLandingItem(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const maybeItem = value as { type?: unknown; complexItemType?: unknown; simpleItemType?: unknown };
+  return (
+    (maybeItem.type === "ComplexItem" && maybeItem.complexItemType === "land")
+    || (maybeItem.type === "SimpleItem" && maybeItem.simpleItemType === "landing")
+  );
+}
+
+function isWingtraDroppableOptimizedSequenceItem(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const maybeItem = value as { type?: unknown; complexItemType?: unknown; simpleItemType?: unknown };
+  const itemType =
+    (typeof maybeItem.complexItemType === "string" ? maybeItem.complexItemType : undefined)
+    ?? (typeof maybeItem.simpleItemType === "string" ? maybeItem.simpleItemType : undefined);
+  return itemType === "loiter" || itemType === "waypoint";
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function readWingtraMissionItemPoint(item: Record<string, unknown>): LngLat | undefined {
+  const coordinate = item.coordinate;
+  if (!Array.isArray(coordinate) || coordinate.length < 2) return undefined;
+  const lat = readFiniteNumber(coordinate[0]);
+  const lng = readFiniteNumber(coordinate[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return undefined;
+  if (Math.abs(lat!) < 1e-9 && Math.abs(lng!) < 1e-9) return undefined;
+  if (lat! < -90 || lat! > 90 || lng! < -180 || lng! > 180) return undefined;
+  return [lng!, lat!];
+}
+
+export interface WingtraSequenceEndpoint {
+  point: LngLat;
+  altitudeWgs84M: number;
+  headingDeg?: number;
+  loiterRadiusM?: number;
+}
+
+export interface WingtraSequenceEndpoints {
+  startEndpoint?: WingtraSequenceEndpoint;
+  endEndpoint?: WingtraSequenceEndpoint;
+}
+
+// Wingtra takeoff/landing file items store these altitudes relative to the
+// takeoff/home altitude, not as raw AMSL/WGS84 values. This matches the
+// WingtraCloud generator, which writes:
+// - takeoff `exitAltitude = loiterExitAMSL - takeOffPosition[2]`
+// - landing `loiterEntryAltitude = loiterEntryAMSL - takeOffAltitude`
+// So we convert them back into approximate WGS84 altitudes using the stored
+// planned home altitude here.
+function resolveWingtraHomeAltitudeWgs84M(template: WingtraFlightPlan | null | undefined): number {
+  const plannedHomePosition = template?.flightPlan?.plannedHomePosition;
+  if (Array.isArray(plannedHomePosition) && plannedHomePosition.length >= 3) {
+    const homeAltitude = readFiniteNumber(plannedHomePosition[2]);
+    if (Number.isFinite(homeAltitude)) return homeAltitude!;
+  }
+  const originCoordinate = template?.flightPlanOrigin?.coordinate;
+  if (Array.isArray(originCoordinate) && originCoordinate.length >= 3) {
+    const originAltitude = readFiniteNumber(originCoordinate[2]);
+    if (Number.isFinite(originAltitude)) return originAltitude!;
+  }
+  return 0;
+}
+
+function readWingtraTakeoffEndpoint(
+  item: Record<string, unknown>,
+  homeAltitudeWgs84M: number,
+): WingtraSequenceEndpoint | undefined {
+  const point = readWingtraMissionItemPoint(item);
+  const relativeAltitudeM = readFiniteNumber(item.exitAltitude);
+  const altitudeWgs84M = Number.isFinite(relativeAltitudeM) ? homeAltitudeWgs84M + relativeAltitudeM! : undefined;
+  if (!point || !Number.isFinite(altitudeWgs84M)) return undefined;
+  const headingDeg = readFiniteNumber(item.loiterHeading);
+  const loiterRadiusM = readFiniteNumber(item.loiterRadius);
+  if (!Number.isFinite(loiterRadiusM) || loiterRadiusM! <= 0) return undefined;
+  return {
+    point,
+    altitudeWgs84M: altitudeWgs84M!,
+    headingDeg: Number.isFinite(headingDeg) ? headingDeg : undefined,
+    loiterRadiusM: loiterRadiusM!,
+  };
+}
+
+function readWingtraLandingEndpoint(
+  item: Record<string, unknown>,
+  homeAltitudeWgs84M: number,
+): WingtraSequenceEndpoint | undefined {
+  const point = readWingtraMissionItemPoint(item);
+  const relativeAltitudeM =
+    readFiniteNumber(item.loiterEntryAltitude)
+    ?? readFiniteNumber(item.transitionAltitude);
+  const altitudeWgs84M = Number.isFinite(relativeAltitudeM) ? homeAltitudeWgs84M + relativeAltitudeM! : undefined;
+  if (!point || !Number.isFinite(altitudeWgs84M)) return undefined;
+  const headingDeg = readFiniteNumber(item.loiterHeading);
+  const loiterRadiusM = readFiniteNumber(item.loiterRadius);
+  if (!Number.isFinite(loiterRadiusM) || loiterRadiusM! <= 0) return undefined;
+  return {
+    point,
+    altitudeWgs84M: altitudeWgs84M!,
+    headingDeg: Number.isFinite(headingDeg) ? headingDeg : undefined,
+    loiterRadiusM: loiterRadiusM!,
+  };
+}
+
+export function extractWingtraSequenceEndpoints(
+  template: WingtraFlightPlan | null | undefined,
+): WingtraSequenceEndpoints {
+  const items = Array.isArray(template?.flightPlan?.items) ? template.flightPlan.items : [];
+  const takeoffItem = items.find((item) => isWingtraTakeoffItem(item));
+  const landingItem = items.find((item) => isWingtraLandingItem(item));
+  const homeAltitudeWgs84M = resolveWingtraHomeAltitudeWgs84M(template);
+  return {
+    startEndpoint: takeoffItem ? readWingtraTakeoffEndpoint(takeoffItem, homeAltitudeWgs84M) : undefined,
+    endEndpoint: landingItem ? readWingtraLandingEndpoint(landingItem, homeAltitudeWgs84M) : undefined,
+  };
+}
+
 export function getWingtraFreshExportPayloadOptions(
   payloadKind?: PayloadKind,
   planeHardwareVersion?: WingtraPlaneHardwareVersion,
@@ -860,6 +989,46 @@ export function replaceAreaItemsInWingtraFlightPlan(
     mergedItems.splice(insertIndex, 0, ...remainingAreas);
   }
 
+  return {
+    ...template,
+    flightPlan: {
+      ...template.flightPlan,
+      items: mergedItems,
+    },
+  };
+}
+
+export function replaceAreaItemsInWingtraFlightPlanForOptimizedSequence(
+  template: WingtraFlightPlan,
+  areas: ExportedArea[],
+  opts?: ExportToWingtraOptions,
+): WingtraFlightPlan {
+  const exportedAreaItems = exportToWingtraFlightPlan(areas, opts).flightPlan.items;
+  const originalItems = Array.isArray(template.flightPlan?.items) ? template.flightPlan.items : [];
+  const mergedItems: Array<WingtraAreaItem | Record<string, unknown>> = [];
+  let nextExportedAreaIndex = 0;
+  let lastInsertedAreaIndex = -1;
+
+  for (const item of originalItems) {
+    if (isWingtraDroppableOptimizedSequenceItem(item)) {
+      continue;
+    }
+    if (!isWingtraAreaItem(item)) {
+      mergedItems.push(item);
+      continue;
+    }
+    if (nextExportedAreaIndex < exportedAreaItems.length) {
+      mergedItems.push(exportedAreaItems[nextExportedAreaIndex] as WingtraAreaItem | Record<string, unknown>);
+      lastInsertedAreaIndex = mergedItems.length - 1;
+      nextExportedAreaIndex += 1;
+    }
+  }
+
+  if (nextExportedAreaIndex < exportedAreaItems.length) {
+    const remainingAreas = exportedAreaItems.slice(nextExportedAreaIndex) as Array<WingtraAreaItem | Record<string, unknown>>;
+    const insertIndex = lastInsertedAreaIndex >= 0 ? lastInsertedAreaIndex + 1 : mergedItems.length;
+    mergedItems.splice(insertIndex, 0, ...remainingAreas);
+  }
   return {
     ...template,
     flightPlan: {

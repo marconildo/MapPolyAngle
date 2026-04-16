@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 
 import {
+  extractWingtraSequenceEndpoints,
   exportToWingtraFlightPlan,
   importWingtraFlightPlan,
   isWingtraFlightPlanTemplateExportReady,
   replaceAreaItemsInWingtraFlightPlan,
+  replaceAreaItemsInWingtraFlightPlanForOptimizedSequence,
   resolveFreshWingtraExportPayloadOptionFromAreas,
 } from "../interop/wingtra/convert.ts";
 import type { ExportedArea, WingtraAreaItem, WingtraFlightPlan } from "../interop/wingtra/types.ts";
@@ -62,7 +64,43 @@ function makeArea(latStart: number, angleDeg: number): ExportedArea {
 }
 
 function isAreaItem(item: unknown): item is WingtraAreaItem {
-  return !!item && typeof item === "object" && (item as { type?: unknown }).type === "ComplexItem";
+  return !!item
+    && typeof item === "object"
+    && (item as { type?: unknown }).type === "ComplexItem"
+    && (item as { complexItemType?: unknown }).complexItemType === "area";
+}
+
+function makeComplexTakeoff(lat: number, lng: number) {
+  return {
+    type: "ComplexItem",
+    complexItemType: "takeoff",
+    coordinate: [lat, lng, 0],
+    exitAltitude: 79,
+    loiterRadius: 60,
+    loiterHeading: 22.5,
+    takeOffAltitude: 50,
+  };
+}
+
+function makeComplexLanding(lat: number, lng: number) {
+  return {
+    type: "ComplexItem",
+    complexItemType: "land",
+    coordinate: [lat, lng, 0],
+    loiterEntryAltitude: 318,
+    transitionAltitude: 50,
+    loiterRadius: 60,
+    loiterHeading: 180,
+    landAltitude: 0,
+  };
+}
+
+function makeComplexCorridor(label: string) {
+  return {
+    type: "ComplexItem",
+    complexItemType: "corridor",
+    label,
+  };
 }
 
 function runPreservesNonAreaItemsWhenAreaCountGrows() {
@@ -128,6 +166,117 @@ function runPreservesNonAreaItemsWhenAreaCountShrinks() {
 
 runPreservesNonAreaItemsWhenAreaCountGrows();
 runPreservesNonAreaItemsWhenAreaCountShrinks();
+
+function runExtractsSequenceEndpointsIndependently() {
+  const takeoff = makeComplexTakeoff(47.0, 8.0);
+  const landing = makeComplexLanding(47.02, 8.03);
+  const takeoffOnlyTemplate: WingtraFlightPlan = {
+    version: 1,
+    fileType: "Plan",
+    flightPlan: {
+      version: 6,
+      plannedHomePosition: [47.0, 8.0, 479],
+      items: [takeoff, makeAreaItem(47.0, "area-a")],
+    },
+  };
+  const landingOnlyTemplate: WingtraFlightPlan = {
+    version: 1,
+    fileType: "Plan",
+    flightPlan: {
+      version: 6,
+      plannedHomePosition: [47.0, 8.0, 479],
+      items: [makeAreaItem(47.0, "area-a"), landing],
+    },
+  };
+
+  const takeoffOnlyEndpoints = extractWingtraSequenceEndpoints(takeoffOnlyTemplate);
+  assert.deepEqual(takeoffOnlyEndpoints.startEndpoint, {
+    point: [8.0, 47.0],
+    altitudeWgs84M: 558,
+    headingDeg: 22.5,
+    loiterRadiusM: 60,
+  });
+  assert.equal(takeoffOnlyEndpoints.endEndpoint, undefined);
+
+  const landingOnlyEndpoints = extractWingtraSequenceEndpoints(landingOnlyTemplate);
+  assert.equal(landingOnlyEndpoints.startEndpoint, undefined);
+  assert.deepEqual(landingOnlyEndpoints.endEndpoint, {
+    point: [8.03, 47.02],
+    altitudeWgs84M: 797,
+    headingDeg: 180,
+    loiterRadiusM: 60,
+  });
+}
+
+function runIgnoresInvalidPlaceholderSequenceEndpoints() {
+  const invalidTemplate: WingtraFlightPlan = {
+    version: 1,
+    fileType: "Plan",
+    flightPlan: {
+      version: 6,
+      plannedHomePosition: [47.0, 8.0, 422],
+      items: [
+        {
+          type: "ComplexItem",
+          complexItemType: "takeoff",
+          coordinate: [47.0, 8.0, 0],
+          takeOffAltitude: 50,
+          loiterRadius: 60,
+          loiterHeading: 22.5,
+        },
+        {
+          type: "ComplexItem",
+          complexItemType: "land",
+          coordinate: [0, 0, 0],
+          transitionAltitude: 0,
+          loiterRadius: -1,
+        },
+      ],
+    },
+  };
+
+  const endpoints = extractWingtraSequenceEndpoints(invalidTemplate);
+  assert.equal(endpoints.startEndpoint, undefined);
+  assert.equal(endpoints.endEndpoint, undefined);
+}
+
+function runOptimizedSequenceRewritePreservesCorridorsAndDropsWaypointLoiter() {
+  const takeoff = makeComplexTakeoff(47.0, 8.0);
+  const loiter = { type: "SimpleItem", simpleItemType: "loiter", label: "loiter" };
+  const waypoint = { type: "ComplexItem", complexItemType: "waypoint", label: "waypoint" };
+  const corridor = makeComplexCorridor("corridor");
+  const landing = makeComplexLanding(47.02, 8.03);
+  const template: WingtraFlightPlan = {
+    version: 1,
+    fileType: "Plan",
+    flightPlan: {
+      version: 6,
+      items: [
+        takeoff,
+        makeAreaItem(47.0, "area-a"),
+        loiter,
+        waypoint,
+        corridor,
+        makeAreaItem(47.01, "area-b"),
+        landing,
+      ],
+    },
+  };
+
+  const merged = replaceAreaItemsInWingtraFlightPlanForOptimizedSequence(template, [
+    makeArea(47.02, 30),
+    makeArea(47.0, 10),
+  ]);
+
+  assert.equal(merged.flightPlan.items.length, 5);
+  assert.deepEqual(merged.flightPlan.items[0], takeoff);
+  assert.equal(merged.flightPlan.items.filter(isAreaItem).length, 2);
+  assert.deepEqual(merged.flightPlan.items[2], corridor);
+  assert.deepEqual(merged.flightPlan.items[4], landing);
+  assert.ok(!merged.flightPlan.items.includes(loiter as any));
+  assert.ok(!merged.flightPlan.items.includes(waypoint as any));
+  assert.ok(merged.flightPlan.items.includes(corridor as any));
+}
 
 function runFreshExportIncludesMinimumWicDraftFields() {
   const exported = exportToWingtraFlightPlan([makeArea(47.0, 12)], {
@@ -208,5 +357,8 @@ runFreshExportIncludesMinimumWicDraftFields();
 runTemplateReadinessRejectsMissingMinimumFields();
 runHardwareVersionSelectsMatchingWingtraPayload();
 runCameraImportPreservesCruiseSpeed();
+runExtractsSequenceEndpointsIndependently();
+runIgnoresInvalidPlaceholderSequenceEndpoints();
+runOptimizedSequenceRewritePreservesCorridorsAndDropsWaypointLoiter();
 
 console.log("wingtra_flightplan_items.test.ts: all assertions passed");

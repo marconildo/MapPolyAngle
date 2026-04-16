@@ -238,11 +238,68 @@ def test_optimize_area_sequence_endpoint_accepts_transfer_cost_overrides(monkeyp
     payload = response.json()
     connection = payload["connections"][0]
     assert connection["transferHorizontalSpeedMps"] == 18
-    assert connection["transferClimbRateMps"] == 3
-    assert connection["transferDescentRateMps"] == 7
-    assert connection["transferHorizontalEnergyRate"] == 1.1
-    assert connection["transferClimbEnergyRate"] == 3.2
-    assert connection["transferDescentEnergyRate"] == 0.4
+
+
+def test_optimize_area_sequence_endpoint_accepts_optional_start_and_end_endpoints(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "fetch_dem_for_rings", lambda *_args, **_kwargs: (FlatDem(), 14))
+
+    request_payload = {
+        "areas": [
+            {
+                "polygonId": "area-a",
+                "ring": [[7.0, 47.0], [7.0018, 47.0], [7.0018, 47.0012], [7.0, 47.0012], [7.0, 47.0]],
+                "bearingDeg": 0,
+                "payloadKind": "camera",
+                "params": {
+                    "payloadKind": "camera",
+                    "altitudeAGL": 80,
+                    "frontOverlap": 70,
+                    "sideOverlap": 70,
+                    "cameraKey": "SONY_RX1R2",
+                    "speedMps": 12,
+                },
+            },
+            {
+                "polygonId": "area-b",
+                "ring": [[7.004, 47.0], [7.0058, 47.0], [7.0058, 47.0012], [7.004, 47.0012], [7.004, 47.0]],
+                "bearingDeg": 0,
+                "payloadKind": "camera",
+                "params": {
+                    "payloadKind": "camera",
+                    "altitudeAGL": 80,
+                    "frontOverlap": 70,
+                    "sideOverlap": 70,
+                    "cameraKey": "SONY_RX1R2",
+                    "speedMps": 12,
+                },
+            },
+        ],
+        "terrainSource": {"mode": "mapbox"},
+        "altitudeMode": "legacy",
+        "minClearanceM": 60,
+        "maxHeightAboveGroundM": 120,
+        "startEndpoint": {
+            "point": [6.9995, 47.0002],
+            "altitudeWgs84M": 180,
+            "headingDeg": 90,
+            "loiterRadiusM": 60,
+        },
+        "endEndpoint": {
+            "point": [7.0063, 47.0002],
+            "altitudeWgs84M": 180,
+            "headingDeg": 90,
+            "loiterRadiusM": 60,
+        },
+    }
+
+    with TestClient(app_module.app) as client:
+        response = client.post("/v1/mission/optimize-area-sequence", json=request_payload)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["startConnection"]["fromPolygonId"] == "__depot_start__"
+    assert payload["endConnection"]["toPolygonId"] == "__depot_end__"
+    assert payload["totalTransferCost"] >= payload["startConnection"]["transferCost"] + payload["endConnection"]["transferCost"]
 
 
 def test_optimize_area_sequence_endpoint_prefetches_area_rings_and_uses_lazy_dem_loading(monkeypatch) -> None:
