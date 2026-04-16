@@ -158,7 +158,8 @@
       }
 
       .embedded-figure svg,
-      .intro-map {
+      .intro-map,
+      .intro-photo {
         display: block;
         width: 100%;
         height: auto;
@@ -228,25 +229,21 @@
         <p class="deck">
           This article explains the sequencing layer in the mission planner: once a large mapping site has already
           been partitioned into smaller survey areas and each area already has an optimized local bearing, we still
-          need to decide the order in which those areas should be flown and whether each one should be reversed.
+          need to decide the order in which those areas should be flown and whether each one should be reversed. The
+          live user-facing planner for this workflow is
+          <a href="https://map-poly-angle.vercel.app/" target="_blank" rel="noreferrer">Map Poly Angle</a>.
         </p>
       </header>
 
       <section>
         <p class="section-kicker">1. Problem setup</p>
-        <h2>We start with one large area to map, not with a sequence problem</h2>
+        <h2>Mapping in changing terrain</h2>
         <p>
           The operational objective is simple to state but hard to execute well: cover as large an area as possible
           with consistent GSD and acceptable mission time. A single large survey polygon, like
           <code>luz0.flightplan</code>, is a natural starting point. It can target a nominal camera ground resolution
           of <strong>1.39 cm/px</strong>,
           but one large survey block forces one global traversal pattern onto terrain that is not globally uniform.
-        </p>
-        <p>
-          The live user-facing planner for this workflow is
-          <a href="https://map-poly-angle.vercel.app/" target="_blank" rel="noreferrer">Map Poly Angle</a>.
-          This post focuses on one internal part of that system: the sequencing step that happens after area creation
-          and local bearing optimization.
         </p>
         <p>
           In production we therefore do something else first: we partition the original site into smaller areas and
@@ -356,6 +353,14 @@
     </svg>
   
             <figcaption><strong><code>luz0-realProd.flightplan</code>.</strong> The same site after partitioning into 17 smaller areas, each with its own local direction.</figcaption>
+          </figure>
+          <figure>
+            <img class="intro-photo" src="/sequence-dp/luz0-screenshot.png" alt="Map Poly Angle screenshot for luz0 single-area mission showing broad GSD variation across the site">
+            <figcaption><strong>Single-area analysis in the app.</strong> The large original area is easy to author, but the GSD varies substantially across the terrain.</figcaption>
+          </figure>
+          <figure>
+            <img class="intro-photo" src="/sequence-dp/luz0-realprod-screenshot.png" alt="Map Poly Angle screenshot for luz0-realProd split mission showing improved GSD consistency across the site">
+            <figcaption><strong>Partitioned analysis in the app.</strong> After splitting and reorienting locally, the site achieves a much more consistent coverage pattern.</figcaption>
           </figure>
         </div>
         <p>
