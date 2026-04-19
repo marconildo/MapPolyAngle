@@ -6,7 +6,7 @@ import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import { isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, build3DFlightPath, groupFlightLinesForTraversal, queryElevationAtPointWGS84, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
 import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart, Area, Line } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,6 +20,21 @@ import type { PolygonAnalysisResult } from "@/components/MapFlightDirection/type
 import type { ExactPartitionPreview as SharedExactPartitionPreview } from "@/overlap/exact-region";
 import { createCoveragePanelResetState } from "@/state/clearAllState";
 import { shouldRunAsyncGeneration } from "@/state/asyncUpdateGuard";
+import { MissionProfileWorkerController } from "@/flight/missionProfileController";
+import {
+  buildMissionProfileDetailRange,
+  clipMissionProfileToRange,
+  computeMissionTotalDistanceM,
+  horizontalDistanceMeters3D,
+  quantizeMissionProfileSpacingBucket,
+} from "@/flight/missionProfile";
+import type {
+  MissionProfileCoreSample,
+  MissionProfileData,
+  MissionProfileSegmentSnapshot,
+  MissionProfileSnapshot,
+  MissionProfileViewport,
+} from "@/flight/missionProfileWorker.types";
 // Turf types may be unresolved if TS can't find bundled types; cast as any.
 // @ts-ignore
 import * as turf from '@turf/turf';
@@ -127,33 +142,9 @@ const OVERLAY_SCALE_UPPER_QUANTILE = 0.95;
 const CARD_SUMMARY_LOWER_QUANTILE = 0.05;
 const CARD_SUMMARY_UPPER_QUANTILE = 0.95;
 const DENSITY_OVERLAY_MAX = 100;
-const MISSION_PROFILE_SAMPLE_SPACING_M = 12;
-
-type MissionProfilePoint = {
-  distanceM: number;
-  lng: number;
-  lat: number;
-  droneAltitudeM: number;
-  terrainAltitudeM: number | null;
-  clearanceM: number | null;
-  minHeightGuideAltitudeM: number | null;
-  maxHeightGuideAltitudeM: number | null;
-  segmentLabel: string;
-  segmentKind: 'area' | 'connector';
-};
-
-type MissionProfileSummary = {
-  totalDistanceM: number;
-  minClearanceM: number | null;
-  meanClearanceM: number | null;
-  maxClearanceM: number | null;
-  sampleCount: number;
-};
-
-type MissionProfileData = {
-  samples: MissionProfilePoint[];
-  summary: MissionProfileSummary;
-};
+const MAX_MISSION_PROFILE_DISPLAY_SAMPLES = 450;
+const MISSION_HEIGHT_CHART_MARGIN = { top: 4, right: 10, left: 4, bottom: 18 } as const;
+const MISSION_HEIGHT_Y_AXIS_WIDTH = 52;
 
 function splitPerfNow() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -166,104 +157,6 @@ function splitPerfLog(scope: string, message: string, data?: unknown) {
     return;
   }
   console.debug(`[terrain-split][${scope}] ${message}`, data);
-}
-
-function horizontalDistanceMeters3D(
-  start: [number, number, number],
-  end: [number, number, number],
-) {
-  const [x1, y1] = lngLatToMeters(start[0], start[1]);
-  const [x2, y2] = lngLatToMeters(end[0], end[1]);
-  return Math.hypot(x2 - x1, y2 - y1);
-}
-
-function pointsNearlyMatch3D(
-  left: [number, number, number],
-  right: [number, number, number],
-) {
-  return horizontalDistanceMeters3D(left, right) <= 0.05 && Math.abs(left[2] - right[2]) <= 0.05;
-}
-
-function sampleMissionPathProfile(
-  segments: Array<{
-    path3D: [number, number, number][][];
-    terrainTiles: TerrainTile[];
-    segmentLabel: string;
-    segmentKind: 'area' | 'connector';
-  }>,
-  minHeightAboveGroundM: number,
-  maxHeightAboveGroundM: number,
-  sampleSpacingM = MISSION_PROFILE_SAMPLE_SPACING_M,
-): MissionProfileData | null {
-  const samples: MissionProfilePoint[] = [];
-  let cumulativeDistanceM = 0;
-  let lastPoint3D: [number, number, number] | null = null;
-
-  const appendSample = (
-    point: [number, number, number],
-    terrainTiles: TerrainTile[],
-    segmentLabel: string,
-    segmentKind: 'area' | 'connector',
-  ) => {
-    const terrainAltitudeM = terrainTiles.length > 0 ? queryElevationAtPointWGS84(point[0], point[1], terrainTiles) : NaN;
-    samples.push({
-      distanceM: cumulativeDistanceM,
-      lng: point[0],
-      lat: point[1],
-      droneAltitudeM: point[2],
-      terrainAltitudeM: Number.isFinite(terrainAltitudeM) ? terrainAltitudeM : null,
-      clearanceM: Number.isFinite(terrainAltitudeM) ? point[2] - terrainAltitudeM : null,
-      minHeightGuideAltitudeM: Number.isFinite(terrainAltitudeM) ? terrainAltitudeM + minHeightAboveGroundM : null,
-      maxHeightGuideAltitudeM: Number.isFinite(terrainAltitudeM) ? terrainAltitudeM + maxHeightAboveGroundM : null,
-      segmentLabel,
-      segmentKind,
-    });
-    lastPoint3D = point;
-  };
-
-  for (const segmentGroup of segments) {
-    for (const path of segmentGroup.path3D) {
-      if (path.length === 0) continue;
-      const firstPoint = path[0]!;
-      if (!lastPoint3D || !pointsNearlyMatch3D(firstPoint, lastPoint3D)) {
-        appendSample(firstPoint, segmentGroup.terrainTiles, segmentGroup.segmentLabel, segmentGroup.segmentKind);
-      }
-
-      for (let index = 1; index < path.length; index += 1) {
-        const start = path[index - 1]!;
-        const end = path[index]!;
-        const segmentDistanceM = horizontalDistanceMeters3D(start, end);
-        const steps = Math.max(1, Math.ceil(segmentDistanceM / sampleSpacingM));
-        for (let step = 1; step <= steps; step += 1) {
-          const t = step / steps;
-          const point: [number, number, number] = [
-            start[0] + (end[0] - start[0]) * t,
-            start[1] + (end[1] - start[1]) * t,
-            start[2] + (end[2] - start[2]) * t,
-          ];
-          cumulativeDistanceM += segmentDistanceM / steps;
-          appendSample(point, segmentGroup.terrainTiles, segmentGroup.segmentLabel, segmentGroup.segmentKind);
-        }
-      }
-    }
-  }
-
-  if (samples.length < 2) return null;
-
-  const finiteClearances = samples
-    .map((sample) => sample.clearanceM)
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
-  const summary: MissionProfileSummary = {
-    totalDistanceM: samples[samples.length - 1]?.distanceM ?? 0,
-    minClearanceM: finiteClearances.length > 0 ? Math.min(...finiteClearances) : null,
-    meanClearanceM: finiteClearances.length > 0
-      ? finiteClearances.reduce((sum, value) => sum + value, 0) / finiteClearances.length
-      : null,
-    maxClearanceM: finiteClearances.length > 0 ? Math.max(...finiteClearances) : null,
-    sampleCount: samples.length,
-  };
-
-  return { samples, summary };
 }
 
 function statsTotalAreaM2(stats: GSDStats) {
@@ -400,6 +293,398 @@ function lidarStripMayAffectTile(
     minYs > bounds.maxY
   );
 }
+
+function decimateMissionProfileSamples<T extends { distanceM: number }>(
+  samples: T[],
+  maxSamples = MAX_MISSION_PROFILE_DISPLAY_SAMPLES,
+): T[] {
+  if (samples.length <= maxSamples) return samples;
+  const step = (samples.length - 1) / Math.max(maxSamples - 1, 1);
+  const decimated: T[] = [];
+  let lastIndex = -1;
+  for (let bucket = 0; bucket < maxSamples; bucket += 1) {
+    const index = Math.round(bucket * step);
+    if (index === lastIndex) continue;
+    const sample = samples[index];
+    if (sample) {
+      decimated.push(sample);
+      lastIndex = index;
+    }
+  }
+  const finalSample = samples[samples.length - 1];
+  if (finalSample && decimated[decimated.length - 1] !== finalSample) {
+    decimated.push(finalSample);
+  }
+  return decimated;
+}
+
+type MissionHeightProfileChartProps = {
+  samples: Array<MissionProfileCoreSample & {
+    minHeightGuideAltitudeM: number | null;
+    maxHeightGuideAltitudeM: number | null;
+  }>;
+  totalDistanceM: number;
+  domain: [number, number];
+  yDomain: [number, number];
+  formatMissionDistance: (distanceM: number) => string;
+  onHoverDistance: (distanceM: number | null) => void;
+  onViewportChange: (viewport: MissionProfileViewport) => void;
+};
+
+const MissionHeightProfileChart = React.memo(function MissionHeightProfileChart({
+  samples,
+  totalDistanceM,
+  domain,
+  yDomain,
+  formatMissionDistance,
+  onHoverDistance,
+  onViewportChange,
+}: MissionHeightProfileChartProps) {
+  const overlayRef = React.useRef<HTMLDivElement | null>(null);
+  const domainRef = React.useRef<[number, number]>(domain);
+  const totalDistanceRef = React.useRef(totalDistanceM);
+  const onHoverDistanceRef = React.useRef(onHoverDistance);
+  const onViewportChangeRef = React.useRef(onViewportChange);
+  const dragStateRef = React.useRef<{
+    startClientX: number;
+    startDomain: [number, number];
+    isDragging: boolean;
+  } | null>(null);
+  const suspendHoverRef = React.useRef(false);
+  const hoverResumeTimeoutRef = React.useRef<number | null>(null);
+
+  React.useEffect(() => {
+    domainRef.current = domain;
+  }, [domain]);
+
+  React.useEffect(() => {
+    totalDistanceRef.current = totalDistanceM;
+  }, [totalDistanceM]);
+
+  React.useEffect(() => {
+    onHoverDistanceRef.current = onHoverDistance;
+  }, [onHoverDistance]);
+
+  React.useEffect(() => {
+    onViewportChangeRef.current = onViewportChange;
+  }, [onViewportChange]);
+
+  const clampViewport = React.useCallback((startDistanceM: number, endDistanceM: number): MissionProfileViewport => {
+    const fullStart = 0;
+    const fullEnd = totalDistanceRef.current;
+    const fullSpan = Math.max(fullEnd - fullStart, 1);
+    const minSpan = Math.min(fullSpan, 200);
+    let start = Math.max(fullStart, Math.min(startDistanceM, fullEnd));
+    let end = Math.max(start, Math.min(endDistanceM, fullEnd));
+    let span = end - start;
+
+    if (span < minSpan) {
+      const center = (start + end) * 0.5;
+      start = center - minSpan * 0.5;
+      end = center + minSpan * 0.5;
+      if (start < fullStart) {
+        end += fullStart - start;
+        start = fullStart;
+      }
+      if (end > fullEnd) {
+        start -= end - fullEnd;
+        end = fullEnd;
+      }
+      start = Math.max(fullStart, start);
+      end = Math.min(fullEnd, end);
+      span = end - start;
+    }
+
+    const isFull = Math.abs(start - fullStart) <= 1 && Math.abs(end - fullEnd) <= 1;
+    return {
+      mode: isFull ? "full" : "zoomed",
+      startDistanceM: isFull ? fullStart : start,
+      endDistanceM: isFull ? fullEnd : end,
+    };
+  }, []);
+
+  const resolveDistanceAtClientX = React.useCallback((clientX: number) => {
+    const rect = overlayRef.current?.getBoundingClientRect();
+    if (!rect || !(rect.width > 0)) return null;
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    const t = x / rect.width;
+    const currentDomain = domainRef.current;
+    return currentDomain[0] + (currentDomain[1] - currentDomain[0]) * t;
+  }, []);
+
+  const clearHoverResumeTimeout = React.useCallback(() => {
+    if (hoverResumeTimeoutRef.current !== null) {
+      window.clearTimeout(hoverResumeTimeoutRef.current);
+      hoverResumeTimeoutRef.current = null;
+    }
+  }, []);
+
+  const suspendHoverTracking = React.useCallback(() => {
+    clearHoverResumeTimeout();
+    suspendHoverRef.current = true;
+    onHoverDistanceRef.current(null);
+  }, [clearHoverResumeTimeout]);
+
+  const resumeHoverTrackingSoon = React.useCallback((delayMs: number) => {
+    clearHoverResumeTimeout();
+    hoverResumeTimeoutRef.current = window.setTimeout(() => {
+      suspendHoverRef.current = false;
+      hoverResumeTimeoutRef.current = null;
+    }, delayMs);
+  }, [clearHoverResumeTimeout]);
+
+  const zoomAtClientX = React.useCallback((clientX: number, deltaY: number) => {
+    const totalDistanceM = totalDistanceRef.current;
+    if (!(totalDistanceM > 0)) return;
+    const anchorDistanceM = resolveDistanceAtClientX(clientX);
+    if (anchorDistanceM === null) return;
+    const currentDomain = domainRef.current;
+    const span = Math.max(currentDomain[1] - currentDomain[0], 1);
+    const zoomFactor = Math.exp(deltaY * 0.0015);
+    const nextSpan = Math.max(1, Math.min(totalDistanceM, span * zoomFactor));
+    const anchorRatio = (anchorDistanceM - currentDomain[0]) / span;
+    const nextStart = anchorDistanceM - anchorRatio * nextSpan;
+    const nextEnd = nextStart + nextSpan;
+    onViewportChangeRef.current(clampViewport(nextStart, nextEnd));
+  }, [clampViewport, resolveDistanceAtClientX]);
+
+  React.useEffect(() => {
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!(totalDistanceRef.current > 0)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      suspendHoverTracking();
+      zoomAtClientX(event.clientX, event.deltaY);
+      resumeHoverTrackingSoon(180);
+    };
+    overlay.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      overlay.removeEventListener("wheel", handleWheel);
+    };
+  }, [resumeHoverTrackingSoon, suspendHoverTracking, zoomAtClientX]);
+
+  const handleMouseMove = React.useCallback((event: MouseEvent) => {
+    const dragState = dragStateRef.current;
+    if (!dragState) return;
+    const rect = overlayRef.current?.getBoundingClientRect();
+    if (!rect || !(rect.width > 0)) return;
+    const dx = event.clientX - dragState.startClientX;
+    if (!dragState.isDragging && Math.abs(dx) < 4) {
+      return;
+    }
+    dragState.isDragging = true;
+    event.preventDefault();
+    event.stopPropagation();
+    onHoverDistanceRef.current(null);
+    const span = dragState.startDomain[1] - dragState.startDomain[0];
+    const deltaDistanceM = (dx / rect.width) * span;
+    const nextStart = dragState.startDomain[0] - deltaDistanceM;
+    const nextEnd = dragState.startDomain[1] - deltaDistanceM;
+    onViewportChangeRef.current(clampViewport(nextStart, nextEnd));
+  }, [clampViewport, resolveDistanceAtClientX]);
+
+  const handleMouseUp = React.useCallback((event: MouseEvent) => {
+    const dragState = dragStateRef.current;
+    dragStateRef.current = null;
+    window.removeEventListener("mousemove", handleMouseMove);
+    window.removeEventListener("mouseup", handleMouseUp);
+    if (dragState?.isDragging) {
+      event.preventDefault();
+      event.stopPropagation();
+      const hoverDistanceM = resolveDistanceAtClientX(event.clientX);
+      onHoverDistanceRef.current(hoverDistanceM);
+    }
+    resumeHoverTrackingSoon(0);
+  }, [handleMouseMove, resolveDistanceAtClientX, resumeHoverTrackingSoon]);
+
+  const preventDefault = React.useCallback((event: Event) => {
+    event.preventDefault();
+  }, []);
+
+  React.useEffect(() => {
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+
+    const handleMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const currentDomain = domainRef.current;
+      if (!(currentDomain[1] - currentDomain[0] > 0)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      suspendHoverTracking();
+      dragStateRef.current = {
+        startClientX: event.clientX,
+        startDomain: currentDomain,
+        isDragging: false,
+      };
+      window.addEventListener("mousemove", handleMouseMove, { passive: false });
+      window.addEventListener("mouseup", handleMouseUp, { passive: false });
+    };
+
+    overlay.addEventListener("mousedown", handleMouseDown, { passive: false });
+    overlay.addEventListener("dragstart", preventDefault);
+    return () => {
+      overlay.removeEventListener("mousedown", handleMouseDown);
+      overlay.removeEventListener("dragstart", preventDefault);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [handleMouseMove, handleMouseUp, preventDefault, suspendHoverTracking]);
+
+  React.useEffect(() => () => {
+    window.removeEventListener("mousemove", handleMouseMove);
+    window.removeEventListener("mouseup", handleMouseUp);
+    clearHoverResumeTimeout();
+  }, [clearHoverResumeTimeout, handleMouseMove, handleMouseUp]);
+
+  const handleOverlayMouseMove = React.useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (suspendHoverRef.current) return;
+    if (dragStateRef.current?.isDragging) return;
+    onHoverDistanceRef.current(resolveDistanceAtClientX(event.clientX));
+  }, [resolveDistanceAtClientX]);
+
+  const handleOverlayMouseLeave = React.useCallback(() => {
+    if (suspendHoverRef.current) return;
+    if (!dragStateRef.current?.isDragging) onHoverDistanceRef.current(null);
+  }, []);
+
+  const handleOverlayDoubleClick = React.useCallback(() => {
+    onViewportChangeRef.current({
+      mode: "full",
+      startDistanceM: 0,
+      endDistanceM: totalDistanceRef.current,
+    });
+    onHoverDistanceRef.current(null);
+  }, []);
+
+  return (
+    <div className="relative h-56">
+      <ResponsiveContainer width="100%" height="100%">
+        <ComposedChart
+          data={samples}
+          margin={MISSION_HEIGHT_CHART_MARGIN}
+        >
+          <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+          <XAxis
+            dataKey="distanceM"
+            type="number"
+            domain={domain}
+            tick={{ fontSize: 10 }}
+            tickFormatter={formatMissionDistance}
+            label={{
+              value: totalDistanceM >= 2000 ? 'Distance along mission (km)' : 'Distance along mission (m)',
+              position: 'bottom',
+              offset: 6,
+              style: { fontSize: '10px' },
+            }}
+          />
+          <YAxis
+            width={MISSION_HEIGHT_Y_AXIS_WIDTH}
+            domain={yDomain}
+            allowDataOverflow
+            tick={{ fontSize: 10 }}
+            tickFormatter={(value: number) => value.toFixed(0)}
+            label={{ value: 'Elevation (m)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+          />
+          <Area
+            type="monotone"
+            dataKey="terrainAltitudeM"
+            stroke="#64748b"
+            fill="rgba(148, 163, 184, 0.32)"
+            isAnimationActive={false}
+            dot={false}
+            connectNulls
+          />
+          <Line
+            type="monotone"
+            dataKey="droneAltitudeM"
+            stroke="#2563eb"
+            strokeWidth={2}
+            dot={false}
+            isAnimationActive={false}
+            connectNulls
+          />
+          <Line
+            type="monotone"
+            dataKey="minHeightGuideAltitudeM"
+            stroke="#f59e0b"
+            strokeWidth={1.5}
+            strokeDasharray="6 4"
+            dot={false}
+            isAnimationActive={false}
+            connectNulls
+          />
+          <Line
+            type="monotone"
+            dataKey="maxHeightGuideAltitudeM"
+            stroke="#ef4444"
+            strokeWidth={1.5}
+            strokeDasharray="6 4"
+            dot={false}
+            isAnimationActive={false}
+            connectNulls
+          />
+        </ComposedChart>
+      </ResponsiveContainer>
+      <div
+        ref={overlayRef}
+        className="absolute cursor-grab select-none touch-none"
+        style={{
+          left: `${MISSION_HEIGHT_Y_AXIS_WIDTH + MISSION_HEIGHT_CHART_MARGIN.left}px`,
+          right: `${MISSION_HEIGHT_CHART_MARGIN.right}px`,
+          top: `${MISSION_HEIGHT_CHART_MARGIN.top}px`,
+          bottom: "32px",
+        }}
+        onDoubleClick={handleOverlayDoubleClick}
+        onMouseMove={handleOverlayMouseMove}
+        onMouseLeave={handleOverlayMouseLeave}
+        onDragStart={(event) => {
+          event.preventDefault();
+        }}
+      />
+    </div>
+  );
+});
+
+function buildMissionProfileDisplaySamples(
+  samples: MissionProfileCoreSample[],
+  minHeightAboveGroundM: number,
+  maxHeightAboveGroundM: number,
+) {
+  return samples.map((sample) => ({
+    ...sample,
+    minHeightGuideAltitudeM:
+      typeof sample.terrainAltitudeM === "number" ? sample.terrainAltitudeM + minHeightAboveGroundM : null,
+    maxHeightGuideAltitudeM:
+      typeof sample.terrainAltitudeM === "number" ? sample.terrainAltitudeM + maxHeightAboveGroundM : null,
+  }));
+}
+
+function findNearestMissionProfileSample(
+  samples: MissionProfileCoreSample[],
+  distanceM: number,
+): MissionProfileCoreSample | null {
+  if (samples.length === 0) return null;
+  let low = 0;
+  let high = samples.length - 1;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if ((samples[mid]?.distanceM ?? 0) < distanceM) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const upper = samples[low] ?? null;
+  const lower = samples[Math.max(0, low - 1)] ?? null;
+  if (!upper) return lower;
+  if (!lower) return upper;
+  return Math.abs(upper.distanceM - distanceM) < Math.abs(lower.distanceM - distanceM) ? upper : lower;
+}
+
 export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missionGeometryVersion = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, mergeState, historyState, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
@@ -541,7 +826,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
   const [minHeightAboveGroundUI, setMinHeightAboveGroundUI] = useState<number>(60);
   const [maxHeightAboveGroundUI, setMaxHeightAboveGroundUI] = useState<number>(120);
   const [turnExtendUI, setTurnExtendUI] = useState<number>(96);
-  const [hoveredMissionProfileSample, setHoveredMissionProfileSample] = useState<MissionProfilePoint | null>(null);
+  const [hoveredMissionProfileSample, setHoveredMissionProfileSample] = useState<MissionProfileCoreSample | null>(null);
+  const [missionProfileOverview, setMissionProfileOverview] = useState<MissionProfileData | null>(null);
+  const [missionProfileDetailProfiles, setMissionProfileDetailProfiles] = useState<Map<string, MissionProfileData | null>>(new Map());
+  const [missionProfileViewport, setMissionProfileViewport] = useState<MissionProfileViewport>({
+    mode: "full",
+    startDistanceM: 0,
+    endDistanceM: 0,
+  });
+  const [missionProfileChartWidthPx, setMissionProfileChartWidthPx] = useState<number>(0);
+  const missionProfileChartContainerRef = useRef<HTMLDivElement | null>(null);
+  const missionProfileWorkerRef = useRef<MissionProfileWorkerController | null>(null);
+  const missionProfileLatestDetailRequestRef = useRef(0);
 
   // Sync initial values from map API
   React.useEffect(() => {
@@ -1327,8 +1623,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
             padTiles: 0,
             data: center.tile.data,
           },
-        };
-      }
+  };
+}
       const offsets: Array<{ dx: number; dy: number; tileRef: { z: number; x: number; y: number } }> = [];
       for (let dy = -padTiles; dy <= padTiles; dy++) {
         for (let dx = -padTiles; dx <= padTiles; dx++) {
@@ -2830,7 +3126,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
     return cards;
   }, [overallStats]);
 
-  const missionHeightProfile = useMemo(() => {
+  const missionProfileSnapshot = useMemo(() => {
     const api = mapRef.current;
     if (!api?.getMissionAreaOrder || !api.getFlightPaths3D || !api.getMissionConnectorTerrainTiles) {
       return null;
@@ -2850,22 +3146,18 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
       ] as const),
     );
 
-    const segments: Array<{
-      path3D: [number, number, number][][];
-      terrainTiles: TerrainTile[];
-      segmentLabel: string;
-      segmentKind: 'area' | 'connector';
-    }> = [];
+    const segments: MissionProfileSegmentSnapshot[] = [];
 
     for (let index = 0; index < orderedPolygonIds.length; index += 1) {
       const polygonId = orderedPolygonIds[index]!;
       const areaPath3D = polygonFlightPaths3D.get(polygonId);
       if (areaPath3D && areaPath3D.length > 0) {
         segments.push({
+          key: polygonId,
           path3D: areaPath3D,
           terrainTiles: (polygonTiles.get(polygonId) ?? []) as TerrainTile[],
           segmentLabel: getPolygonDisplayName(polygonId),
-          segmentKind: 'area',
+          segmentKind: "area",
         });
       }
 
@@ -2874,35 +3166,196 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
       const connection = connectionsByPair.get(`${polygonId}->${nextPolygonId}`);
       if (!connection || connection.path3D.length === 0) continue;
       segments.push({
+        key: connection.key,
         path3D: connection.path3D,
         terrainTiles: connectorTerrainTiles.get(connection.key) ?? [],
         segmentLabel: `${getPolygonDisplayName(polygonId)} → ${getPolygonDisplayName(nextPolygonId)}`,
-        segmentKind: 'connector',
+        segmentKind: "connector",
       });
     }
 
-    return sampleMissionPathProfile(segments, minHeightAboveGroundUI, maxHeightAboveGroundUI);
-  }, [
-    altitudeModeUI,
-    getPolygonDisplayName,
-    mapRef,
-    maxHeightAboveGroundUI,
-    minClearanceUI,
-    minHeightAboveGroundUI,
-    missionGeometryVersion,
-    polygonAnalyses,
-    turnExtendUI,
-  ]);
+    if (segments.length === 0) return null;
+
+    const missionId = `${missionGeometryVersion}:${orderedPolygonIds.join("|")}`;
+    return {
+      missionId,
+      totalDistanceM: computeMissionTotalDistanceM({ segments }),
+      segments,
+    } satisfies MissionProfileSnapshot;
+  }, [getPolygonDisplayName, mapRef, missionGeometryVersion]);
+
+  React.useEffect(() => {
+    const controller = new MissionProfileWorkerController();
+    missionProfileWorkerRef.current = controller;
+    return () => {
+      controller.terminate();
+      missionProfileWorkerRef.current = null;
+    };
+  }, []);
+
+  React.useEffect(() => {
+    const container = missionProfileChartContainerRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0;
+      setMissionProfileChartWidthPx(width);
+    });
+    observer.observe(container);
+    setMissionProfileChartWidthPx(container.getBoundingClientRect().width);
+    return () => observer.disconnect();
+  }, [missionProfileOverview]);
+
+  React.useEffect(() => {
+    const controller = missionProfileWorkerRef.current;
+    missionProfileLatestDetailRequestRef.current += 1;
+    setMissionProfileOverview(null);
+    setMissionProfileDetailProfiles(new Map());
+    if (!missionProfileSnapshot) {
+      setMissionProfileViewport({ mode: "full", startDistanceM: 0, endDistanceM: 0 });
+    }
+    setHoveredMissionProfileSample(null);
+    mapRef.current?.setMissionProfileCursor?.(null);
+
+    if (!controller) return;
+    const snapshot = missionProfileSnapshot;
+    let cancelled = false;
+    const load = async () => {
+      await controller.setMissionSnapshot(snapshot);
+      if (cancelled || !snapshot) return;
+      const overview = await controller.computeOverview();
+      if (cancelled) return;
+      setMissionProfileOverview(overview);
+      setMissionProfileViewport((current) => {
+        const totalDistanceM = overview?.summary.totalDistanceM ?? snapshot.totalDistanceM;
+        if (!(totalDistanceM > 0)) {
+          return { mode: "full", startDistanceM: 0, endDistanceM: 0 };
+        }
+        if (current.mode === "zoomed" && current.endDistanceM > current.startDistanceM) {
+          return {
+            mode: "zoomed",
+            startDistanceM: Math.max(0, Math.min(current.startDistanceM, totalDistanceM)),
+            endDistanceM: Math.max(
+              Math.max(0, Math.min(current.startDistanceM, totalDistanceM)),
+              Math.min(current.endDistanceM, totalDistanceM),
+            ),
+          };
+        }
+        return { mode: "full", startDistanceM: 0, endDistanceM: totalDistanceM };
+      });
+    };
+
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [mapRef, missionProfileSnapshot]);
+
+  const missionProfileTotalDistanceM = missionProfileOverview?.summary.totalDistanceM
+    ?? missionProfileSnapshot?.totalDistanceM
+    ?? 0;
+
+  const missionProfileResolvedViewport = useMemo(() => {
+    if (!(missionProfileTotalDistanceM > 0)) {
+      return { mode: "full", startDistanceM: 0, endDistanceM: 0 } satisfies MissionProfileViewport;
+    }
+    if (missionProfileViewport.mode === "full" || missionProfileViewport.endDistanceM <= missionProfileViewport.startDistanceM) {
+      return { mode: "full", startDistanceM: 0, endDistanceM: missionProfileTotalDistanceM } satisfies MissionProfileViewport;
+    }
+    return {
+      mode: "zoomed",
+      startDistanceM: Math.max(0, Math.min(missionProfileViewport.startDistanceM, missionProfileTotalDistanceM)),
+      endDistanceM: Math.max(
+        Math.max(0, Math.min(missionProfileViewport.startDistanceM, missionProfileTotalDistanceM)),
+        Math.min(missionProfileViewport.endDistanceM, missionProfileTotalDistanceM),
+      ),
+    } satisfies MissionProfileViewport;
+  }, [missionProfileTotalDistanceM, missionProfileViewport]);
+
+  const missionProfileDetailRequest = useMemo(() => {
+    if (!missionProfileOverview || missionProfileResolvedViewport.mode === "full" || !(missionProfileChartWidthPx > 0)) {
+      return null;
+    }
+    const visibleSpanM = Math.max(
+      1,
+      missionProfileResolvedViewport.endDistanceM - missionProfileResolvedViewport.startDistanceM,
+    );
+    const targetSamples = Math.max(400, Math.min(3000, Math.round(missionProfileChartWidthPx * 1.5)));
+    const spacingBucketM = quantizeMissionProfileSpacingBucket(visibleSpanM / targetSamples);
+    const detailRange = buildMissionProfileDetailRange(
+      missionProfileResolvedViewport.startDistanceM,
+      missionProfileResolvedViewport.endDistanceM,
+      missionProfileOverview.summary.totalDistanceM,
+      spacingBucketM,
+    );
+    const requestKey = [
+      missionProfileSnapshot?.missionId ?? "mission",
+      detailRange.requestStartM.toFixed(1),
+      detailRange.requestEndM.toFixed(1),
+      spacingBucketM.toFixed(2),
+    ].join(":");
+    return {
+      requestKey,
+      rangeStartM: detailRange.requestStartM,
+      rangeEndM: detailRange.requestEndM,
+      spacingBucketM,
+      maxSamples: targetSamples,
+    };
+  }, [missionProfileChartWidthPx, missionProfileOverview, missionProfileResolvedViewport, missionProfileSnapshot]);
+
+  React.useEffect(() => {
+    const controller = missionProfileWorkerRef.current;
+    if (!controller || !missionProfileDetailRequest) return;
+    if (missionProfileDetailProfiles.has(missionProfileDetailRequest.requestKey)) return;
+
+    const requestSeq = ++missionProfileLatestDetailRequestRef.current;
+    void controller.computeDetail(missionProfileDetailRequest).then(({ requestKey, profile }) => {
+      setMissionProfileDetailProfiles((current) => {
+        const next = new Map(current);
+        next.set(requestKey, profile);
+        return next;
+      });
+      if (requestSeq < missionProfileLatestDetailRequestRef.current) return;
+    }).catch(() => {
+      // Keep the current overview if detail refinement fails.
+    });
+  }, [missionProfileDetailProfiles, missionProfileDetailRequest]);
+
+  const missionProfileActiveSource = useMemo(() => {
+    if (!missionProfileOverview) return null;
+    if (missionProfileResolvedViewport.mode === "full" || !missionProfileDetailRequest) {
+      return missionProfileOverview;
+    }
+    return missionProfileDetailProfiles.get(missionProfileDetailRequest.requestKey) ?? missionProfileOverview;
+  }, [missionProfileDetailProfiles, missionProfileDetailRequest, missionProfileOverview, missionProfileResolvedViewport.mode]);
+
+  const missionHeightProfile = useMemo(() => {
+    if (!missionProfileActiveSource) return null;
+    if (missionProfileResolvedViewport.mode === "full") return missionProfileActiveSource;
+    return clipMissionProfileToRange(
+      missionProfileActiveSource,
+      missionProfileResolvedViewport.startDistanceM,
+      missionProfileResolvedViewport.endDistanceM,
+    ) ?? missionProfileActiveSource;
+  }, [missionProfileActiveSource, missionProfileResolvedViewport]);
+
+  const missionHeightDisplaySamples = useMemo(
+    () => buildMissionProfileDisplaySamples(
+      missionHeightProfile?.samples ?? [],
+      minHeightAboveGroundUI,
+      maxHeightAboveGroundUI,
+    ),
+    [maxHeightAboveGroundUI, minHeightAboveGroundUI, missionHeightProfile],
+  );
 
   const missionHeightAxis = useMemo(() => {
-    if (!missionHeightProfile?.samples.length) {
+    if (!missionHeightDisplaySamples.length) {
       return {
         domain: [0, 1] as [number, number],
       };
     }
 
     const values: number[] = [];
-    for (const sample of missionHeightProfile.samples) {
+    for (const sample of missionHeightDisplaySamples) {
       const sampleValues = [
         sample.terrainAltitudeM,
         sample.droneAltitudeM,
@@ -2941,10 +3394,12 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
     return {
       domain: [lower, upper] as [number, number],
     };
-  }, [missionHeightProfile]);
+  }, [missionHeightDisplaySamples]);
 
-  const missionHeightChartMargin = { top: 4, right: 10, left: 4, bottom: 18 } as const;
-  const missionHeightYAxisWidth = 52;
+  const missionHeightChartSamples = useMemo(
+    () => decimateMissionProfileSamples(missionHeightDisplaySamples),
+    [missionHeightDisplaySamples],
+  );
 
   const overlayLegends = useMemo(() => {
     const legends: Array<{
@@ -2981,29 +3436,33 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
   }, [lockedOverlayRanges, overallStats, overlayScaleLocked, resolveOverlayRanges, showGsd]);
 
   const formatMissionDistance = useCallback((distanceM: number) => {
-    const totalDistanceM = missionHeightProfile?.summary.totalDistanceM ?? 0;
+    const totalDistanceM = missionProfileTotalDistanceM;
     if (totalDistanceM >= 2000) return `${(distanceM / 1000).toFixed(1)}`;
     return `${Math.round(distanceM)}`;
-  }, [missionHeightProfile]);
+  }, [missionProfileTotalDistanceM]);
 
   const clearMissionProfileCursor = useCallback(() => {
     mapRef.current?.setMissionProfileCursor?.(null);
     setHoveredMissionProfileSample(null);
   }, [mapRef]);
 
-  const handleMissionProfileChartHover = useCallback((state: any) => {
-    const hoveredSample = state?.activePayload?.[0]?.payload as MissionProfilePoint | undefined;
-    if (
-      hoveredSample
-      && Number.isFinite(hoveredSample.lng)
-      && Number.isFinite(hoveredSample.lat)
-    ) {
-      setHoveredMissionProfileSample(hoveredSample);
-      mapRef.current?.setMissionProfileCursor?.([hoveredSample.lng, hoveredSample.lat]);
+  const handleMissionProfileHoverDistance = useCallback((distanceM: number | null) => {
+    if (distanceM === null || !missionHeightProfile?.samples.length) {
+      clearMissionProfileCursor();
       return;
     }
-    clearMissionProfileCursor();
-  }, [clearMissionProfileCursor, mapRef]);
+    const hoveredSample = findNearestMissionProfileSample(missionHeightProfile.samples, distanceM);
+    if (!hoveredSample || !Number.isFinite(hoveredSample.lng) || !Number.isFinite(hoveredSample.lat)) {
+      clearMissionProfileCursor();
+      return;
+    }
+    mapRef.current?.setMissionProfileCursor?.([hoveredSample.lng, hoveredSample.lat]);
+    React.startTransition(() => {
+      setHoveredMissionProfileSample((current) =>
+        current?.distanceM === hoveredSample.distanceM ? current : hoveredSample,
+      );
+    });
+  }, [clearMissionProfileCursor, mapRef, missionHeightProfile]);
 
   React.useEffect(() => () => {
     clearMissionProfileCursor();
@@ -3011,7 +3470,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
 
   React.useEffect(() => {
     setHoveredMissionProfileSample(null);
-  }, [missionHeightProfile]);
+  }, [missionHeightProfile, missionProfileResolvedViewport]);
 
   const handleOverlayScaleLockedChange = useCallback((checked: boolean) => {
     if (checked && !overlayScaleLockedRef.current) {
@@ -3523,76 +3982,19 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
                 <div className="text-gray-500">Max clearance</div>
               </div>
             </div>
-            <div className="relative h-56">
-              <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart
-                  data={missionHeightProfile.samples}
-                  margin={missionHeightChartMargin}
-                  onMouseMove={handleMissionProfileChartHover}
-                  onMouseLeave={clearMissionProfileCursor}
-                >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                  <XAxis
-                    dataKey="distanceM"
-                    type="number"
-                    domain={[0, 'dataMax']}
-                    tick={{ fontSize: 10 }}
-                    tickFormatter={formatMissionDistance}
-                    label={{
-                      value: missionHeightProfile.summary.totalDistanceM >= 2000 ? 'Distance along mission (km)' : 'Distance along mission (m)',
-                      position: 'bottom',
-                      offset: 6,
-                      style: { fontSize: '10px' },
-                    }}
-                  />
-                  <YAxis
-                    width={missionHeightYAxisWidth}
-                    domain={missionHeightAxis.domain}
-                    allowDataOverflow
-                    tick={{ fontSize: 10 }}
-                    tickFormatter={(value: number) => value.toFixed(0)}
-                    label={{ value: 'Elevation (m)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="terrainAltitudeM"
-                    stroke="#64748b"
-                    fill="rgba(148, 163, 184, 0.32)"
-                    isAnimationActive={false}
-                    dot={false}
-                    connectNulls
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="droneAltitudeM"
-                    stroke="#2563eb"
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
-                    connectNulls
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="minHeightGuideAltitudeM"
-                    stroke="#f59e0b"
-                    strokeWidth={1.5}
-                    strokeDasharray="6 4"
-                    dot={false}
-                    isAnimationActive={false}
-                    connectNulls
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="maxHeightGuideAltitudeM"
-                    stroke="#ef4444"
-                    strokeWidth={1.5}
-                    strokeDasharray="6 4"
-                    dot={false}
-                    isAnimationActive={false}
-                    connectNulls
-                  />
-                </ComposedChart>
-              </ResponsiveContainer>
+            <div ref={missionProfileChartContainerRef}>
+              <MissionHeightProfileChart
+                samples={missionHeightChartSamples}
+                totalDistanceM={missionProfileTotalDistanceM}
+                domain={[
+                  missionProfileResolvedViewport.startDistanceM,
+                  missionProfileResolvedViewport.endDistanceM,
+                ]}
+                yDomain={missionHeightAxis.domain}
+                formatMissionDistance={formatMissionDistance}
+                onHoverDistance={handleMissionProfileHoverDistance}
+                onViewportChange={setMissionProfileViewport}
+              />
             </div>
             <p className="text-[11px] text-gray-500">
               Clearance is the vertical gap between the drone path and the sampled terrain directly underneath each mission point.
