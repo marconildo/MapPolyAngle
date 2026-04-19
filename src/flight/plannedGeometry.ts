@@ -1,6 +1,7 @@
 import type { FlightParams, LngLat, PlannedFlightGeometry, PlannedTurnBlock } from "@/domain/types";
 import { generateFlightLinesForPolygon } from "./flightLines";
 import { groupFlightLinesForTraversal, haversineDistance } from "./geometry";
+import { buildLeadManeuversForGeometry } from "./missionGeometry";
 
 type LocalPoint = {
   north: number;
@@ -855,19 +856,72 @@ const sampleLoiterArcBearings = (
   return bearingsRad;
 };
 
+const continuityDotAtJoin = (previousLine: LngLat[], nextLine: LngLat[]) => {
+  if (previousLine.length < 2 || nextLine.length < 2) return 1;
+  const referenceCoordinate = previousLine.at(-1)!;
+  const previousDirection = unitLocal(
+    subtractLocal(
+      toLocalPoint(previousLine.at(-1)!, referenceCoordinate),
+      toLocalPoint(previousLine.at(-2)!, referenceCoordinate),
+    ),
+  );
+  const nextDirection = unitLocal(
+    subtractLocal(
+      toLocalPoint(nextLine[1]!, referenceCoordinate),
+      toLocalPoint(nextLine[0]!, referenceCoordinate),
+    ),
+  );
+  if (normLocal(previousDirection) <= 1e-9 || normLocal(nextDirection) <= 1e-9) return 1;
+  return dotLocal(previousDirection, nextDirection);
+};
+
 const buildMissionTurnFallbackLine = (
   geometry: TurnBlockGeometry,
   referenceCoordinate: LngLat,
 ) => {
-  const entryBearingRad = bearingRad(geometry.loiterCenter, geometry.turnOff);
-  const entryPoint = advanceLocalPoint(geometry.loiterCenter, geometry.loiterRadiusM, entryBearingRad);
-  const idealCogRad = getBearingLoiterExitRad(
-    geometry.loiterCenter,
-    geometry.nextSweepStart,
-    geometry.loiterRadiusM,
-    geometry.loiterDirection,
+  const inboundDirection = unitLocal(subtractLocal(geometry.endSweep, geometry.startSweep));
+  const outboundDirection = unitLocal(subtractLocal(geometry.nextSweepEnd, geometry.nextSweepStart));
+  if (normLocal(inboundDirection) <= 1e-9 || normLocal(outboundDirection) <= 1e-9) {
+    return {
+      turnaroundLine: dedupeCoordinates([
+        fromLocalPoint(geometry.endSweep, referenceCoordinate),
+        fromLocalPoint(geometry.nextSweepStart, referenceCoordinate),
+      ]),
+      loiterEntryPoint: undefined,
+      loiterExitPoint: undefined,
+    };
+  }
+
+  const entryRadialUnit = unitLocal(
+    geometry.loiterDirection > 0
+      ? negateLocal(perpendicularRightLocal(inboundDirection))
+      : perpendicularRightLocal(inboundDirection),
   );
-  const exitBearingRad = idealCogRad + (geometry.loiterDirection > 0 ? -Math.PI / 2 : Math.PI / 2);
+  const exitRadialUnit = unitLocal(
+    geometry.loiterDirection > 0
+      ? negateLocal(perpendicularRightLocal(outboundDirection))
+      : perpendicularRightLocal(outboundDirection),
+  );
+  if (normLocal(entryRadialUnit) <= 1e-9 || normLocal(exitRadialUnit) <= 1e-9) {
+    return {
+      turnaroundLine: dedupeCoordinates([
+        fromLocalPoint(geometry.endSweep, referenceCoordinate),
+        fromLocalPoint(geometry.nextSweepStart, referenceCoordinate),
+      ]),
+      loiterEntryPoint: undefined,
+      loiterExitPoint: undefined,
+    };
+  }
+
+  const entryBearingRad = bearingRad(
+    { north: 0, east: 0 },
+    entryRadialUnit,
+  );
+  const exitBearingRad = bearingRad(
+    { north: 0, east: 0 },
+    exitRadialUnit,
+  );
+  const entryPoint = advanceLocalPoint(geometry.loiterCenter, geometry.loiterRadiusM, entryBearingRad);
   const exitPoint = advanceLocalPoint(geometry.loiterCenter, geometry.loiterRadiusM, exitBearingRad);
   const approximateArcLengthM =
     Math.abs(wrapPi(exitBearingRad - entryBearingRad)) * geometry.loiterRadiusM;
@@ -879,7 +933,6 @@ const buildMissionTurnFallbackLine = (
 
   const turnaroundCoordinates = dedupeCoordinates([
     fromLocalPoint(geometry.endSweep, referenceCoordinate),
-    fromLocalPoint(geometry.turnOff, referenceCoordinate),
     fromLocalPoint(entryPoint, referenceCoordinate),
     ...arcCoordinates.slice(1, -1),
     fromLocalPoint(exitPoint, referenceCoordinate),
@@ -1350,6 +1403,7 @@ const connectSweepLinesUsingDynamicFlightTurn = (
     }
 
     const previewLines = runTurnPreviewBlock(turnBlockGeometry, referenceCoordinate, previewParams);
+    const tangentFallbackTurn = buildMissionTurnFallbackLine(turnBlockGeometry, referenceCoordinate);
     const sweepLineForTurn = sweepLines[sweepIndex];
     const stitchedSweepLine =
       connectedLines.length > 0 ? stitchLineStart(sweepLineForTurn, connectedLines.at(-1)!.at(-1)!) : sweepLineForTurn;
@@ -1362,15 +1416,20 @@ const connectSweepLinesUsingDynamicFlightTurn = (
     let turnaroundLine = previewLines?.turnaroundLine;
     let loiterEntryPoint = previewLines?.loiterEntryPoint;
     let loiterExitPoint = previewLines?.loiterExitPoint;
+    const previewLooksSmooth =
+      turnaroundLine &&
+      turnaroundLine.length > 1 &&
+      continuityDotAtJoin(stitchedSweepLine, turnaroundLine) >= 0.98 &&
+      continuityDotAtJoin(turnaroundLine, sweepLines[sweepIndex + 1]!) >= 0.98;
 
-    if (!turnaroundLine) {
-      const fallbackTurn = buildMissionTurnFallbackLine(turnBlockGeometry, referenceCoordinate);
-      turnaroundLine = fallbackTurn.turnaroundLine;
-      loiterEntryPoint = fallbackTurn.loiterEntryPoint;
-      loiterExitPoint = fallbackTurn.loiterExitPoint;
+    const useTangentFallback = !previewLooksSmooth;
+    if (useTangentFallback) {
+      turnaroundLine = tangentFallbackTurn.turnaroundLine;
+      loiterEntryPoint = tangentFallbackTurn.loiterEntryPoint;
+      loiterExitPoint = tangentFallbackTurn.loiterExitPoint;
     }
 
-    if (turnaroundLine && turnaroundLine.length > 0) {
+    if (turnaroundLine && turnaroundLine.length > 0 && !useTangentFallback) {
       turnaroundLine = blendTurnaroundEndIntoSweep(
         turnaroundLine,
         sweepLines[sweepIndex + 1]!,
@@ -1439,6 +1498,8 @@ export const generatePlannedFlightGeometryForPolygon = (
       gridPoints: [],
       leadInPoints: [],
       leadOutPoints: [],
+      leadIn: undefined,
+      leadOut: undefined,
       connectedLines: sweepLines,
       turnaroundRadiusM: 0,
       turnBlocks: [],
@@ -1460,6 +1521,12 @@ export const generatePlannedFlightGeometryForPolygon = (
     flightTurnModel,
     params.altitudeAGL,
   );
+  const { leadIn, leadOut } = buildLeadManeuversForGeometry(
+    connectedLines,
+    leadInPoints,
+    leadOutPoints,
+    flightTurnModel.defaultTurnaroundRadiusM,
+  );
 
   const geometry = {
     ...raw,
@@ -1468,6 +1535,8 @@ export const generatePlannedFlightGeometryForPolygon = (
     gridPoints,
     leadInPoints,
     leadOutPoints,
+    leadIn,
+    leadOut,
     connectedLines,
     turnaroundRadiusM,
     turnBlocks,

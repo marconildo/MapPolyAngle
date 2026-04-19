@@ -6,9 +6,9 @@ import { lngLatToMeters, tileMetersBounds } from "@/overlap/mercator";
 import { metersToLngLat } from "@/services/Projection";
 import { SONY_RX1R2, SONY_RX1R3, SONY_A6100_20MM, DJI_ZENMUSE_P1_24MM, ILX_LR1_INSPECT_85MM, MAP61_17MM, RGB61_24MM, forwardSpacingRotated } from "@/domain/camera";
 import { DEFAULT_LIDAR_MAX_RANGE_M, getLidarMappingFovDeg, getLidarModel, lidarDeliverableDensity, lidarSinglePassDensity, lidarSwathWidth } from "@/domain/lidar";
-import { isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, build3DFlightPath, groupFlightLinesForTraversal, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
+import { isPointInRing, sampleCameraPositionsOnPlannedFlightGeometry, build3DFlightPath, groupFlightLinesForTraversal, queryElevationAtPointWGS84, queryMinMaxElevationAlongPolylineWGS84 } from "@/components/MapFlightDirection/utils/geometry";
 import { generatePlannedFlightGeometryForPolygon } from "@/flight/plannedGeometry";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart, Area, Line } from 'recharts';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,7 @@ type Props = {
   mapRef: React.RefObject<MapFlightDirectionAPI>;
   mapboxToken: string;
   clearAllEpoch?: number;
+  missionGeometryVersion?: number;
   /** Provide per‑polygon params (altitude/front/side) so we can compute per‑polygon photoSpacing. */
   getPerPolygonParams?: () => Record<string, FlightParams>;
   onEditPolygonParams?: (polygonId: string) => void;
@@ -126,6 +127,33 @@ const OVERLAY_SCALE_UPPER_QUANTILE = 0.95;
 const CARD_SUMMARY_LOWER_QUANTILE = 0.05;
 const CARD_SUMMARY_UPPER_QUANTILE = 0.95;
 const DENSITY_OVERLAY_MAX = 100;
+const MISSION_PROFILE_SAMPLE_SPACING_M = 12;
+
+type MissionProfilePoint = {
+  distanceM: number;
+  lng: number;
+  lat: number;
+  droneAltitudeM: number;
+  terrainAltitudeM: number | null;
+  clearanceM: number | null;
+  minHeightGuideAltitudeM: number | null;
+  maxHeightGuideAltitudeM: number | null;
+  segmentLabel: string;
+  segmentKind: 'area' | 'connector';
+};
+
+type MissionProfileSummary = {
+  totalDistanceM: number;
+  minClearanceM: number | null;
+  meanClearanceM: number | null;
+  maxClearanceM: number | null;
+  sampleCount: number;
+};
+
+type MissionProfileData = {
+  samples: MissionProfilePoint[];
+  summary: MissionProfileSummary;
+};
 
 function splitPerfNow() {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -138,6 +166,104 @@ function splitPerfLog(scope: string, message: string, data?: unknown) {
     return;
   }
   console.debug(`[terrain-split][${scope}] ${message}`, data);
+}
+
+function horizontalDistanceMeters3D(
+  start: [number, number, number],
+  end: [number, number, number],
+) {
+  const [x1, y1] = lngLatToMeters(start[0], start[1]);
+  const [x2, y2] = lngLatToMeters(end[0], end[1]);
+  return Math.hypot(x2 - x1, y2 - y1);
+}
+
+function pointsNearlyMatch3D(
+  left: [number, number, number],
+  right: [number, number, number],
+) {
+  return horizontalDistanceMeters3D(left, right) <= 0.05 && Math.abs(left[2] - right[2]) <= 0.05;
+}
+
+function sampleMissionPathProfile(
+  segments: Array<{
+    path3D: [number, number, number][][];
+    terrainTiles: TerrainTile[];
+    segmentLabel: string;
+    segmentKind: 'area' | 'connector';
+  }>,
+  minHeightAboveGroundM: number,
+  maxHeightAboveGroundM: number,
+  sampleSpacingM = MISSION_PROFILE_SAMPLE_SPACING_M,
+): MissionProfileData | null {
+  const samples: MissionProfilePoint[] = [];
+  let cumulativeDistanceM = 0;
+  let lastPoint3D: [number, number, number] | null = null;
+
+  const appendSample = (
+    point: [number, number, number],
+    terrainTiles: TerrainTile[],
+    segmentLabel: string,
+    segmentKind: 'area' | 'connector',
+  ) => {
+    const terrainAltitudeM = terrainTiles.length > 0 ? queryElevationAtPointWGS84(point[0], point[1], terrainTiles) : NaN;
+    samples.push({
+      distanceM: cumulativeDistanceM,
+      lng: point[0],
+      lat: point[1],
+      droneAltitudeM: point[2],
+      terrainAltitudeM: Number.isFinite(terrainAltitudeM) ? terrainAltitudeM : null,
+      clearanceM: Number.isFinite(terrainAltitudeM) ? point[2] - terrainAltitudeM : null,
+      minHeightGuideAltitudeM: Number.isFinite(terrainAltitudeM) ? terrainAltitudeM + minHeightAboveGroundM : null,
+      maxHeightGuideAltitudeM: Number.isFinite(terrainAltitudeM) ? terrainAltitudeM + maxHeightAboveGroundM : null,
+      segmentLabel,
+      segmentKind,
+    });
+    lastPoint3D = point;
+  };
+
+  for (const segmentGroup of segments) {
+    for (const path of segmentGroup.path3D) {
+      if (path.length === 0) continue;
+      const firstPoint = path[0]!;
+      if (!lastPoint3D || !pointsNearlyMatch3D(firstPoint, lastPoint3D)) {
+        appendSample(firstPoint, segmentGroup.terrainTiles, segmentGroup.segmentLabel, segmentGroup.segmentKind);
+      }
+
+      for (let index = 1; index < path.length; index += 1) {
+        const start = path[index - 1]!;
+        const end = path[index]!;
+        const segmentDistanceM = horizontalDistanceMeters3D(start, end);
+        const steps = Math.max(1, Math.ceil(segmentDistanceM / sampleSpacingM));
+        for (let step = 1; step <= steps; step += 1) {
+          const t = step / steps;
+          const point: [number, number, number] = [
+            start[0] + (end[0] - start[0]) * t,
+            start[1] + (end[1] - start[1]) * t,
+            start[2] + (end[2] - start[2]) * t,
+          ];
+          cumulativeDistanceM += segmentDistanceM / steps;
+          appendSample(point, segmentGroup.terrainTiles, segmentGroup.segmentLabel, segmentGroup.segmentKind);
+        }
+      }
+    }
+  }
+
+  if (samples.length < 2) return null;
+
+  const finiteClearances = samples
+    .map((sample) => sample.clearanceM)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  const summary: MissionProfileSummary = {
+    totalDistanceM: samples[samples.length - 1]?.distanceM ?? 0,
+    minClearanceM: finiteClearances.length > 0 ? Math.min(...finiteClearances) : null,
+    meanClearanceM: finiteClearances.length > 0
+      ? finiteClearances.reduce((sum, value) => sum + value, 0) / finiteClearances.length
+      : null,
+    maxClearanceM: finiteClearances.length > 0 ? Math.max(...finiteClearances) : null,
+    sampleCount: samples.length,
+  };
+
+  return { samples, summary };
 }
 
 function statsTotalAreaM2(stats: GSDStats) {
@@ -274,7 +400,7 @@ function lidarStripMayAffectTile(
     minYs > bounds.maxY
   );
 }
-export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, mergeState, historyState, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missionGeometryVersion = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, mergeState, historyState, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
     SONY_RX1R3,
@@ -412,16 +538,23 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
   // NEW: altitude strategy & min clearance & turn extension (synced with map API if available)
   const [altitudeModeUI, setAltitudeModeUI] = useState<'legacy' | 'min-clearance'>('legacy');
   const [minClearanceUI, setMinClearanceUI] = useState<number>(60);
+  const [minHeightAboveGroundUI, setMinHeightAboveGroundUI] = useState<number>(60);
+  const [maxHeightAboveGroundUI, setMaxHeightAboveGroundUI] = useState<number>(120);
   const [turnExtendUI, setTurnExtendUI] = useState<number>(96);
+  const [hoveredMissionProfileSample, setHoveredMissionProfileSample] = useState<MissionProfilePoint | null>(null);
 
   // Sync initial values from map API
   React.useEffect(() => {
     const api = mapRef.current;
     const mode = (api as any)?.getAltitudeMode ? (api as any).getAltitudeMode() : 'legacy';
     const minc = (api as any)?.getMinClearance ? (api as any).getMinClearance() : 60;
+    const minHeight = (api as any)?.getMinHeightAboveGround ? (api as any).getMinHeightAboveGround() : 60;
+    const maxHeight = (api as any)?.getMaxHeightAboveGround ? (api as any).getMaxHeightAboveGround() : 120;
     const ext = (api as any)?.getTurnExtend ? (api as any).getTurnExtend() : 96;
     setAltitudeModeUI(mode);
     setMinClearanceUI(minc);
+    setMinHeightAboveGroundUI(minHeight);
+    setMaxHeightAboveGroundUI(maxHeight);
     setTurnExtendUI(ext);
   }, [mapRef]);
 
@@ -2697,6 +2830,122 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
     return cards;
   }, [overallStats]);
 
+  const missionHeightProfile = useMemo(() => {
+    const api = mapRef.current;
+    if (!api?.getMissionAreaOrder || !api.getFlightPaths3D || !api.getMissionConnectorTerrainTiles) {
+      return null;
+    }
+
+    const orderedPolygonIds = api.getMissionAreaOrder();
+    if (orderedPolygonIds.length === 0) return null;
+
+    const missionGeometry = api.getMissionGeometry?.();
+    const polygonFlightPaths3D = api.getFlightPaths3D();
+    const polygonTiles = api.getPolygonTiles?.() ?? new Map<string, TerrainTile[]>();
+    const connectorTerrainTiles = api.getMissionConnectorTerrainTiles();
+    const connectionsByPair = new Map(
+      (missionGeometry?.connections ?? []).map((connection) => [
+        `${connection.fromPolygonId}->${connection.toPolygonId}`,
+        connection,
+      ] as const),
+    );
+
+    const segments: Array<{
+      path3D: [number, number, number][][];
+      terrainTiles: TerrainTile[];
+      segmentLabel: string;
+      segmentKind: 'area' | 'connector';
+    }> = [];
+
+    for (let index = 0; index < orderedPolygonIds.length; index += 1) {
+      const polygonId = orderedPolygonIds[index]!;
+      const areaPath3D = polygonFlightPaths3D.get(polygonId);
+      if (areaPath3D && areaPath3D.length > 0) {
+        segments.push({
+          path3D: areaPath3D,
+          terrainTiles: (polygonTiles.get(polygonId) ?? []) as TerrainTile[],
+          segmentLabel: getPolygonDisplayName(polygonId),
+          segmentKind: 'area',
+        });
+      }
+
+      const nextPolygonId = orderedPolygonIds[index + 1];
+      if (!nextPolygonId) continue;
+      const connection = connectionsByPair.get(`${polygonId}->${nextPolygonId}`);
+      if (!connection || connection.path3D.length === 0) continue;
+      segments.push({
+        path3D: connection.path3D,
+        terrainTiles: connectorTerrainTiles.get(connection.key) ?? [],
+        segmentLabel: `${getPolygonDisplayName(polygonId)} → ${getPolygonDisplayName(nextPolygonId)}`,
+        segmentKind: 'connector',
+      });
+    }
+
+    return sampleMissionPathProfile(segments, minHeightAboveGroundUI, maxHeightAboveGroundUI);
+  }, [
+    altitudeModeUI,
+    getPolygonDisplayName,
+    mapRef,
+    maxHeightAboveGroundUI,
+    minClearanceUI,
+    minHeightAboveGroundUI,
+    missionGeometryVersion,
+    polygonAnalyses,
+    turnExtendUI,
+  ]);
+
+  const missionHeightAxis = useMemo(() => {
+    if (!missionHeightProfile?.samples.length) {
+      return {
+        domain: [0, 1] as [number, number],
+      };
+    }
+
+    const values: number[] = [];
+    for (const sample of missionHeightProfile.samples) {
+      const sampleValues = [
+        sample.terrainAltitudeM,
+        sample.droneAltitudeM,
+        sample.minHeightGuideAltitudeM,
+        sample.maxHeightGuideAltitudeM,
+      ];
+      for (const value of sampleValues) {
+        if (typeof value === 'number' && Number.isFinite(value)) values.push(value);
+      }
+    }
+
+    if (values.length === 0) {
+      return {
+        domain: [0, 1] as [number, number],
+      };
+    }
+
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const span = Math.max(maxValue - minValue, 1);
+    const padding = Math.max(4, span * 0.08);
+
+    let lower = Math.floor(minValue - padding);
+    let upper = Math.ceil(maxValue + padding);
+
+    if (upper - lower < 8) {
+      const center = (upper + lower) / 2;
+      lower = Math.floor(center - 4);
+      upper = Math.ceil(center + 4);
+    }
+
+    if (upper <= lower) {
+      upper = lower + 1;
+    }
+
+    return {
+      domain: [lower, upper] as [number, number],
+    };
+  }, [missionHeightProfile]);
+
+  const missionHeightChartMargin = { top: 4, right: 10, left: 4, bottom: 18 } as const;
+  const missionHeightYAxisWidth = 52;
+
   const overlayLegends = useMemo(() => {
     const legends: Array<{
       metricKind: MetricKind;
@@ -2730,6 +2979,39 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
 
     return legends;
   }, [lockedOverlayRanges, overallStats, overlayScaleLocked, resolveOverlayRanges, showGsd]);
+
+  const formatMissionDistance = useCallback((distanceM: number) => {
+    const totalDistanceM = missionHeightProfile?.summary.totalDistanceM ?? 0;
+    if (totalDistanceM >= 2000) return `${(distanceM / 1000).toFixed(1)}`;
+    return `${Math.round(distanceM)}`;
+  }, [missionHeightProfile]);
+
+  const clearMissionProfileCursor = useCallback(() => {
+    mapRef.current?.setMissionProfileCursor?.(null);
+    setHoveredMissionProfileSample(null);
+  }, [mapRef]);
+
+  const handleMissionProfileChartHover = useCallback((state: any) => {
+    const hoveredSample = state?.activePayload?.[0]?.payload as MissionProfilePoint | undefined;
+    if (
+      hoveredSample
+      && Number.isFinite(hoveredSample.lng)
+      && Number.isFinite(hoveredSample.lat)
+    ) {
+      setHoveredMissionProfileSample(hoveredSample);
+      mapRef.current?.setMissionProfileCursor?.([hoveredSample.lng, hoveredSample.lat]);
+      return;
+    }
+    clearMissionProfileCursor();
+  }, [clearMissionProfileCursor, mapRef]);
+
+  React.useEffect(() => () => {
+    clearMissionProfileCursor();
+  }, [clearMissionProfileCursor]);
+
+  React.useEffect(() => {
+    setHoveredMissionProfileSample(null);
+  }, [missionHeightProfile]);
 
   const handleOverlayScaleLockedChange = useCallback((checked: boolean) => {
     if (checked && !overlayScaleLockedRef.current) {
@@ -3198,6 +3480,127 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
         );
       })}
 
+      {missionHeightProfile && (
+        <Card className="mt-2">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm">Mission Height Profile</CardTitle>
+            <CardDescription className="text-xs">
+              Drone altitude versus terrain underneath it across the full flown mission path.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-4 gap-4 text-xs">
+              <div className="text-center">
+                <div className="font-medium text-gray-900">
+                  {hoveredMissionProfileSample?.clearanceM !== null && hoveredMissionProfileSample?.clearanceM !== undefined
+                    ? `${hoveredMissionProfileSample.clearanceM.toFixed(1)} m`
+                    : '—'}
+                </div>
+                <div className="text-gray-500">HAGL at cursor</div>
+              </div>
+              <div className="text-center">
+                <div className="font-medium text-red-600">
+                  {missionHeightProfile.summary.minClearanceM !== null
+                    ? `${missionHeightProfile.summary.minClearanceM.toFixed(1)} m`
+                    : 'n/a'}
+                </div>
+                <div className="text-gray-500">Min clearance</div>
+              </div>
+              <div className="text-center">
+                <div className="font-medium text-blue-600">
+                  {missionHeightProfile.summary.meanClearanceM !== null
+                    ? `${missionHeightProfile.summary.meanClearanceM.toFixed(1)} m`
+                    : 'n/a'}
+                </div>
+                <div className="text-gray-500">Mean clearance</div>
+              </div>
+              <div className="text-center">
+                <div className="font-medium text-green-600">
+                  {missionHeightProfile.summary.maxClearanceM !== null
+                    ? `${missionHeightProfile.summary.maxClearanceM.toFixed(1)} m`
+                    : 'n/a'}
+                </div>
+                <div className="text-gray-500">Max clearance</div>
+              </div>
+            </div>
+            <div className="relative h-56">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart
+                  data={missionHeightProfile.samples}
+                  margin={missionHeightChartMargin}
+                  onMouseMove={handleMissionProfileChartHover}
+                  onMouseLeave={clearMissionProfileCursor}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis
+                    dataKey="distanceM"
+                    type="number"
+                    domain={[0, 'dataMax']}
+                    tick={{ fontSize: 10 }}
+                    tickFormatter={formatMissionDistance}
+                    label={{
+                      value: missionHeightProfile.summary.totalDistanceM >= 2000 ? 'Distance along mission (km)' : 'Distance along mission (m)',
+                      position: 'bottom',
+                      offset: 6,
+                      style: { fontSize: '10px' },
+                    }}
+                  />
+                  <YAxis
+                    width={missionHeightYAxisWidth}
+                    domain={missionHeightAxis.domain}
+                    allowDataOverflow
+                    tick={{ fontSize: 10 }}
+                    tickFormatter={(value: number) => value.toFixed(0)}
+                    label={{ value: 'Elevation (m)', angle: -90, position: 'insideLeft', style: { fontSize: '10px' } }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="terrainAltitudeM"
+                    stroke="#64748b"
+                    fill="rgba(148, 163, 184, 0.32)"
+                    isAnimationActive={false}
+                    dot={false}
+                    connectNulls
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="droneAltitudeM"
+                    stroke="#2563eb"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                    connectNulls
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="minHeightGuideAltitudeM"
+                    stroke="#f59e0b"
+                    strokeWidth={1.5}
+                    strokeDasharray="6 4"
+                    dot={false}
+                    isAnimationActive={false}
+                    connectNulls
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="maxHeightGuideAltitudeM"
+                    stroke="#ef4444"
+                    strokeWidth={1.5}
+                    strokeDasharray="6 4"
+                    dot={false}
+                    isAnimationActive={false}
+                    connectNulls
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="text-[11px] text-gray-500">
+              Clearance is the vertical gap between the drone path and the sampled terrain directly underneath each mission point.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       {overlayLegends.length > 0 && (
         <div className="rounded-md border border-gray-200 bg-gray-50/80 p-2 space-y-2">
           <div className="flex items-center justify-between gap-3 text-[11px] text-gray-500">
@@ -3272,6 +3675,34 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, getPer
                     const api = mapRef.current as any;
                     if (api?.setMinClearance) api.setMinClearance(v);
                     scheduleGuardedTimeout(() => { compute(); }, 0);
+                  }}
+                />
+              </label>
+              <label className="text-xs text-gray-600 block">Min height above ground (m)
+                <input
+                  className="w-full border rounded px-2 py-1 text-xs"
+                  type="number"
+                  min={0}
+                  value={minHeightAboveGroundUI}
+                  onChange={(e)=>{
+                    const v = Math.max(0, parseFloat(e.target.value || '60'));
+                    setMinHeightAboveGroundUI(v);
+                    const api = mapRef.current as any;
+                    if (api?.setMinHeightAboveGround) api.setMinHeightAboveGround(v);
+                  }}
+                />
+              </label>
+              <label className="text-xs text-gray-600 block">Max height above ground (m)
+                <input
+                  className="w-full border rounded px-2 py-1 text-xs"
+                  type="number"
+                  min={0}
+                  value={maxHeightAboveGroundUI}
+                  onChange={(e)=>{
+                    const v = Math.max(0, parseFloat(e.target.value || '120'));
+                    setMaxHeightAboveGroundUI(v);
+                    const api = mapRef.current as any;
+                    if (api?.setMaxHeightAboveGround) api.setMaxHeightAboveGround(v);
                   }}
                 />
               </label>

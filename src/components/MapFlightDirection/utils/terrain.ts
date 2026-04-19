@@ -68,6 +68,29 @@ function lat2tile(lat: number, zoom: number) {
   );
 }
 
+export function terrainTileKey(tile: Pick<TerrainTile, 'z' | 'x' | 'y'>) {
+  return `${tile.z}/${tile.x}/${tile.y}`;
+}
+
+export function getTileCoverageKeysForPolygon(
+  polygon: Polygon,
+  zoom: number,
+): string[] {
+  const bounds = getPolygonBounds(polygon.coordinates);
+  const minTileX = long2tile(bounds.minLng, zoom);
+  const maxTileX = long2tile(bounds.maxLng, zoom);
+  const minTileY = lat2tile(bounds.maxLat, zoom);
+  const maxTileY = lat2tile(bounds.minLat, zoom);
+
+  const keys: string[] = [];
+  for (let x = minTileX; x <= maxTileX; x++) {
+    for (let y = minTileY; y <= maxTileY; y++) {
+      keys.push(`${zoom}/${x}/${y}`);
+    }
+  }
+  return keys;
+}
+
 export async function fetchTilesForPolygon(
   polygon: Polygon,
   zoom: number,

@@ -6,8 +6,11 @@
 import type { Map as MapboxMap } from 'mapbox-gl';
 import type {
   FlightParams,
+  MissionFlightGeometry,
+  MissionTravelSummary,
   PlannedFlightGeometry,
   PayloadKind,
+  TerrainTile,
 } from '@/domain/types';
 import type { TerrainPartitionSolutionPreview } from '@/terrain-partition/types';
 import type { PolygonAnalysisResult } from './types';
@@ -138,7 +141,13 @@ export interface MapFlightDirectionAPI {
   applyPolygonParamsBatch(updates: Array<{ polygonId: string; params: FlightParams }>): void;
   applyParamsToAllPending(params: FlightParams): void; // bulk apply same params to queued polygons
   getFlightLines(): Map<string, PlannedFlightGeometry & { altitudeAGL: number }>;
+  getFlightPaths3D(): Map<string, [number, number, number][][]>;
   getPerPolygonParams(): Record<string, FlightParams>;
+  getMissionAreaOrder(): string[];
+  getMissionGeometry(): MissionFlightGeometry | null;
+  getMissionConnectorTerrainTiles(): Map<string, TerrainTile[]>;
+  getMissionTravelSummary(): MissionTravelSummary | null;
+  setMissionProfileCursor(point: [number, number] | null): void;
 
   // Altitude strategy and clearance controls
   setAltitudeMode(mode: 'legacy' | 'min-clearance'): void;
@@ -147,6 +156,10 @@ export interface MapFlightDirectionAPI {
   getMinClearance(): number;
   setTurnExtend(meters: number): void;
   getTurnExtend(): number;
+  setMinHeightAboveGround(meters: number): void;
+  getMinHeightAboveGround(): number;
+  setMaxHeightAboveGround(meters: number): void;
+  getMaxHeightAboveGround(): number;
 
   // 3D visualization
   addCameraPoints(polygonId: string, positions: [number, number, number][]): void;

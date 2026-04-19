@@ -180,6 +180,16 @@ function convertElevationToWGS84(lat: number, lng: number, elevationEGM96: numbe
   return egm96.egm96ToEllipsoid(lat, lng, elevationEGM96);
 }
 
+export function queryElevationAtPointWGS84(
+  lng: number,
+  lat: number,
+  tiles: TerrainTile[],
+): number {
+  const elevationEGM96 = queryElevationAtPoint(lng, lat, tiles);
+  if (!Number.isFinite(elevationEGM96)) return NaN;
+  return convertElevationToWGS84(lat, lng, elevationEGM96);
+}
+
 function queryMaxElevationAlongLineWGS84(
   startLng: number,
   startLat: number,

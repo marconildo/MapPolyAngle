@@ -114,6 +114,7 @@ export default function Home() {
   // Imported/or override state (queried from Map component)
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
   const [overrides, setOverrides] = useState<Record<string, BearingOverride>>({});
+  const [missionGeometryVersion, setMissionGeometryVersion] = useState(0);
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
   const [mergeState, setMergeState] = useState<PolygonMergeState>({
     mode: 'idle',
@@ -412,6 +413,10 @@ export default function Home() {
       }
     }, 0);
   }, [cancelPendingCoverageAutoRun, importedPoseCount]);
+
+  const handleMissionGeometryUpdated = useCallback(() => {
+    setMissionGeometryVersion((current) => current + 1);
+  }, []);
 
   // Handler to receive the auto-run function from OverlapGSDPanel
   const handleAutoRunReceived = useCallback((autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => {
@@ -884,6 +889,7 @@ export default function Home() {
             mapRef={mapRef}
             mapboxToken={mapboxToken}
             clearAllEpoch={clearAllEpoch}
+            missionGeometryVersion={missionGeometryVersion}
             getPerPolygonParams={getParamsByPolygon}
             onEditPolygonParams={handleEditPolygonParams}
             onAutoRun={handleAutoRunReceived}
@@ -1236,6 +1242,7 @@ export default function Home() {
             onError={handleError}
             onRequestParams={handleRequestParams}
             onFlightLinesUpdated={handleFlightLinesUpdated}
+            onMissionGeometryUpdated={handleMissionGeometryUpdated}
             onClearGSD={handleClearGsd}
             onPolygonSelected={setSelectedPolygonId}
             onMergeStateChange={handleMergeStateChange}

@@ -6,7 +6,7 @@
  * © 2025 <your-name>. MIT License.
  ***********************************************************************/
 
-import type { FlightParams, PlannedFlightGeometry } from '@/domain/types';
+import type { FlightParams, InterAreaConnectionGeometry, PlannedFlightGeometry } from '@/domain/types';
 import type { Map as MapboxMap } from 'mapbox-gl';
 import { haversineDistance } from '@/flight/geometry';
 import { generateFlightLinesForPolygon } from '@/flight/flightLines';
@@ -25,6 +25,8 @@ function toPlannedFlightGeometry(
     gridPoints: [],
     leadInPoints: [],
     leadOutPoints: [],
+    leadIn: undefined,
+    leadOut: undefined,
     connectedLines: [],
     turnaroundRadiusM: 0,
     turnBlocks: [],
@@ -51,6 +53,14 @@ function getDrawLayerAnchor(map: MapboxMap): string | undefined {
   return layers.find((layer) => layer.id.startsWith('gl-draw-'))?.id;
 }
 
+function dedupeLineCoordinates(points: [number, number][]): [number, number][] {
+  return points.filter((point, index) =>
+    index === 0
+    || point[0] !== points[index - 1]![0]
+    || point[1] !== points[index - 1]![1],
+  );
+}
+
 const PROCESSING_PERIMETER_SOURCE_ID = 'terrain-processing-perimeter-source';
 const PROCESSING_PERIMETER_GLOW_LAYER_ID = 'terrain-processing-perimeter-glow';
 const PROCESSING_PERIMETER_CORE_LAYER_ID = 'terrain-processing-perimeter-core';
@@ -70,6 +80,11 @@ const NON_SELECTED_POLYGONS_LINE_LAYER_ID = 'non-selected-polygons-dim-line';
 const MISSION_ENDPOINTS_SOURCE_ID = 'mission-sequence-endpoints-source';
 const MISSION_ENDPOINTS_MARKER_LAYER_ID = 'mission-sequence-endpoints-marker';
 const MISSION_ENDPOINTS_LABEL_LAYER_ID = 'mission-sequence-endpoints-label';
+const INTER_AREA_CONNECTIONS_SOURCE_ID = 'inter-area-connections-source';
+const INTER_AREA_CONNECTIONS_LAYER_ID = 'inter-area-connections-layer';
+const MISSION_PROFILE_CURSOR_SOURCE_ID = 'mission-profile-cursor-source';
+const MISSION_PROFILE_CURSOR_HALO_LAYER_ID = 'mission-profile-cursor-halo';
+const MISSION_PROFILE_CURSOR_CORE_LAYER_ID = 'mission-profile-cursor-core';
 
 function emptyProcessingPerimeterData() {
   return {
@@ -412,6 +427,80 @@ export function clearMissionSequenceEndpoints(map: MapboxMap) {
   try { if (map.getLayer(MISSION_ENDPOINTS_LABEL_LAYER_ID)) map.removeLayer(MISSION_ENDPOINTS_LABEL_LAYER_ID); } catch {}
   try { if (map.getLayer(MISSION_ENDPOINTS_MARKER_LAYER_ID)) map.removeLayer(MISSION_ENDPOINTS_MARKER_LAYER_ID); } catch {}
   try { if (map.getSource(MISSION_ENDPOINTS_SOURCE_ID)) map.removeSource(MISSION_ENDPOINTS_SOURCE_ID); } catch {}
+}
+
+function emptyMissionProfileCursorData() {
+  return {
+    type: 'FeatureCollection',
+    features: [],
+  } as const;
+}
+
+function ensureMissionProfileCursorLayers(map: MapboxMap) {
+  if (!map.getSource(MISSION_PROFILE_CURSOR_SOURCE_ID)) {
+    map.addSource(MISSION_PROFILE_CURSOR_SOURCE_ID, {
+      type: 'geojson',
+      data: emptyMissionProfileCursorData(),
+    } as any);
+  }
+
+  const beforeId = getDrawLayerAnchor(map);
+  if (!map.getLayer(MISSION_PROFILE_CURSOR_HALO_LAYER_ID)) {
+    map.addLayer({
+      id: MISSION_PROFILE_CURSOR_HALO_LAYER_ID,
+      type: 'circle',
+      source: MISSION_PROFILE_CURSOR_SOURCE_ID,
+      paint: {
+        'circle-radius': 8,
+        'circle-color': '#ffffff',
+        'circle-opacity': 0.92,
+      },
+    }, beforeId);
+  }
+
+  if (!map.getLayer(MISSION_PROFILE_CURSOR_CORE_LAYER_ID)) {
+    map.addLayer({
+      id: MISSION_PROFILE_CURSOR_CORE_LAYER_ID,
+      type: 'circle',
+      source: MISSION_PROFILE_CURSOR_SOURCE_ID,
+      paint: {
+        'circle-radius': 4.8,
+        'circle-color': '#f97316',
+        'circle-stroke-width': 1.4,
+        'circle-stroke-color': '#ffffff',
+        'circle-opacity': 0.98,
+      },
+    }, beforeId);
+  }
+}
+
+export function setMissionProfileCursor(
+  map: MapboxMap,
+  point: [number, number] | null,
+) {
+  ensureMissionProfileCursorLayers(map);
+  const source = map.getSource(MISSION_PROFILE_CURSOR_SOURCE_ID) as any;
+  if (!source) return;
+
+  source.setData(point ? {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: point,
+        },
+        properties: {},
+      },
+    ],
+  } : emptyMissionProfileCursorData());
+}
+
+export function clearMissionProfileCursor(map: MapboxMap) {
+  try { if (map.getLayer(MISSION_PROFILE_CURSOR_CORE_LAYER_ID)) map.removeLayer(MISSION_PROFILE_CURSOR_CORE_LAYER_ID); } catch {}
+  try { if (map.getLayer(MISSION_PROFILE_CURSOR_HALO_LAYER_ID)) map.removeLayer(MISSION_PROFILE_CURSOR_HALO_LAYER_ID); } catch {}
+  try { if (map.getSource(MISSION_PROFILE_CURSOR_SOURCE_ID)) map.removeSource(MISSION_PROFILE_CURSOR_SOURCE_ID); } catch {}
 }
 
 export function setNonSelectedPolygonDimMask(
@@ -762,6 +851,69 @@ export function removeFlightLinesForPolygon(map: MapboxMap, polygonId: string) {
   try { if (map.getSource(sourceId)) map.removeSource(sourceId); } catch {}
 }
 
+export function setInterAreaConnections(
+  map: MapboxMap,
+  connections: readonly Pick<InterAreaConnectionGeometry, 'leadOut' | 'transfer' | 'leadIn'>[],
+) {
+  const data = {
+    type: 'FeatureCollection',
+    features: connections
+      .map((connection, connectionIndex) => {
+        const coordinates = dedupeLineCoordinates([
+          ...connection.leadOut,
+          ...connection.transfer.slice(1),
+          ...connection.leadIn.slice(1),
+        ]);
+        if (coordinates.length < 2) return null;
+        return {
+          type: 'Feature',
+          geometry: {
+            type: 'LineString',
+            coordinates,
+          },
+          properties: {
+            connectionIndex,
+          },
+        };
+      })
+      .filter((feature): feature is NonNullable<typeof feature> => feature !== null),
+  } as const;
+
+  if (map.getSource(INTER_AREA_CONNECTIONS_SOURCE_ID)) {
+    (map.getSource(INTER_AREA_CONNECTIONS_SOURCE_ID) as any).setData(data);
+  } else {
+    map.addSource(INTER_AREA_CONNECTIONS_SOURCE_ID, { type: 'geojson', data } as any);
+  }
+
+  if (!map.getLayer(INTER_AREA_CONNECTIONS_LAYER_ID)) {
+    map.addLayer({
+      id: INTER_AREA_CONNECTIONS_LAYER_ID,
+      type: 'line',
+      source: INTER_AREA_CONNECTIONS_SOURCE_ID,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round',
+      },
+      paint: {
+        'line-color': '#7dd3fc',
+        'line-width': 1.35,
+        'line-opacity': 0.92,
+        'line-dasharray': [1.2, 1.05],
+      },
+    }, getDrawLayerAnchor(map));
+  }
+}
+
+export function setInterAreaConnectionsVisibility(map: MapboxMap, visible: boolean) {
+  if (!map.getLayer(INTER_AREA_CONNECTIONS_LAYER_ID)) return;
+  map.setLayoutProperty(INTER_AREA_CONNECTIONS_LAYER_ID, 'visibility', visible ? 'visible' : 'none');
+}
+
+export function clearInterAreaConnections(map: MapboxMap) {
+  try { if (map.getLayer(INTER_AREA_CONNECTIONS_LAYER_ID)) map.removeLayer(INTER_AREA_CONNECTIONS_LAYER_ID); } catch {}
+  try { if (map.getSource(INTER_AREA_CONNECTIONS_SOURCE_ID)) map.removeSource(INTER_AREA_CONNECTIONS_SOURCE_ID); } catch {}
+}
+
 // -------------------------------------------------------------------
 // Trigger tick marks (camera trigger positions) along flight lines
 // -------------------------------------------------------------------
@@ -882,6 +1034,9 @@ export function clearAllFlightLines(map: MapboxMap) {
       try { map.removeSource(sourceId); } catch {}
     }
   }
+
+  clearInterAreaConnections(map);
+  clearMissionProfileCursor(map);
 }
 
 /**
