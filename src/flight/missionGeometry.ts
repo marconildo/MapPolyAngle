@@ -120,10 +120,9 @@ function path3DLengthMeters(path3D: readonly [number, number, number][][]): numb
     for (let index = 1; index < segment.length; index += 1) {
       const start = segment[index - 1];
       const end = segment[index];
-      const [x1, y1] = lngLatToMeters(start[0], start[1]);
-      const [x2, y2] = lngLatToMeters(end[0], end[1]);
+      const horizontalDistanceM = haversineDistance([start[0], start[1]], [end[0], end[1]]);
       const dz = end[2] - start[2];
-      total += Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + dz ** 2);
+      total += Math.sqrt(horizontalDistanceM ** 2 + dz ** 2);
     }
   }
   return total;
