@@ -4,6 +4,7 @@ import { queryElevationAtPointWGS84 } from "@/components/MapFlightDirection/util
 import type {
   MissionProfileCoreSample,
   MissionProfileData,
+  MissionProfileSegmentKind,
   MissionProfileSamplingOptions,
   MissionProfileSnapshot,
 } from "./missionProfileWorker.types";
@@ -13,6 +14,15 @@ type TerrainQueryFn = (lng: number, lat: number, terrainTiles: TerrainTile[]) =>
 type EvaluatedPoint = MissionProfileCoreSample & {
   terrainAltitudeM: number | null;
   clearanceM: number | null;
+};
+
+export type MissionProfileSegmentDistanceRange = {
+  key: string;
+  segmentLabel: string;
+  segmentKind: MissionProfileSegmentKind;
+  index: number;
+  startDistanceM: number;
+  endDistanceM: number;
 };
 
 const OVERVIEW_MAX_SAMPLES = 800;
@@ -268,6 +278,36 @@ export function computeMissionTotalDistanceM(snapshot: Pick<MissionProfileSnapsh
     }
   }
   return totalDistanceM;
+}
+
+export function computeMissionSegmentDistanceRanges(
+  snapshot: Pick<MissionProfileSnapshot, "segments">,
+): MissionProfileSegmentDistanceRange[] {
+  const ranges: MissionProfileSegmentDistanceRange[] = [];
+  let cumulativeDistanceM = 0;
+
+  for (let segmentIndex = 0; segmentIndex < snapshot.segments.length; segmentIndex += 1) {
+    const segment = snapshot.segments[segmentIndex]!;
+    const segmentStartM = cumulativeDistanceM;
+
+    for (const path of segment.path3D) {
+      for (let pointIndex = 1; pointIndex < path.length; pointIndex += 1) {
+        cumulativeDistanceM += horizontalDistanceMeters3D(path[pointIndex - 1]!, path[pointIndex]!);
+      }
+    }
+
+    if (cumulativeDistanceM <= segmentStartM) continue;
+    ranges.push({
+      key: segment.key,
+      segmentLabel: segment.segmentLabel,
+      segmentKind: segment.segmentKind,
+      index: segmentIndex,
+      startDistanceM: segmentStartM,
+      endDistanceM: cumulativeDistanceM,
+    });
+  }
+
+  return ranges;
 }
 
 export function buildMissionProfileOverview(

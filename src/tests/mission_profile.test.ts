@@ -6,6 +6,7 @@ import {
   buildMissionProfileDetailRange,
   buildMissionProfileOverview,
   clipMissionProfileToRange,
+  computeMissionSegmentDistanceRanges,
   quantizeMissionProfileSpacingBucket,
 } from "../flight/missionProfile.ts";
 import type { MissionProfileSnapshot } from "../flight/missionProfileWorker.types.ts";
@@ -151,10 +152,75 @@ function testBucketsAndRangesAreStable() {
   );
 }
 
+function testSegmentDistanceRangesTrackAreaAndConnectorWindows() {
+  const segmentSnapshot: MissionProfileSnapshot = {
+    missionId: "segments",
+    totalDistanceM: 0,
+    segments: [
+      {
+        key: "A",
+        segmentLabel: "Area 1",
+        segmentKind: "area",
+        terrainTiles: [],
+        path3D: [[
+          [fromMeters(0, 0)[0], fromMeters(0, 0)[1], 620],
+          [fromMeters(100, 0)[0], fromMeters(100, 0)[1], 620],
+        ]],
+      },
+      {
+        key: "A->B",
+        segmentLabel: "Area 1 → Area 2",
+        segmentKind: "connector",
+        terrainTiles: [],
+        path3D: [[
+          [fromMeters(100, 0)[0], fromMeters(100, 0)[1], 620],
+          [fromMeters(130, 40)[0], fromMeters(130, 40)[1], 620],
+        ]],
+      },
+      {
+        key: "B",
+        segmentLabel: "Area 2",
+        segmentKind: "area",
+        terrainTiles: [],
+        path3D: [[
+          [fromMeters(130, 40)[0], fromMeters(130, 40)[1], 620],
+          [fromMeters(260, 40)[0], fromMeters(260, 40)[1], 620],
+        ]],
+      },
+      {
+        key: "B->C",
+        segmentLabel: "Area 2 → Area 3",
+        segmentKind: "connector",
+        terrainTiles: [],
+        path3D: [[
+          [fromMeters(260, 40)[0], fromMeters(260, 40)[1], 620],
+          [fromMeters(300, 20)[0], fromMeters(300, 20)[1], 620],
+        ]],
+      },
+    ],
+  };
+
+  const ranges = computeMissionSegmentDistanceRanges(segmentSnapshot);
+  assert.equal(ranges.length, 4, "all non-empty segments should get ranges");
+  assert.equal(ranges[0]?.key, "A");
+  assert.equal(Math.round(ranges[0]!.startDistanceM), 0);
+  assert.ok(ranges[0]!.endDistanceM > 0, "first area should contribute a positive range");
+  assert.equal(ranges[1]?.key, "A->B");
+  assert.equal(ranges[1]!.startDistanceM, ranges[0]!.endDistanceM);
+  assert.equal(ranges[2]!.startDistanceM, ranges[1]!.endDistanceM);
+  assert.equal(ranges[2]?.key, "B");
+  assert.equal(ranges[3]?.key, "B->C");
+  assert.ok(
+    ranges[3]!.endDistanceM > ranges[2]!.endDistanceM,
+    "later connector should extend the mission distance range",
+  );
+}
+
 testOverviewBuildsReasonableProfile();
 testDetailRefinesRidgeRegion();
 testClipRetainsContextForNarrowWindow();
 testClipSummaryUsesOnlyVisibleSamples();
 testBucketsAndRangesAreStable();
+testSegmentDistanceRangesTrackAreaAndConnectorWindows();
 
 console.log("mission_profile.test.ts: all assertions passed");
