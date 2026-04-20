@@ -61,6 +61,8 @@ type Props = {
   historyState: PolygonHistoryState;
   selectedPolygonId?: string | null;
   onSelectPolygon?: (id: string | null) => void;
+  onOptimizeTransit?: () => void;
+  isOptimizingTransit?: boolean;
 };
 
 type MetricKind = 'gsd' | 'density';
@@ -763,7 +765,7 @@ function findNearestMissionProfileSample(
   return Math.abs(upper.distanceM - distanceM) < Math.abs(lower.distanceM - distanceM) ? upper : lower;
 }
 
-export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missionGeometryVersion = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, mergeState, historyState, selectedPolygonId: controlledSelectedId, onSelectPolygon }: Props) {
+export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missionGeometryVersion = 0, getPerPolygonParams, onEditPolygonParams, onAutoRun, onClearExposed, onExposePoseImporter, onPosesImported, polygonAnalyses, overrides, importedOriginals: _importedOriginals, mergeState, historyState, selectedPolygonId: controlledSelectedId, onSelectPolygon, onOptimizeTransit, isOptimizingTransit = false }: Props) {
   const CAMERA_REGISTRY: Record<string, CameraModel> = useMemo(()=>({
     SONY_RX1R2,
     SONY_RX1R3,
@@ -4161,10 +4163,24 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
       {missionHeightProfileForDisplay && (
         <Card className="mt-2">
           <CardHeader className="pb-3">
-            <CardTitle className="text-sm">{missionHeightProfileTitle}</CardTitle>
-            <CardDescription className="text-xs">
-              {missionHeightProfileDescription}
-            </CardDescription>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <CardTitle className="text-sm">{missionHeightProfileTitle}</CardTitle>
+                <CardDescription className="text-xs">
+                  {missionHeightProfileDescription}
+                </CardDescription>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={onOptimizeTransit}
+                disabled={isOptimizingTransit}
+                className="h-6 shrink-0 whitespace-nowrap px-1.5 text-[10px]"
+              >
+                Optimize Transit
+              </Button>
+            </div>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid grid-cols-4 gap-4 text-xs">

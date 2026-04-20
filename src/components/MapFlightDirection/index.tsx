@@ -342,6 +342,10 @@ function applyOptimizedAreaSequenceChoices(
     });
 }
 
+function sortAreaSequenceChoices(choices: MissionAreaSequenceBackendChoice[]) {
+  return [...choices].sort((left, right) => left.orderIndex - right.orderIndex);
+}
+
 const DECK_FLIGHT_LAYER_ID_PREFIXES = [
   'drone-path-',
   'drone-centerline-',
@@ -1349,6 +1353,115 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
         onFlightLinesUpdated?.(latestByPolygon.size === 1 ? Array.from(latestByPolygon.keys())[0] : '__all__');
       }
     }, [applyPolygonParams, onFlightLinesUpdated]);
+
+    const collectWingtraExportPolys = useCallback((): WingtraExportPolygonState[] => {
+      const polys: WingtraExportPolygonState[] = [];
+      polygonParamsRef.current.forEach((params, pid) => {
+        const res = polygonResultsRef.current.get(pid);
+        const collection = drawRef.current?.getAll();
+        const feature = collection?.features.find((f) => f.id === pid && f.geometry?.type === 'Polygon');
+        const ring = res?.polygon.coordinates || (feature?.geometry as any)?.coordinates?.[0];
+        if (!ring) return;
+        const override = bearingOverridesRef.current.get(pid);
+        const bearingDeg = normalizeBearing(override ? override.bearingDeg : (res?.result.contourDirDeg ?? 0)) ?? 0;
+        const axialBearingDeg = normalizeAxialBearingDeg(bearingDeg);
+        const lineSpacingM = override?.lineSpacingM || polygonFlightLinesRef.current.get(pid)?.lineSpacing;
+        polys.push({
+          polygonId: pid,
+          ring: ring as any,
+          params,
+          bearingDeg,
+          axialBearingDeg,
+          lineSpacingM,
+          triggerDistanceM: params.triggerDistanceM,
+        });
+      });
+      return polys;
+    }, []);
+
+    const optimizeMissionTransitInMemory = useCallback(async () => {
+      if (!isAreaSequenceBackendEnabled()) {
+        throw new Error('Transit optimization backend is not configured.');
+      }
+
+      const { areasFromState, extractWingtraSequenceEndpoints } = await loadWingtraConvertModule();
+      const polys = collectWingtraExportPolys();
+      if (polys.length === 0) {
+        throw new Error('Draw or import at least one area before optimizing transit.');
+      }
+
+      const fallbackAreas = buildWingtraFallbackAreas(areasFromState, polys);
+      if (fallbackAreas.length === 0) {
+        throw new Error('Draw or import at least one area before optimizing transit.');
+      }
+
+      const sequenceEndpoints = extractWingtraSequenceEndpoints(lastImportedFlightplan);
+      const shouldRunAreaSequenceOptimization =
+        polys.length > 1 || !!sequenceEndpoints.startEndpoint || !!sequenceEndpoints.endEndpoint;
+      if (!shouldRunAreaSequenceOptimization) {
+        return;
+      }
+
+      const axialAreasByPolygonId = buildWingtraAxialAreasByPolygonId(areasFromState, polys);
+      const exportSequenceMaxHeightAboveGroundM = resolveWingtraExportMaxHeightAboveGroundM(lastImportedFlightplan);
+      const exportSequenceCruiseSpeedMps = resolveWingtraExportCruiseSpeedMps(lastImportedFlightplan);
+      const sequenceResult = await optimizeAreaSequenceWithBackend(
+        buildAreaSequenceBackendRequest(polys, {
+          terrainSource,
+          altitudeMode,
+          minClearanceM,
+          turnExtendM,
+          maxHeightAboveGroundM: exportSequenceMaxHeightAboveGroundM,
+          fallbackCruiseSpeedMps: exportSequenceCruiseSpeedMps,
+          startEndpoint: sequenceEndpoints.startEndpoint,
+          endEndpoint: sequenceEndpoints.endEndpoint,
+        }),
+      );
+
+      if (sequenceResult.areas.length !== fallbackAreas.length) {
+        throw new Error('Transit optimization returned an incomplete area ordering.');
+      }
+
+      const orderedChoices = sortAreaSequenceChoices(sequenceResult.areas);
+      const orderedPolygonIds = orderedChoices.map((choice) => choice.polygonId);
+      updateMissionAreaOrder(() => orderedPolygonIds);
+
+      const nextOverrides = new Map(bearingOverridesRef.current);
+      const updatedParams: Array<{ polygonId: string; params: PolygonParams }> = [];
+
+      for (const choice of orderedChoices) {
+        const poly = polys.find((candidate) => candidate.polygonId === choice.polygonId);
+        const axialArea = axialAreasByPolygonId.get(choice.polygonId);
+        if (!poly || !axialArea) continue;
+        const optimizedBearingDeg = choice.flipped
+          ? (normalizeBearing(axialArea.angleDeg + 180) ?? axialArea.angleDeg)
+          : axialArea.angleDeg;
+        nextOverrides.set(choice.polygonId, {
+          bearingDeg: optimizedBearingDeg,
+          lineSpacingM: poly.lineSpacingM,
+          source: 'optimized',
+        });
+        const params = polygonParamsRef.current.get(choice.polygonId);
+        if (params) {
+          updatedParams.push({ polygonId: choice.polygonId, params });
+        }
+      }
+
+      bearingOverridesRef.current = nextOverrides;
+      setBearingOverrides(new Map(nextOverrides));
+      if (updatedParams.length > 0) {
+        applyPolygonParamsBatch(updatedParams);
+      }
+    }, [
+      altitudeMode,
+      applyPolygonParamsBatch,
+      collectWingtraExportPolys,
+      lastImportedFlightplan,
+      minClearanceM,
+      terrainSource,
+      turnExtendM,
+      updateMissionAreaOrder,
+    ]);
 
     const withProcessingPolygon = useCallback(async <T,>(polygonId: string, task: () => Promise<T>) => {
       const startIds = new Set(processingPolygonIdsRef.current);
@@ -4243,6 +4356,9 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       importWingtraFromText,
 
       optimizePolygonDirection,
+      optimizeMissionTransit: async () => {
+        await optimizeMissionTransitInMemory();
+      },
       revertPolygonToImportedDirection: (polygonId: string) => {
         void revertPolygonToImportedDirection(polygonId);
       },
@@ -4385,7 +4501,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       getTerrainPartitionSolutions, refineTerrainPartitionPreview, applyTerrainPartitionSolution, applyTerrainPartitionPreview,
       bearingOverrides, importedOriginals,
       importKmlFromText, importWingtraFromText,
-      optimizePolygonDirection, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons, resetAllDrawingsState,
+      optimizePolygonDirection, optimizeMissionTransitInMemory, revertPolygonToImportedDirection, runFullAnalysis, refreshTerrainForAllPolygons, resetAllDrawingsState,
       syncFlightLinesVisibility,
       altitudeMode, minClearanceM, terrainSource, turnExtendM,
       minHeightAboveGroundM, maxHeightAboveGroundM,

@@ -145,6 +145,7 @@ export default function Home() {
   const [exportNameDialogOpen, setExportNameDialogOpen] = useState(false);
   const [exportNameDraft, setExportNameDraft] = useState('exported');
   const [isExportingFlightplan, setIsExportingFlightplan] = useState(false);
+  const [isOptimizingTransit, setIsOptimizingTransit] = useState(false);
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
   const [clearAllEpoch, setClearAllEpoch] = useState(0);
@@ -698,6 +699,27 @@ export default function Home() {
     })();
   }, [exportNameDraft, isExportingFlightplan]);
 
+  const handleOptimizeTransit = useCallback(() => {
+    if (isOptimizingTransit || isExportingFlightplan) return;
+    void (async () => {
+      const api = mapRef.current;
+      if (!api?.optimizeMissionTransit) return;
+
+      try {
+        setIsOptimizingTransit(true);
+        await api.optimizeMissionTransit();
+      } catch (error) {
+        toast({
+          variant: 'destructive',
+          title: 'Transit optimization failed',
+          description: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setIsOptimizingTransit(false);
+      }
+    })();
+  }, [isExportingFlightplan, isOptimizingTransit]);
+
   if (!mapboxToken) {
     return (
       <div className="min-h-screen w-full flex items-center justify-center bg-gray-50">
@@ -903,6 +925,8 @@ export default function Home() {
             historyState={historyState}
             selectedPolygonId={selectedPolygonId}
             onSelectPolygon={setSelectedPolygonId}
+            onOptimizeTransit={handleOptimizeTransit}
+            isOptimizingTransit={isOptimizingTransit}
           />
         </Suspense>
       </div>
