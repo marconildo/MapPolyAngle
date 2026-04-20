@@ -137,6 +137,18 @@ function testBucketsAndRangesAreStable() {
   const detailRange = buildMissionProfileDetailRange(100, 300, 1_200, 10);
   assert.ok(detailRange.requestStartM <= 100, "detail range should pad backward");
   assert.ok(detailRange.requestEndM >= 300, "detail range should pad forward");
+
+  const nearbyDetailRange = buildMissionProfileDetailRange(102, 298, 1_200, 10);
+  assert.equal(
+    nearbyDetailRange.requestStartM,
+    detailRange.requestStartM,
+    "tiny zoom deltas should reuse the same padded detail-window start",
+  );
+  assert.equal(
+    nearbyDetailRange.requestEndM,
+    detailRange.requestEndM,
+    "tiny zoom deltas should reuse the same padded detail-window end",
+  );
 }
 
 testOverviewBuildsReasonableProfile();

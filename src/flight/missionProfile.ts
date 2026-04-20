@@ -395,7 +395,10 @@ export function buildMissionProfileDetailRange(
   const paddedSpanM = visibleSpanM * 1.25;
   const paddedStartM = Math.max(0, viewportStartM - visibleSpanM * 0.25);
   const paddedEndM = Math.min(totalDistanceM, viewportEndM + visibleSpanM * 0.25);
-  const bucketSpanM = Math.max(spacingBucketM * 64, paddedSpanM);
+  const bucketSpanM = Math.max(
+    spacingBucketM * 64,
+    quantizeMissionProfileSpacingBucket(paddedSpanM),
+  );
   const quantizedStartM = Math.max(0, Math.floor(paddedStartM / bucketSpanM) * bucketSpanM);
   const quantizedEndM = Math.min(totalDistanceM, Math.ceil(paddedEndM / bucketSpanM) * bucketSpanM);
   return {

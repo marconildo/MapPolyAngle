@@ -294,28 +294,90 @@ function lidarStripMayAffectTile(
   );
 }
 
-function decimateMissionProfileSamples<T extends { distanceM: number }>(
+function decimateMissionProfileSamples<T extends {
+  distanceM: number;
+  terrainAltitudeM: number | null;
+  droneAltitudeM: number;
+}>(
   samples: T[],
   maxSamples = MAX_MISSION_PROFILE_DISPLAY_SAMPLES,
 ): T[] {
   if (samples.length <= maxSamples) return samples;
-  const step = (samples.length - 1) / Math.max(maxSamples - 1, 1);
-  const decimated: T[] = [];
+  const startDistanceM = samples[0]?.distanceM ?? 0;
+  const endDistanceM = samples[samples.length - 1]?.distanceM ?? startDistanceM;
+  const spanDistanceM = Math.max(endDistanceM - startDistanceM, 1);
+  const bucketCount = Math.max(1, Math.floor(maxSamples / 6));
+  const bucketWidthM = spanDistanceM / bucketCount;
+  const retainedIndexes = new Set<number>([0, samples.length - 1]);
+
+  for (let bucketIndex = 0; bucketIndex < bucketCount; bucketIndex += 1) {
+    const bucketStartM = startDistanceM + bucketIndex * bucketWidthM;
+    const bucketEndM = bucketStartM + bucketWidthM;
+    let firstIndex = -1;
+    let lastIndex = -1;
+    let minTerrainIndex = -1;
+    let maxTerrainIndex = -1;
+    let minDroneIndex = -1;
+    let maxDroneIndex = -1;
+    let minTerrain = Number.POSITIVE_INFINITY;
+    let maxTerrain = Number.NEGATIVE_INFINITY;
+    let minDrone = Number.POSITIVE_INFINITY;
+    let maxDrone = Number.NEGATIVE_INFINITY;
+
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = samples[index]!;
+      if (sample.distanceM < bucketStartM || sample.distanceM > bucketEndM) continue;
+      if (firstIndex === -1) firstIndex = index;
+      lastIndex = index;
+      if (typeof sample.terrainAltitudeM === "number") {
+        if (sample.terrainAltitudeM < minTerrain) {
+          minTerrain = sample.terrainAltitudeM;
+          minTerrainIndex = index;
+        }
+        if (sample.terrainAltitudeM > maxTerrain) {
+          maxTerrain = sample.terrainAltitudeM;
+          maxTerrainIndex = index;
+        }
+      }
+      if (sample.droneAltitudeM < minDrone) {
+        minDrone = sample.droneAltitudeM;
+        minDroneIndex = index;
+      }
+      if (sample.droneAltitudeM > maxDrone) {
+        maxDrone = sample.droneAltitudeM;
+        maxDroneIndex = index;
+      }
+    }
+    [firstIndex, lastIndex, minTerrainIndex, maxTerrainIndex, minDroneIndex, maxDroneIndex]
+      .filter((index) => index >= 0)
+      .forEach((index) => retainedIndexes.add(index));
+  }
+
+  const decimated = [...retainedIndexes]
+    .sort((left, right) => left - right)
+    .map((index) => samples[index]!)
+    .filter((sample, index, array) => index === 0 || sample !== array[index - 1]);
+
+  if (decimated.length <= maxSamples) {
+    return decimated;
+  }
+
+  const fallbackStep = (decimated.length - 1) / Math.max(maxSamples - 1, 1);
+  const fallback: T[] = [];
   let lastIndex = -1;
   for (let bucket = 0; bucket < maxSamples; bucket += 1) {
-    const index = Math.round(bucket * step);
+    const index = Math.round(bucket * fallbackStep);
     if (index === lastIndex) continue;
-    const sample = samples[index];
-    if (sample) {
-      decimated.push(sample);
-      lastIndex = index;
-    }
+    const sample = decimated[index];
+    if (!sample) continue;
+    fallback.push(sample);
+    lastIndex = index;
   }
-  const finalSample = samples[samples.length - 1];
-  if (finalSample && decimated[decimated.length - 1] !== finalSample) {
-    decimated.push(finalSample);
+  const finalSample = decimated[decimated.length - 1];
+  if (finalSample && fallback[fallback.length - 1] !== finalSample) {
+    fallback.push(finalSample);
   }
-  return decimated;
+  return fallback;
 }
 
 type MissionHeightProfileChartProps = {
@@ -329,6 +391,15 @@ type MissionHeightProfileChartProps = {
   formatMissionDistance: (distanceM: number) => string;
   onHoverDistance: (distanceM: number | null) => void;
   onViewportChange: (viewport: MissionProfileViewport) => void;
+};
+
+type MissionProfileDetailCacheEntry = {
+  requestKey: string;
+  rangeStartM: number;
+  rangeEndM: number;
+  spacingBucketM: number;
+  maxSamples: number;
+  profile: MissionProfileData | null;
 };
 
 const MissionHeightProfileChart = React.memo(function MissionHeightProfileChart({
@@ -828,7 +899,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
   const [turnExtendUI, setTurnExtendUI] = useState<number>(96);
   const [hoveredMissionProfileSample, setHoveredMissionProfileSample] = useState<MissionProfileCoreSample | null>(null);
   const [missionProfileOverview, setMissionProfileOverview] = useState<MissionProfileData | null>(null);
-  const [missionProfileDetailProfiles, setMissionProfileDetailProfiles] = useState<Map<string, MissionProfileData | null>>(new Map());
+  const [missionProfileDetailProfiles, setMissionProfileDetailProfiles] = useState<Map<string, MissionProfileDetailCacheEntry>>(new Map());
+  const [missionProfileCommittedDetailKey, setMissionProfileCommittedDetailKey] = useState<string | null>(null);
   const [missionProfileViewport, setMissionProfileViewport] = useState<MissionProfileViewport>({
     mode: "full",
     startDistanceM: 0,
@@ -3210,6 +3282,7 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
     missionProfileLatestDetailRequestRef.current += 1;
     setMissionProfileOverview(null);
     setMissionProfileDetailProfiles(new Map());
+    setMissionProfileCommittedDetailKey(null);
     if (!missionProfileSnapshot) {
       setMissionProfileViewport({ mode: "full", startDistanceM: 0, endDistanceM: 0 });
     }
@@ -3311,7 +3384,10 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
     void controller.computeDetail(missionProfileDetailRequest).then(({ requestKey, profile }) => {
       setMissionProfileDetailProfiles((current) => {
         const next = new Map(current);
-        next.set(requestKey, profile);
+        next.set(requestKey, {
+          ...missionProfileDetailRequest,
+          profile,
+        });
         return next;
       });
       if (requestSeq < missionProfileLatestDetailRequestRef.current) return;
@@ -3320,13 +3396,85 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
     });
   }, [missionProfileDetailProfiles, missionProfileDetailRequest]);
 
+  const findBestCoveringDetail = useCallback((viewportStartM: number, viewportEndM: number) => {
+    let bestCoveringDetail: MissionProfileDetailCacheEntry | null = null;
+    for (const detailEntry of missionProfileDetailProfiles.values()) {
+      if (!detailEntry.profile) continue;
+      if (detailEntry.rangeStartM > viewportStartM || detailEntry.rangeEndM < viewportEndM) continue;
+      if (!bestCoveringDetail) {
+        bestCoveringDetail = detailEntry;
+        continue;
+      }
+      if (detailEntry.spacingBucketM < bestCoveringDetail.spacingBucketM) {
+        bestCoveringDetail = detailEntry;
+        continue;
+      }
+      if (detailEntry.spacingBucketM === bestCoveringDetail.spacingBucketM) {
+        const detailSpanM = detailEntry.rangeEndM - detailEntry.rangeStartM;
+        const bestSpanM = bestCoveringDetail.rangeEndM - bestCoveringDetail.rangeStartM;
+        if (detailSpanM < bestSpanM) {
+          bestCoveringDetail = detailEntry;
+        }
+      }
+    }
+    return bestCoveringDetail;
+  }, [missionProfileDetailProfiles]);
+
+  React.useEffect(() => {
+    if (!missionProfileOverview || missionProfileResolvedViewport.mode === "full" || !missionProfileDetailRequest) {
+      setMissionProfileCommittedDetailKey((current) => (current === null ? current : null));
+      return;
+    }
+
+    const viewportStartM = missionProfileResolvedViewport.startDistanceM;
+    const viewportEndM = missionProfileResolvedViewport.endDistanceM;
+    const exactDetail = missionProfileDetailProfiles.get(missionProfileDetailRequest.requestKey);
+    if (exactDetail?.profile) {
+      setMissionProfileCommittedDetailKey((current) =>
+        current === missionProfileDetailRequest.requestKey ? current : missionProfileDetailRequest.requestKey,
+      );
+      return;
+    }
+
+    const committedDetail = missionProfileCommittedDetailKey
+      ? missionProfileDetailProfiles.get(missionProfileCommittedDetailKey)
+      : null;
+    if (
+      committedDetail?.profile
+      && committedDetail.rangeStartM <= viewportStartM
+      && committedDetail.rangeEndM >= viewportEndM
+    ) {
+      return;
+    }
+
+    const bestCoveringDetail = findBestCoveringDetail(viewportStartM, viewportEndM);
+    const nextKey = bestCoveringDetail?.requestKey ?? null;
+    setMissionProfileCommittedDetailKey((current) => (current === nextKey ? current : nextKey));
+  }, [
+    findBestCoveringDetail,
+    missionProfileCommittedDetailKey,
+    missionProfileDetailProfiles,
+    missionProfileDetailRequest,
+    missionProfileOverview,
+    missionProfileResolvedViewport,
+  ]);
+
   const missionProfileActiveSource = useMemo(() => {
     if (!missionProfileOverview) return null;
     if (missionProfileResolvedViewport.mode === "full" || !missionProfileDetailRequest) {
       return missionProfileOverview;
     }
-    return missionProfileDetailProfiles.get(missionProfileDetailRequest.requestKey) ?? missionProfileOverview;
-  }, [missionProfileDetailProfiles, missionProfileDetailRequest, missionProfileOverview, missionProfileResolvedViewport.mode]);
+    const committedDetail = missionProfileCommittedDetailKey
+      ? missionProfileDetailProfiles.get(missionProfileCommittedDetailKey)
+      : null;
+    return committedDetail?.profile ?? missionProfileOverview;
+  }, [
+    missionProfileCommittedDetailKey,
+    missionProfileDetailProfiles,
+    missionProfileDetailRequest,
+    missionProfileOverview,
+    missionProfileResolvedViewport.mode,
+  ]);
 
   const missionHeightProfile = useMemo(() => {
     if (!missionProfileActiveSource) return null;
