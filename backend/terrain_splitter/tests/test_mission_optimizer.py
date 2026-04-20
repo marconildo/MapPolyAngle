@@ -135,6 +135,22 @@ def _endpoint(
     )
 
 
+def _make_linear_provided_area(polygon_id: str, min_lng: float) -> MissionAreaRequest:
+    return _make_provided_area(
+        polygon_id,
+        ring_origin_lng=min_lng,
+        ring_origin_lat=47.0,
+        start_point=(min_lng + 0.0001, 47.0006),
+        end_point=(min_lng + 0.0017, 47.0006),
+        lead_in_center=(min_lng + 0.0001, 47.0003),
+        lead_out_center=(min_lng + 0.0017, 47.0003),
+        lead_in_radius_m=25.0,
+        lead_out_radius_m=25.0,
+        altitude_agl=80.0,
+        altitude_wgs84_m=180.0,
+    )
+
+
 def test_two_area_exact_solver_picks_lower_cost_flip() -> None:
     dem = FakeDem()
     area_a = _make_area("A", 0.0000, 0.0000)
@@ -724,6 +740,109 @@ def test_solver_falls_back_to_greedy_when_exact_limit_is_low() -> None:
     assert response.solveMode == "greedy-fallback"
     assert response.solvedExactly is False
     assert sorted(area.polygonId for area in response.areas) == ["A", "B", "C"]
+
+
+def test_greedy_solver_start_endpoint_biases_first_area() -> None:
+    dem = FlatDem()
+    areas = [
+        _make_linear_provided_area("A", 7.0000),
+        _make_linear_provided_area("B", 7.0040),
+        _make_linear_provided_area("C", 7.0080),
+    ]
+    request = MissionOptimizeAreaSequenceRequest(
+        areas=areas,
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+        exactSearchMaxAreas=2,
+        startEndpoint=_endpoint((7.0081, 47.0006), altitude_wgs84_m=180.0, heading_deg=90.0),
+    )
+
+    response = optimize_area_sequence(request, dem, request_id="req-greedy-start-endpoint")
+
+    assert response.solveMode == "greedy-fallback"
+    assert response.solvedExactly is False
+    assert response.startConnection is not None
+    assert response.startConnection.toPolygonId == "C"
+    assert response.areas[0].polygonId == "C"
+
+
+def test_greedy_solver_end_endpoint_biases_last_area() -> None:
+    dem = FlatDem()
+    areas = [
+        _make_linear_provided_area("A", 7.0000),
+        _make_linear_provided_area("B", 7.0040),
+        _make_linear_provided_area("C", 7.0080),
+    ]
+    request = MissionOptimizeAreaSequenceRequest(
+        areas=areas,
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+        exactSearchMaxAreas=2,
+        endEndpoint=_endpoint((7.0017, 47.0006), altitude_wgs84_m=180.0, heading_deg=90.0),
+    )
+
+    response = optimize_area_sequence(request, dem, request_id="req-greedy-end-endpoint")
+
+    assert response.solveMode == "greedy-fallback"
+    assert response.solvedExactly is False
+    assert response.endConnection is not None
+    assert response.endConnection.fromPolygonId == "A"
+    assert response.areas[-1].polygonId == "A"
+
+
+def test_greedy_solver_with_both_endpoints_differs_from_unconstrained_path() -> None:
+    dem = FlatDem()
+    areas = [
+        _make_linear_provided_area("A", 7.0000),
+        _make_linear_provided_area("B", 7.0040),
+        _make_linear_provided_area("C", 7.0080),
+    ]
+    constrained_request = MissionOptimizeAreaSequenceRequest(
+        areas=areas,
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+        exactSearchMaxAreas=2,
+        startEndpoint=_endpoint((7.0081, 47.0006), altitude_wgs84_m=180.0, heading_deg=90.0),
+        endEndpoint=_endpoint((7.0017, 47.0006), altitude_wgs84_m=180.0, heading_deg=90.0),
+    )
+    unconstrained_request = MissionOptimizeAreaSequenceRequest(
+        areas=areas,
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+        exactSearchMaxAreas=2,
+    )
+
+    constrained_response = optimize_area_sequence(constrained_request, dem, request_id="req-greedy-both-endpoints")
+    unconstrained_response = optimize_area_sequence(unconstrained_request, dem, request_id="req-greedy-no-endpoints")
+
+    constrained_order = [area.polygonId for area in constrained_response.areas]
+    unconstrained_order = [area.polygonId for area in unconstrained_response.areas]
+
+    assert constrained_response.solveMode == "greedy-fallback"
+    assert unconstrained_response.solveMode == "greedy-fallback"
+    assert constrained_order != unconstrained_order
+    assert constrained_order[0] == "C"
+    assert constrained_order[-1] == "A"
+
+
+def test_default_threshold_uses_exact_dp_for_seventeen_areas() -> None:
+    dem = FlatDem()
+    request = MissionOptimizeAreaSequenceRequest(
+        areas=[_make_area(f"A{index}", 7.0 + index * 0.0030, 47.0) for index in range(17)],
+        altitudeMode="legacy",
+        minClearanceM=60.0,
+        maxHeightAboveGroundM=120.0,
+    )
+
+    response = optimize_area_sequence(request, dem, request_id="req-seventeen-default-threshold")
+
+    assert response.solveMode == "exact-dp"
+    assert response.solvedExactly is True
+    assert len(response.areas) == 17
 
 
 def test_single_area_solver_accounts_for_optional_start_and_end_endpoints() -> None:
