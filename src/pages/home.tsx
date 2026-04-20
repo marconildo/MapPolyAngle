@@ -114,6 +114,7 @@ export default function Home() {
   // Imported/or override state (queried from Map component)
   const [importedOriginals, setImportedOriginals] = useState<Record<string, { bearingDeg: number; lineSpacingM: number }>>({});
   const [overrides, setOverrides] = useState<Record<string, BearingOverride>>({});
+  const [missionGeometryVersion, setMissionGeometryVersion] = useState(0);
   const [selectedPolygonId, setSelectedPolygonId] = useState<string | null>(null);
   const [mergeState, setMergeState] = useState<PolygonMergeState>({
     mode: 'idle',
@@ -144,6 +145,7 @@ export default function Home() {
   const [exportNameDialogOpen, setExportNameDialogOpen] = useState(false);
   const [exportNameDraft, setExportNameDraft] = useState('exported');
   const [isExportingFlightplan, setIsExportingFlightplan] = useState(false);
+  const [isOptimizingTransit, setIsOptimizingTransit] = useState(false);
   // NEW: track imported pose count
   const [importedPoseCount, setImportedPoseCount] = useState(0);
   const [clearAllEpoch, setClearAllEpoch] = useState(0);
@@ -412,6 +414,10 @@ export default function Home() {
       }
     }, 0);
   }, [cancelPendingCoverageAutoRun, importedPoseCount]);
+
+  const handleMissionGeometryUpdated = useCallback(() => {
+    setMissionGeometryVersion((current) => current + 1);
+  }, []);
 
   // Handler to receive the auto-run function from OverlapGSDPanel
   const handleAutoRunReceived = useCallback((autoRunFn: (opts?: { polygonId?: string; reason?: 'lines'|'spacing'|'alt'|'manual' }) => void) => {
@@ -693,6 +699,27 @@ export default function Home() {
     })();
   }, [exportNameDraft, isExportingFlightplan]);
 
+  const handleOptimizeTransit = useCallback(() => {
+    if (isOptimizingTransit || isExportingFlightplan) return;
+    void (async () => {
+      const api = mapRef.current;
+      if (!api?.optimizeMissionTransit) return;
+
+      try {
+        setIsOptimizingTransit(true);
+        await api.optimizeMissionTransit();
+      } catch (error) {
+        toast({
+          variant: 'destructive',
+          title: 'Transit optimization failed',
+          description: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setIsOptimizingTransit(false);
+      }
+    })();
+  }, [isExportingFlightplan, isOptimizingTransit]);
+
   if (!mapboxToken) {
     return (
       <div className="min-h-screen w-full flex items-center justify-center bg-gray-50">
@@ -743,7 +770,7 @@ export default function Home() {
       ? `Imagery overlay: ${imageryDescriptor.name.length > 9 ? `${imageryDescriptor.name.slice(0, 9)}...` : imageryDescriptor.name}`
       : 'Terrain source';
   const headerButtonClassName = isMobile
-    ? 'h-9 min-w-0 flex-1 justify-center px-2.5 text-[13px]'
+    ? 'h-9 w-9 shrink-0 justify-center px-0'
     : 'h-8 px-2 whitespace-nowrap';
   const analysisPanelBody = (
     <>
@@ -884,6 +911,7 @@ export default function Home() {
             mapRef={mapRef}
             mapboxToken={mapboxToken}
             clearAllEpoch={clearAllEpoch}
+            missionGeometryVersion={missionGeometryVersion}
             getPerPolygonParams={getParamsByPolygon}
             onEditPolygonParams={handleEditPolygonParams}
             onAutoRun={handleAutoRunReceived}
@@ -897,6 +925,8 @@ export default function Home() {
             historyState={historyState}
             selectedPolygonId={selectedPolygonId}
             onSelectPolygon={setSelectedPolygonId}
+            onOptimizeTransit={handleOptimizeTransit}
+            isOptimizingTransit={isOptimizingTransit}
           />
         </Suspense>
       </div>
@@ -906,7 +936,7 @@ export default function Home() {
   return (
     <div className="h-screen flex flex-col bg-gray-50">
       {/* Header (compact) */}
-      <header className="bg-white/95 backdrop-blur border-b border-gray-200 px-3 md:px-4 py-2 z-50">
+      <header className="bg-white/95 backdrop-blur border-b border-gray-200 pl-2 pr-3 md:pr-4 py-2 z-50">
         <div className="flex items-center gap-2 md:justify-between">
           <div className="flex shrink-0 items-center gap-2">
             <div className="flex h-9 w-9 items-center justify-center rounded-md bg-blue-600">
@@ -923,7 +953,7 @@ export default function Home() {
               </div>
             )}
           </div>
-          <div className="flex min-w-0 flex-1 items-center gap-2 md:w-auto md:flex-none md:justify-end">
+          <div className="flex min-w-0 flex-1 items-center justify-end gap-2 md:w-auto md:flex-none">
             <Button
               size="sm"
               variant="outline"
@@ -931,9 +961,10 @@ export default function Home() {
               onClick={handleUndoPolygonOperation}
               disabled={historyState.isApplyingOperation || !historyState.canUndo}
               title={historyState.undoLabel ? `Undo ${historyState.undoLabel}` : 'Undo'}
+              aria-label={historyState.undoLabel ? `Undo ${historyState.undoLabel}` : 'Undo'}
             >
-              <Undo2 className="w-3 h-3 mr-1" />
-              Undo
+              <Undo2 className={isMobile ? 'w-3.5 h-3.5' : 'w-3 h-3 mr-1'} />
+              {!isMobile && 'Undo'}
             </Button>
 
             <Button
@@ -943,16 +974,24 @@ export default function Home() {
               onClick={handleRedoPolygonOperation}
               disabled={historyState.isApplyingOperation || !historyState.canRedo}
               title={historyState.redoLabel ? `Redo ${historyState.redoLabel}` : 'Redo'}
+              aria-label={historyState.redoLabel ? `Redo ${historyState.redoLabel}` : 'Redo'}
             >
-              <Redo2 className="w-3 h-3 mr-1" />
-              Redo
+              <Redo2 className={isMobile ? 'w-3.5 h-3.5' : 'w-3 h-3 mr-1'} />
+              {!isMobile && 'Redo'}
             </Button>
 
             {/* Consolidated Import dropdown */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline" className={headerButtonClassName}>
-                  <Upload className="w-3 h-3 mr-1" /> Import ▾
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className={headerButtonClassName}
+                  title="Import"
+                  aria-label="Import"
+                >
+                  <Upload className={isMobile ? 'w-3.5 h-3.5' : 'w-3 h-3 mr-1'} />
+                  {!isMobile && 'Import ▾'}
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-48">
@@ -988,15 +1027,18 @@ export default function Home() {
                   variant="outline"
                   className={headerButtonClassName}
                   title={isExportingFlightplan ? 'Export in progress' : 'Export data'}
+                  aria-label={isExportingFlightplan ? 'Export in progress' : 'Export'}
                   disabled={isExportingFlightplan}
                 >
                   <span className="inline-flex w-full items-center justify-center gap-1.5">
                     {isExportingFlightplan ? (
                       <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
                     ) : (
-                      <Download className="h-3 w-3" />
+                      <Download className={isMobile ? 'h-3.5 w-3.5' : 'h-3 w-3'} />
                     )}
-                    <span>{isExportingFlightplan ? 'Exporting' : 'Export ▾'}</span>
+                    {!isMobile && (
+                      <span>{isExportingFlightplan ? 'Exporting' : 'Export ▾'}</span>
+                    )}
                   </span>
                 </Button>
               </DropdownMenuTrigger>
@@ -1018,9 +1060,11 @@ export default function Home() {
               variant="outline"
               className={headerButtonClassName}
               onClick={clearAllDrawings}
+              title="Clear All"
+              aria-label="Clear All"
             >
-              <Trash2 className="w-3 h-3 mr-1" />
-              Clear All
+              <Trash2 className={isMobile ? 'w-3.5 h-3.5' : 'w-3 h-3 mr-1'} />
+              {!isMobile && 'Clear All'}
             </Button>
           </div>
         </div>
@@ -1205,7 +1249,7 @@ export default function Home() {
 
         {/* Right Side Panel - Combined Controls and Instructions - Hidden on mobile */}
         {!isMobile && (
-          <div className="absolute top-2 right-2 z-40 w-[540px] max-w-[92vw] max-h-[calc(100vh-120px)] overflow-y-auto">
+          <div className="absolute top-2 right-4 z-40 w-[540px] max-w-[92vw] max-h-[calc(100vh-120px)] overflow-y-auto">
 
           {/* Unified Analysis Panel */}
           <Card className="backdrop-blur-md bg-white/95">
@@ -1236,6 +1280,7 @@ export default function Home() {
             onError={handleError}
             onRequestParams={handleRequestParams}
             onFlightLinesUpdated={handleFlightLinesUpdated}
+            onMissionGeometryUpdated={handleMissionGeometryUpdated}
             onClearGSD={handleClearGsd}
             onPolygonSelected={setSelectedPolygonId}
             onMergeStateChange={handleMergeStateChange}

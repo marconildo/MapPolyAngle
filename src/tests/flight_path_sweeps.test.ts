@@ -276,6 +276,7 @@ function runDynamicTurnRegressionCase() {
   );
 
   for (let index = 1; index < geometry.connectedLines.length - 1; index += 2) {
+    const previousSweep = geometry.connectedLines[index - 1];
     const turnaroundEnd = geometry.connectedLines[index][geometry.connectedLines[index].length - 1];
     const nextSweepStart = geometry.connectedLines[index + 1][0];
     assert.deepEqual(
@@ -285,6 +286,19 @@ function runDynamicTurnRegressionCase() {
     );
 
     const turnaround = geometry.connectedLines[index];
+    const previousSweepHeadingDeg = headingDeg(
+      previousSweep[previousSweep.length - 2] as [number, number],
+      previousSweep[previousSweep.length - 1] as [number, number],
+    );
+    const turnaroundStartHeadingDeg = headingDeg(
+      turnaround[0] as [number, number],
+      turnaround[1] as [number, number],
+    );
+    assert.ok(
+      Math.abs(headingDeltaDeg(previousSweepHeadingDeg, turnaroundStartHeadingDeg)) < 12,
+      "turnaround blocks should leave the previous sweep without a visible heading notch",
+    );
+
     const nextSweep = geometry.connectedLines[index + 1];
     const turnaroundHeadingDeg = headingDeg(
       turnaround[turnaround.length - 2] as [number, number],

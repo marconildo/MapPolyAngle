@@ -62,6 +62,46 @@ export function remove3DPathLayer(
   });
 }
 
+export function update3DMissionConnectorLayer(
+  overlay: MapboxOverlay,
+  connectorPaths: [number, number, number][][],
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  const renderPaths = mergeContiguous3DPathSegmentsForRender(connectorPaths);
+  const connectorLayer = new PathLayer({
+    id: 'drone-mission-connectors',
+    data: renderPaths,
+    getPath: (d: any) => d,
+    getColor: [125, 211, 252, 220],
+    getWidth: 2.4,
+    widthUnits: 'meters',
+    coordinateSystem: COORDINATE_SYSTEM.LNGLAT,
+    billboard: false,
+    parameters: {
+      depthTest: true,
+      depthWrite: true,
+    },
+  });
+
+  setLayers((currentLayers) => {
+    const filteredLayers = currentLayers.filter((layer) => String(layer?.id ?? '') !== 'drone-mission-connectors');
+    const newLayers = [...filteredLayers, connectorLayer];
+    overlay.setProps({ layers: newLayers });
+    return newLayers;
+  });
+}
+
+export function remove3DMissionConnectorLayer(
+  overlay: MapboxOverlay,
+  setLayers: React.Dispatch<React.SetStateAction<any[]>>
+) {
+  setLayers((currentLayers) => {
+    const filteredLayers = currentLayers.filter((layer) => String(layer?.id ?? '') !== 'drone-mission-connectors');
+    overlay.setProps({ layers: filteredLayers });
+    return filteredLayers;
+  });
+}
+
 export function update3DCameraPointsLayer(
   overlay: MapboxOverlay,
   polygonId: string,

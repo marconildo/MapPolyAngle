@@ -100,6 +100,14 @@ export interface PlannedTurnBlock {
   loiterExitPoint?: LngLat;
 }
 
+export interface PlannedLeadManeuver {
+  anchorPoint: LngLat;
+  loiterCenter: LngLat;
+  loiterRadiusM: number;
+  loiterDirection: 1 | -1;
+  pathJoinPoint?: LngLat;
+}
+
 export interface PlannedFlightGeometry {
   lineSpacing: number;
   flightLines: LngLat[][]; // raw clipped sweep fragments kept for backward compatibility
@@ -108,9 +116,43 @@ export interface PlannedFlightGeometry {
   gridPoints: LngLat[];
   leadInPoints: LngLat[];
   leadOutPoints: LngLat[];
+  leadIn?: PlannedLeadManeuver;
+  leadOut?: PlannedLeadManeuver;
   connectedLines: LngLat[][]; // sweep/turn segments in flown order
   turnaroundRadiusM: number;
   turnBlocks: PlannedTurnBlock[];
+}
+
+export interface InterAreaConnectionGeometry {
+  key: string;
+  fromPolygonId: string;
+  toPolygonId: string;
+  leadOut: LngLat[];
+  transfer: LngLat[];
+  leadIn: LngLat[];
+  path3D: [number, number, number][][];
+  terrainZoom: number;
+  terrainTileCount: number;
+  sourceAltitudeM: number;
+  targetAltitudeM: number;
+  transferAltitudeM: number;
+  distanceM: number;
+  timeSec: number;
+}
+
+export interface MissionTravelSummary {
+  areaDistanceM: number;
+  areaTimeSec: number;
+  connectorDistanceM: number;
+  connectorTimeSec: number;
+  totalDistanceM: number;
+  totalTimeSec: number;
+}
+
+export interface MissionFlightGeometry {
+  orderedPolygonIds: string[];
+  connections: InterAreaConnectionGeometry[];
+  summary: MissionTravelSummary;
 }
 
 export interface PolygonAnalysisResult {
