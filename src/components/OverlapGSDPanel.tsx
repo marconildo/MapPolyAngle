@@ -40,6 +40,18 @@ import type {
 // @ts-ignore
 import * as turf from '@turf/turf';
 
+const MISSION_DEBUG_STORAGE_KEY = 'mapPolyMissionDebug';
+
+function missionProfileDebugLog(event: string, details?: Record<string, unknown>) {
+  if (!import.meta.env.DEV || typeof window === 'undefined') return;
+  try {
+    if (window.localStorage.getItem(MISSION_DEBUG_STORAGE_KEY) !== '1') return;
+  } catch {
+    return;
+  }
+  console.log(`[mission-debug] profile ${event}`, details ?? {});
+}
+
 type Props = {
   mapRef: React.RefObject<MapFlightDirectionAPI>;
   mapboxToken: string;
@@ -3208,11 +3220,21 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
   const missionProfileSnapshot = useMemo(() => {
     const api = mapRef.current;
     if (!api?.getMissionAreaOrder || !api.getFlightPaths3D || !api.getMissionConnectorTerrainTiles) {
+      missionProfileDebugLog('snapshot skipped: api unavailable', {
+        missionGeometryVersion,
+        hasApi: !!api,
+        hasGetMissionAreaOrder: !!api?.getMissionAreaOrder,
+        hasGetFlightPaths3D: !!api?.getFlightPaths3D,
+        hasGetMissionConnectorTerrainTiles: !!api?.getMissionConnectorTerrainTiles,
+      });
       return null;
     }
 
     const orderedPolygonIds = api.getMissionAreaOrder();
-    if (orderedPolygonIds.length === 0) return null;
+    if (orderedPolygonIds.length === 0) {
+      missionProfileDebugLog('snapshot skipped: empty mission order', { missionGeometryVersion });
+      return null;
+    }
 
     const missionGeometry = api.getMissionGeometry?.();
     const polygonFlightPaths3D = api.getFlightPaths3D();
@@ -3226,6 +3248,8 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
     );
 
     const segments: MissionProfileSegmentSnapshot[] = [];
+    const missingAreaPaths: string[] = [];
+    const missingConnectors: string[] = [];
 
     for (let index = 0; index < orderedPolygonIds.length; index += 1) {
       const polygonId = orderedPolygonIds[index]!;
@@ -3238,12 +3262,17 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
           segmentLabel: getPolygonDisplayName(polygonId),
           segmentKind: "area",
         });
+      } else {
+        missingAreaPaths.push(polygonId);
       }
 
       const nextPolygonId = orderedPolygonIds[index + 1];
       if (!nextPolygonId) continue;
       const connection = connectionsByPair.get(`${polygonId}->${nextPolygonId}`);
-      if (!connection || connection.path3D.length === 0) continue;
+      if (!connection || connection.path3D.length === 0) {
+        missingConnectors.push(`${polygonId}->${nextPolygonId}`);
+        continue;
+      }
       segments.push({
         key: connection.key,
         path3D: connection.path3D,
@@ -3253,7 +3282,30 @@ export function OverlapGSDPanel({ mapRef, mapboxToken, clearAllEpoch = 0, missio
       });
     }
 
-    if (segments.length === 0) return null;
+    missionProfileDebugLog('snapshot assembled', {
+      missionGeometryVersion,
+      orderedPolygonIds,
+      missionGeometryConnectionCount: missionGeometry?.connections.length ?? 0,
+      missionGeometryPairs: (missionGeometry?.connections ?? []).map((connection) => `${connection.fromPolygonId}->${connection.toPolygonId}`),
+      segmentCount: segments.length,
+      areaSegmentCount: segments.filter((segment) => segment.segmentKind === "area").length,
+      connectorSegmentCount: segments.filter((segment) => segment.segmentKind === "connector").length,
+      missingAreaPaths,
+      missingConnectors,
+      polygonPathIds: Array.from(polygonFlightPaths3D.keys()),
+      polygonTileIds: Array.from(polygonTiles.keys()),
+      connectorTileKeys: Array.from(connectorTerrainTiles.keys()),
+    });
+
+    if (segments.length === 0) {
+      missionProfileDebugLog('snapshot skipped: no profile segments', {
+        missionGeometryVersion,
+        orderedPolygonIds,
+        missingAreaPaths,
+        missingConnectors,
+      });
+      return null;
+    }
 
     const missionId = `${missionGeometryVersion}:${orderedPolygonIds.join("|")}`;
     return {
