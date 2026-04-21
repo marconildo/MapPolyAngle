@@ -227,11 +227,13 @@
         <div class="eyebrow">Engineering Blog</div>
         <h1>Optimizing Flight Area Traversal with Dynamic Programming</h1>
         <p class="deck">
-          This article explains the sequencing layer in the mission planner as it exists now: once a large mapping
-          site has been partitioned into survey areas and each area already has an optimized local bearing, the app
-          still has to decide the order in which those areas should be flown and whether each area should be reversed.
-          The same backend optimizer is used by the in-memory <strong>Optimize Transit</strong> workflow and by export.
-          It supports both area-only missions and imported Wingtra missions with valid takeoff and landing anchors.
+          This article explains the sequencing layer in the mission planner: once a large mapping site has already
+          been partitioned into smaller survey areas and each area already has an optimized local bearing, we still
+          need to decide the order in which those areas should be flown and whether each one should be reversed. This
+          blog focuses on that solution approach. If you want to jump ahead and try the workflow yourself, you can use
+          it in
+          <a href="https://map-poly-angle.vercel.app/" target="_blank" rel="noreferrer">Map Poly Angle</a>; the
+          sequencing optimization runs at export, or on clicking Optimise Transit in mission profile.
         </p>
       </header>
 
