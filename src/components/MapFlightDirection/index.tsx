@@ -71,6 +71,11 @@ import * as turf from '@turf/turf';
 import { shouldApplyAsyncPolygonUpdate, shouldRunAsyncGeneration } from '@/state/asyncUpdateGuard';
 import { shouldConsumeClearAllEpoch } from '@/state/clearAllState';
 import {
+  appendMissionAreaOrderIds,
+  removeMissionAreaOrderIds,
+  replaceMissionAreaOrderIds,
+} from '@/state/missionAreaOrder';
+import {
   applyPolygonSnapshotsToMetadata,
   clearPolygonOperationHistory,
   clearPolygonOperationRedo as clearPolygonOperationRedoState,
@@ -125,7 +130,18 @@ const EXACT_OPTIMIZE_ZOOM = 14;
 const EXACT_MIN_OVERLAP_FOR_GSD = 3;
 const EXACT_OPTIMIZE_TIME_WEIGHT = 0.1;
 const TERRAIN_SPLIT_DEBUG = true;
+const MISSION_DEBUG_STORAGE_KEY = 'mapPolyMissionDebug';
 const GEOMETRY_RING_EPSILON_DEG = 1e-7;
+
+function missionDebugLog(event: string, details?: Record<string, unknown>) {
+  if (!import.meta.env.DEV || typeof window === 'undefined') return;
+  try {
+    if (window.localStorage.getItem(MISSION_DEBUG_STORAGE_KEY) !== '1') return;
+  } catch {
+    return;
+  }
+  console.log(`[mission-debug] ${event}`, details ?? {});
+}
 
 function loadExactRegionModule(): Promise<ExactRegionModule> {
   if (!exactRegionModulePromise) {
@@ -358,42 +374,6 @@ function getDeckFlightLayerPolygonId(layerId: string): string {
   const prefix = DECK_FLIGHT_LAYER_ID_PREFIXES.find((candidate) => layerId.startsWith(candidate));
   if (!prefix || prefix === 'drone-mission-connectors') return '';
   return layerId.slice(prefix.length);
-}
-
-function appendMissionAreaOrderIds(order: string[], ids: string[]): string[] {
-  if (ids.length === 0) return order;
-  const seen = new Set(order);
-  const appended = ids.filter((id) => id && !seen.has(id));
-  return appended.length > 0 ? [...order, ...appended] : order;
-}
-
-function removeMissionAreaOrderIds(order: string[], ids: string[]): string[] {
-  if (ids.length === 0) return order;
-  const toRemove = new Set(ids);
-  const next = order.filter((id) => !toRemove.has(id));
-  return next.length === order.length ? order : next;
-}
-
-function replaceMissionAreaOrderIds(order: string[], affectedIds: string[], replacementIds: string[]): string[] {
-  if (affectedIds.length === 0) return appendMissionAreaOrderIds(order, replacementIds);
-  const affected = new Set(affectedIds);
-  const replacement = replacementIds.filter((id) => id && !affected.has(id));
-  const next: string[] = [];
-  let inserted = false;
-  for (const id of order) {
-    if (!affected.has(id)) {
-      next.push(id);
-      continue;
-    }
-    if (!inserted) {
-      next.push(...replacement);
-      inserted = true;
-    }
-  }
-  if (!inserted) {
-    next.push(...replacement);
-  }
-  return appendMissionAreaOrderIds([], next);
 }
 
 function mergeTerrainTilesUnique(tiles: TerrainTile[]): TerrainTile[] {
@@ -837,6 +817,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
     const suppressHistoryInvalidationRef = React.useRef(false);
     const isApplyingPolygonOperationRef = React.useRef(false);
     const polygonOperationAffectedIdsRef = React.useRef<Set<string>>(new Set());
+    const polygonOperationQueueRef = React.useRef<Promise<void>>(Promise.resolve());
     const suppressSelectionDialogUntilRef = React.useRef(0);
     const suppressNextEmptySelectionRef = React.useRef(0);
     const polygonFeatureIdSeqRef = React.useRef(0);
@@ -885,6 +866,25 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       publishHistoryState();
     }, [publishHistoryState]);
 
+    const queuePolygonOperation = useCallback(async <T,>(operation: () => Promise<T>): Promise<T> => {
+      const previousOperation = polygonOperationQueueRef.current.catch(() => {});
+      let releaseOperation!: () => void;
+      const queuedOperation = new Promise<void>((resolve) => {
+        releaseOperation = resolve;
+      });
+      polygonOperationQueueRef.current = previousOperation.then(() => queuedOperation);
+      missionDebugLog('polygon-operation queued');
+
+      await previousOperation;
+      missionDebugLog('polygon-operation dequeued');
+      try {
+        return await operation();
+      } finally {
+        missionDebugLog('polygon-operation released');
+        releaseOperation();
+      }
+    }, []);
+
     const replacePolygonOperationHistory = useCallback((nextHistory: ReturnType<typeof createEmptyPolygonOperationHistory>) => {
       polygonOperationHistoryRef.current = nextHistory;
       publishHistoryState();
@@ -899,6 +899,14 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
     const updateMissionAreaOrder = useCallback((updater: (current: string[]) => string[]) => {
       setMissionAreaOrder((current) => {
         const next = updater(current);
+        if (next !== current) {
+          missionDebugLog('mission-order update', {
+            previous: current,
+            next,
+            added: next.filter((id) => !current.includes(id)),
+            removed: current.filter((id) => !next.includes(id)),
+          });
+        }
         missionAreaOrderRef.current = next;
         return next;
       });
@@ -1873,7 +1881,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           }
         }
 
-        if (deckOverlayRef.current && lines.flightLines.length > 0) {
+        if (lines.flightLines.length > 0) {
           const path3d = build3DFlightPath(
             lines,
             tiles,
@@ -1881,21 +1889,23 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             { altitudeAGL: safeParams.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
           );
           setPolygonFlightPath3DEntry(result.polygonId, path3d);
-          update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
-          const spacingForward = getForwardSpacingForParams(safeParams);
-          if (spacingForward && spacingForward > 0) {
-            // 3D trigger points sampled along the 3D path
-            const samples = sampleCameraPositionsOnPlannedFlightGeometry(lines, path3d, spacingForward);
-            const zOffset = 1; // lift triggers slightly above the path for visibility
-            const ring = result.polygon.coordinates as [number, number][];
-            const positions: [number, number, number][] = samples
-              .filter(([lng, lat]) => isPointInRing(lng, lat, ring))
-              .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
-            update3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, positions, setDeckLayers);
-          } else {
-            remove3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, setDeckLayers);
+          if (deckOverlayRef.current) {
+            update3DPathLayer(deckOverlayRef.current, result.polygonId, path3d, setDeckLayers);
+            const spacingForward = getForwardSpacingForParams(safeParams);
+            if (spacingForward && spacingForward > 0) {
+              // 3D trigger points sampled along the 3D path
+              const samples = sampleCameraPositionsOnPlannedFlightGeometry(lines, path3d, spacingForward);
+              const zOffset = 1; // lift triggers slightly above the path for visibility
+              const ring = result.polygon.coordinates as [number, number][];
+              const positions: [number, number, number][] = samples
+                .filter(([lng, lat]) => isPointInRing(lng, lat, ring))
+                .map(([lng,lat,alt]) => [lng,lat,alt + zOffset]);
+              update3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, positions, setDeckLayers);
+            } else {
+              remove3DTriggerPointsLayer(deckOverlayRef.current, result.polygonId, setDeckLayers);
+            }
+            syncFlightLinesVisibility(flightLinesVisibleRef.current);
           }
-          syncFlightLinesVisibility(flightLinesVisibleRef.current);
         }
 
         if (pendingOptimizeRef.current.has(result.polygonId)) {
@@ -1971,7 +1981,18 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           missionConnectorTerrainCacheRef.current.delete(key);
         }
       });
-      updateMissionAreaOrder((current) => removeMissionAreaOrderIds(current, [polygonId]));
+      const isTransactionCleanup =
+        isApplyingPolygonOperationRef.current &&
+        polygonOperationAffectedIdsRef.current.has(polygonId);
+      if (!isTransactionCleanup) {
+        updateMissionAreaOrder((current) => removeMissionAreaOrderIds(current, [polygonId]));
+      } else {
+        missionDebugLog('cleanup preserved mission-order id during polygon operation', {
+          polygonId,
+          currentOrder: missionAreaOrderRef.current,
+          affectedIds: Array.from(polygonOperationAffectedIdsRef.current),
+        });
+      }
       setPolygonTiles((prev) => {
         if (!prev.has(polygonId)) return prev;
         const next = new Map(prev);
@@ -2009,9 +2030,6 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       }
 
       scheduleGuardedTimeout(() => {
-        const isTransactionCleanup =
-          isApplyingPolygonOperationRef.current &&
-          polygonOperationAffectedIdsRef.current.has(polygonId);
         const draw = drawRef.current as any;
         const remainingPolygonIds = Array.isArray(draw?.getAll?.()?.features)
           ? draw.getAll().features
@@ -2126,6 +2144,17 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       }
 
       const affectedIds = Array.from(new Set(affectedPolygonIds));
+      missionDebugLog('restore polygon operation start', {
+        affectedIds,
+        snapshotIds: snapshots.map((snapshot) => snapshot.feature.id),
+        selectionAfter,
+        orderBefore: missionAreaOrderRef.current,
+        drawIdsBefore: Array.isArray(draw?.getAll?.()?.features)
+          ? draw.getAll().features
+              .filter((feature: any) => feature?.geometry?.type === 'Polygon')
+              .map((feature: any) => String(feature.id))
+          : [],
+      });
       const nextMetadata = applyPolygonSnapshotsToMetadata({
         params: polygonParamsRef.current,
         overrides: bearingOverridesRef.current,
@@ -2277,6 +2306,17 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
         if (!prevSuppressEvents) {
           onFlightLinesUpdated?.('__all__');
         }
+        missionDebugLog('restore polygon operation end', {
+          affectedIds,
+          snapshotIds: snapshots.map((snapshot) => snapshot.feature.id),
+          orderAfter: missionAreaOrderRef.current,
+          drawIdsAfter: Array.isArray(draw?.getAll?.()?.features)
+            ? draw.getAll().features
+                .filter((feature: any) => feature?.geometry?.type === 'Polygon')
+                .map((feature: any) => String(feature.id))
+            : [],
+          missionGeometryConnections: missionGeometryRef.current?.connections.length ?? 0,
+        });
       }
     }, [
       addPolygonSnapshotToDraw,
@@ -2298,16 +2338,45 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       transaction: PolygonOperationTransaction,
       direction: 'forward' | 'backward',
     ) => {
-      const snapshots = direction === 'forward'
-        ? transaction.after.map((snapshot) => clonePolygonSnapshot(snapshot))
-        : transaction.before.map((snapshot) => clonePolygonSnapshot(snapshot));
-      const selectionAfter = direction === 'forward' ? transaction.selectionAfter : transaction.selectionBefore;
-      return restorePolygonOperationSnapshots(
-        snapshots,
-        collectAffectedPolygonIds(transaction),
-        selectionAfter,
-      );
-    }, [restorePolygonOperationSnapshots]);
+      return queuePolygonOperation(async () => {
+        missionDebugLog('polygon-operation apply requested', {
+          kind: transaction.kind,
+          direction,
+          beforeIds: transaction.before.map((snapshot) => snapshot.feature.id),
+          afterIds: transaction.after.map((snapshot) => snapshot.feature.id),
+          orderBefore: missionAreaOrderRef.current,
+        });
+        const draw = drawRef.current as any;
+        const expectedCurrentSnapshots = direction === 'forward' ? transaction.before : transaction.after;
+        const missingCurrentIds = expectedCurrentSnapshots
+          .map((snapshot) => snapshot.feature.id)
+          .filter((polygonId) => !draw?.get?.(polygonId));
+        if (missingCurrentIds.length > 0) {
+          console.warn('[polygon-operation] skipped stale operation; expected polygons are no longer present', {
+            kind: transaction.kind,
+            direction,
+            missingCurrentIds,
+          });
+          return false;
+        }
+        const snapshots = direction === 'forward'
+          ? transaction.after.map((snapshot) => clonePolygonSnapshot(snapshot))
+          : transaction.before.map((snapshot) => clonePolygonSnapshot(snapshot));
+        const selectionAfter = direction === 'forward' ? transaction.selectionAfter : transaction.selectionBefore;
+        const applied = await restorePolygonOperationSnapshots(
+          snapshots,
+          collectAffectedPolygonIds(transaction),
+          selectionAfter,
+        );
+        missionDebugLog('polygon-operation apply finished', {
+          kind: transaction.kind,
+          direction,
+          applied,
+          orderAfter: missionAreaOrderRef.current,
+        });
+        return applied;
+      });
+    }, [queuePolygonOperation, restorePolygonOperationSnapshots]);
 
     const storePolygonOperationTransaction = useCallback((transaction: PolygonOperationTransaction) => {
       replacePolygonOperationHistory(
@@ -3170,7 +3239,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           const flEntry = flightLinesToUpdate.get(polygonId);
           const lineSpacing = flEntry?.lineSpacing ?? imported.items[idx]?.lineSpacingM ?? 25;
           const altitudeAGL = polygonsToUpdate.get(polygonId)?.params.altitudeAGL ?? imported.items[idx]?.altitudeAGL ?? 100;
-          if (deckOverlayRef.current && flEntry?.flightLines?.length) {
+          if (flEntry?.flightLines?.length) {
             const path3d = build3DFlightPath(
               flEntry,
               tiles,
@@ -3178,7 +3247,9 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
               { altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
             );
             setPolygonFlightPath3DEntry(polygonId, path3d);
-            update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+            if (deckOverlayRef.current) {
+              update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+            }
           }
         }
 
@@ -3253,7 +3324,13 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       let cancelled = false;
       const abortController = new AbortController();
 
-      const clearMissionGeometryState = () => {
+      const clearMissionGeometryState = (reason: string, details?: Record<string, unknown>) => {
+        missionDebugLog('mission-geometry clear', {
+          reason,
+          ...details,
+          order: missionAreaOrderRef.current,
+          existingConnections: missionGeometryRef.current?.connections.length ?? 0,
+        });
         clearRenderedMissionConnections();
         setMissionGeometry(null);
         missionGeometryRef.current = null;
@@ -3263,16 +3340,43 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       const rebuildMissionGeometry = async () => {
         const orderedPolygonIds = missionAreaOrder.filter((polygonId) => polygonId.length > 0);
         if (orderedPolygonIds.length === 0) {
-          clearMissionGeometryState();
+          clearMissionGeometryState('empty mission order');
           return;
         }
+        missionDebugLog('mission-geometry rebuild start', {
+          orderedPolygonIds,
+          polygonParamIds: Array.from(polygonParams.keys()),
+          flightLineIds: Array.from(polygonFlightLines.keys()),
+          path3DIds: Array.from(polygonFlightPaths3D.keys()),
+          resultIds: Array.from(polygonResults.keys()),
+          tileIds: Array.from(polygonTiles.keys()),
+        });
 
+        const recoveredPathUpdates: Array<{ polygonId: string; path3d: [number, number, number][][] }> = [];
         const areaInputs = orderedPolygonIds.map((polygonId) => {
           const params = polygonParams.get(polygonId);
           const geometry = polygonFlightLines.get(polygonId);
-          const path3d = polygonFlightPaths3D.get(polygonId);
-          const result = polygonResults.get(polygonId);
           const tiles = polygonTiles.get(polygonId) as TerrainTile[] | undefined;
+          let path3d = polygonFlightPaths3D.get(polygonId);
+          if ((!path3d || path3d.length === 0) && params && geometry && tiles && tiles.length > 0) {
+            try {
+              path3d = build3DFlightPath(
+                geometry,
+                tiles,
+                geometry.lineSpacing,
+                { altitudeAGL: params.altitudeAGL, mode: altitudeMode, minClearance: minClearanceM, preconnected: true },
+              );
+              if (path3d.length > 0) {
+                recoveredPathUpdates.push({ polygonId, path3d });
+              }
+            } catch (error) {
+              console.warn('[mission-geometry] failed to recover missing 3D path for area', {
+                polygonId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          const result = polygonResults.get(polygonId);
           const firstPathPoint = path3d?.[0]?.[0];
           const lastSegment = path3d?.at(-1);
           const lastPathPoint = lastSegment?.[lastSegment.length - 1];
@@ -3287,8 +3391,36 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             lastPathPoint,
           };
         });
+        if (recoveredPathUpdates.length > 0) {
+          missionDebugLog('mission-geometry recovered missing 3D paths', {
+            recoveredIds: recoveredPathUpdates.map((entry) => entry.polygonId),
+          });
+          setPolygonFlightPaths3D((current) => {
+            const next = new Map(current);
+            for (const { polygonId, path3d } of recoveredPathUpdates) {
+              if (!next.has(polygonId) || next.get(polygonId)?.length === 0) {
+                next.set(polygonId, path3d);
+                if (deckOverlayRef.current) {
+                  update3DPathLayer(deckOverlayRef.current, polygonId, path3d, setDeckLayers);
+                }
+              }
+            }
+            polygonFlightPaths3DRef.current = next;
+            return next;
+          });
+        }
 
-        const allReady = areaInputs.every((area) =>
+        type MissionAreaInput = typeof areaInputs[number];
+        type ReadyMissionAreaInput = MissionAreaInput & {
+          params: PolygonParams;
+          geometry: PlannedFlightGeometry;
+          path3d: [number, number, number][][];
+          result: PolygonAnalysisResult;
+          tiles: TerrainTile[];
+          firstPathPoint: [number, number, number];
+          lastPathPoint: [number, number, number];
+        };
+        const isReadyMissionAreaInput = (area: MissionAreaInput): area is ReadyMissionAreaInput =>
           !!area.params
           && !!area.geometry
           && !!area.result
@@ -3299,35 +3431,87 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           && !!area.tiles
           && area.tiles.length > 0
           && !!area.geometry.leadIn
-          && !!area.geometry.leadOut,
-        );
-        if (!allReady) {
-          clearMissionGeometryState();
+          && !!area.geometry.leadOut;
+        const readyAreaInputs = areaInputs.filter(isReadyMissionAreaInput);
+        const readiness = areaInputs.map((area) => ({
+          polygonId: area.polygonId,
+          hasParams: !!area.params,
+          hasGeometry: !!area.geometry,
+          hasResult: !!area.result,
+          hasPath3D: !!area.path3d && area.path3d.length > 0,
+          path3DSegmentCount: area.path3d?.length ?? 0,
+          hasFirstPathPoint: !!area.firstPathPoint,
+          hasLastPathPoint: !!area.lastPathPoint,
+          tileCount: area.tiles?.length ?? 0,
+          hasLeadIn: !!area.geometry?.leadIn,
+          hasLeadOut: !!area.geometry?.leadOut,
+          ready: isReadyMissionAreaInput(area),
+        }));
+        missionDebugLog('mission-geometry readiness', {
+          readyCount: readyAreaInputs.length,
+          orderedCount: orderedPolygonIds.length,
+          missing: readiness.filter((entry) => !entry.ready),
+          readyIds: readiness.filter((entry) => entry.ready).map((entry) => entry.polygonId),
+        });
+        if (readyAreaInputs.length === 0) {
+          clearMissionGeometryState('no ready areas', { readiness });
           return;
         }
 
-        const missionAreas = areaInputs.map((area) => ({
+        const missionAreas = readyAreaInputs.map((area) => ({
           polygonId: area.polygonId,
-          params: area.params!,
-          geometry: area.geometry!,
+          params: area.params,
+          geometry: area.geometry,
         }));
 
-        if (orderedPolygonIds.length < 2) {
-          clearRenderedMissionConnections();
-          const nextMissionGeometry = buildMissionFlightGeometry(orderedPolygonIds, [], missionAreas);
+        const publishMissionGeometry = (connections: MissionFlightGeometry['connections']) => {
+          const missionWithConnections = buildMissionFlightGeometry(orderedPolygonIds, connections, missionAreas);
+          missionDebugLog('mission-geometry publish', {
+            orderedPolygonIds,
+            readyAreaIds: readyAreaInputs.map((area) => area.polygonId),
+            connectionCount: connections.length,
+            connectionPairs: connections.map((connection) => `${connection.fromPolygonId}->${connection.toPolygonId}`),
+            areaDistanceM: Math.round(missionWithConnections.summary.areaDistanceM),
+            connectorDistanceM: Math.round(missionWithConnections.summary.connectorDistanceM),
+          });
+          missionGeometryRef.current = missionWithConnections;
+          setMissionGeometry(missionWithConnections);
+          onMissionGeometryUpdated?.();
+
+          if (mapRef.current) {
+            setInterAreaConnections(mapRef.current, connections);
+          }
+          if (deckOverlayRef.current) {
+            update3DMissionConnectorLayer(
+              deckOverlayRef.current,
+              connections.flatMap((connection) => connection.path3D),
+              setDeckLayers,
+            );
+          }
+          syncFlightLinesVisibility(flightLinesVisibleRef.current);
+        };
+
+        if (orderedPolygonIds.length < 2 || readyAreaInputs.length < 2) {
           if (!cancelled) {
-            missionGeometryRef.current = nextMissionGeometry;
-            setMissionGeometry(nextMissionGeometry);
-            onMissionGeometryUpdated?.();
+            publishMissionGeometry([]);
           }
           return;
         }
 
         const connectionDescriptors = areaInputs.slice(0, -1).map((source, index) => {
           const target = areaInputs[index + 1]!;
+          if (!isReadyMissionAreaInput(source) || !isReadyMissionAreaInput(target)) {
+            missionDebugLog('mission-geometry skip connector pair not ready', {
+              fromPolygonId: source.polygonId,
+              toPolygonId: target.polygonId,
+              sourceReady: isReadyMissionAreaInput(source),
+              targetReady: isReadyMissionAreaInput(target),
+            });
+            return null;
+          }
           const connectionZoom = Math.max(source.result!.terrainZoom, target.result!.terrainZoom);
-          const sourceEndpoint = source.lastPathPoint!;
-          const targetEndpoint = target.firstPathPoint!;
+          const sourceEndpoint = source.lastPathPoint;
+          const targetEndpoint = target.firstPathPoint;
           const connectionKeyBase = [
             source.polygonId,
             target.polygonId,
@@ -3337,7 +3521,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             targetEndpoint[0].toFixed(6),
             targetEndpoint[1].toFixed(6),
           ].join('|');
-          const cruiseSpeedMps = Math.min(getCruiseSpeedMps(source.params!), getCruiseSpeedMps(target.params!));
+          const cruiseSpeedMps = Math.min(getCruiseSpeedMps(source.params), getCruiseSpeedMps(target.params));
           const baseConnectionTiles = mergeTerrainTilesUnique([
             ...(missionConnectorTerrainCacheRef.current.get(connectionKeyBase) ?? []),
             ...(source.tiles?.filter((tile) => tile.z === connectionZoom) ?? []),
@@ -3347,8 +3531,8 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             key: connectionKeyBase,
             fromPolygonId: source.polygonId,
             toPolygonId: target.polygonId,
-            sourceManeuver: source.geometry!.leadOut!,
-            targetManeuver: target.geometry!.leadIn!,
+            sourceManeuver: source.geometry.leadOut!,
+            targetManeuver: target.geometry.leadIn!,
             sourceAnchorAltitudeM: sourceEndpoint[2],
             targetAnchorAltitudeM: targetEndpoint[2],
             cruiseSpeedMps,
@@ -3372,26 +3556,7 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             baseConnectionTiles,
             provisionalConnection,
           };
-        });
-
-        const publishMissionGeometry = (connections: MissionFlightGeometry['connections']) => {
-          const nextMissionGeometry = buildMissionFlightGeometry(orderedPolygonIds, connections, missionAreas);
-          missionGeometryRef.current = nextMissionGeometry;
-          setMissionGeometry(nextMissionGeometry);
-          onMissionGeometryUpdated?.();
-
-          if (mapRef.current) {
-            setInterAreaConnections(mapRef.current, connections);
-          }
-          if (deckOverlayRef.current) {
-            update3DMissionConnectorLayer(
-              deckOverlayRef.current,
-              connections.flatMap((connection) => connection.path3D),
-              setDeckLayers,
-            );
-          }
-          syncFlightLinesVisibility(flightLinesVisibleRef.current);
-        };
+        }).filter((descriptor): descriptor is NonNullable<typeof descriptor> => descriptor !== null);
 
         publishMissionGeometry(connectionDescriptors.map((descriptor) => descriptor.provisionalConnection));
 
@@ -3402,6 +3567,13 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
             const requiredTileKeys = new Set(getTileCoverageKeysForPolygon(corridorPolygon, descriptor.connectionZoom));
             const availableKeys = new Set(descriptor.baseConnectionTiles.map((tile) => terrainTileKey(tile)));
             const missingKeys = Array.from(requiredTileKeys).filter((key) => !availableKeys.has(key));
+            missionDebugLog('mission-geometry connector terrain coverage', {
+              pair: `${descriptor.source.polygonId}->${descriptor.target.polygonId}`,
+              requiredTileCount: requiredTileKeys.size,
+              availableTileCount: availableKeys.size,
+              missingTileCount: missingKeys.length,
+              connectionZoom: descriptor.connectionZoom,
+            });
             if (missingKeys.length === 0) return null;
             return (async () => {
               const fetchedTiles = await fetchTilesForPolygon(
@@ -3419,11 +3591,17 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
           .filter((job): job is Promise<{ key: string; tiles: TerrainTile[] }> => job !== null);
 
         if (fetchJobs.length === 0) {
+          missionDebugLog('mission-geometry no connector terrain fetches needed', {
+            connectionCount: connectionDescriptors.length,
+          });
           return;
         }
 
         const fetchedConnectorTileSets = await Promise.all(fetchJobs);
         if (cancelled) return;
+        missionDebugLog('mission-geometry connector terrain fetches completed', {
+          fetched: fetchedConnectorTileSets.map(({ key, tiles }) => ({ key, tileCount: tiles.length })),
+        });
 
         for (const { key, tiles } of fetchedConnectorTileSets) {
           const mergedTiles = mergeTerrainTilesUnique([
@@ -3955,6 +4133,12 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       splitPerfLog(polygonId, 'prepared child polygon snapshots', {
         createdIds,
       });
+      missionDebugLog('autosplit prepared transaction', {
+        parentId: polygonId,
+        createdIds,
+        orderBeforeApply: missionAreaOrderRef.current,
+        regionCount: normalizedPartitionRegions.length,
+      });
 
       if (createdIds.length <= 1) {
         onError?.('Auto-split did not produce enough valid child polygons.', polygonId);
@@ -3986,6 +4170,11 @@ const MapFlightDirectionComponent = React.forwardRef<MapFlightDirectionAPI, Prop
       splitPerfLog(polygonId, 'applyTerrainPartitionRings completed', {
         totalMs: Math.round(splitPerfNow() - startedAt),
         createdIds,
+      });
+      missionDebugLog('autosplit applied transaction', {
+        parentId: polygonId,
+        createdIds,
+        orderAfterApply: missionAreaOrderRef.current,
       });
       return { createdIds, replaced: true };
     }, [applyPolygonOperationTransaction, createPolygonFeatureId, isAsyncGenerationStillValid, onError, snapshotPolygonFeature, storePolygonOperationTransaction]);
