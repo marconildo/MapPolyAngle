@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="620" viewBox="0 0 1160 620">
+  <defs>
+    <marker id="arrow-greedy" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L0,8 L8,4 z" fill="#c96a18"/>
+    </marker>
+    <marker id="arrow-exact" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L0,8 L8,4 z" fill="#156b64"/>
+    </marker>
+  </defs>
+  <rect width="1160" height="620" fill="#ffffff"/>
+  <text x="40" y="54" font-family="Iowan Old Style, Palatino Linotype, serif" font-size="34" font-weight="700" fill="#1a1c1f">Current greedy fallback vs exact DP</text>
+  <text x="40" y="86" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="17" fill="#5f666d">Synthetic 9-area edge-cost stress test, seed 110. Same order/flip state space; exact DP avoids a local minimum.</text>
+  <rect x="40" y="112" width="520" height="360" rx="18" fill="#f8fafc" stroke="#ddd8cf"/>
+  <text x="64" y="150" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="22" font-weight="700" fill="#1a1c1f">Current greedy fallback</text>
+  <text x="64" y="178" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="15" fill="#5f666d">transfer cost 3324.1</text>
+  <line x1="275.0" y1="462.6" x2="264.5" y2="401.4" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="264.5" y1="401.4" x2="193.7" y2="354.7" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="193.7" y1="354.7" x2="300.5" y2="359.1" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="300.5" y1="359.1" x2="269.2" y2="371.1" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="269.2" y1="371.1" x2="175.6" y2="310.6" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="175.6" y1="310.6" x2="93.9" y2="164.5" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="93.9" y1="164.5" x2="66.1" y2="139.5" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="66.1" y1="139.5" x2="200.5" y2="236.5" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="200.5" y1="236.5" x2="250.6" y2="238.1" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="250.6" y1="238.1" x2="256.4" y2="245.5" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="256.4" y1="245.5" x2="351.4" y2="275.4" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="351.4" y1="275.4" x2="430.0" y2="294.5" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="430.0" y1="294.5" x2="406.1" y2="332.8" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="406.1" y1="332.8" x2="353.7" y2="341.3" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="353.7" y1="341.3" x2="397.2" y2="392.1" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="397.2" y1="392.1" x2="392.7" y2="392.7" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <line x1="392.7" y1="392.7" x2="426.9" y2="414.2" stroke="#c96a18" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-greedy)"/>
+  <rect x="600" y="112" width="520" height="360" rx="18" fill="#f8fafc" stroke="#ddd8cf"/>
+  <text x="624" y="150" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="22" font-weight="700" fill="#1a1c1f">Exact dynamic program</text>
+  <text x="624" y="178" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="15" fill="#5f666d">transfer cost 2374.3</text>
+  <line x1="626.1" y1="139.5" x2="653.9" y2="164.5" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="653.9" y1="164.5" x2="760.5" y2="236.5" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="760.5" y1="236.5" x2="810.6" y2="238.1" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="810.6" y1="238.1" x2="816.4" y2="245.5" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="816.4" y1="245.5" x2="911.4" y2="275.4" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="911.4" y1="275.4" x2="990.0" y2="294.5" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="990.0" y1="294.5" x2="966.1" y2="332.8" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="966.1" y1="332.8" x2="986.9" y2="414.2" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="986.9" y1="414.2" x2="952.7" y2="392.7" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="952.7" y1="392.7" x2="957.2" y2="392.1" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="957.2" y1="392.1" x2="913.7" y2="341.3" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="913.7" y1="341.3" x2="860.5" y2="359.1" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="860.5" y1="359.1" x2="753.7" y2="354.7" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="753.7" y1="354.7" x2="735.6" y2="310.6" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="735.6" y1="310.6" x2="829.2" y2="371.1" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="829.2" y1="371.1" x2="824.5" y2="401.4" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <line x1="824.5" y1="401.4" x2="835.0" y2="462.6" stroke="#156b64" stroke-width="3.2" stroke-opacity="0.72" marker-end="url(#arrow-exact)"/>
+  <g fill="white" stroke="#1f5bd6" stroke-width="2">
+    <circle cx="418.1" cy="313.7" r="12"/><circle cx="375.5" cy="366.7" r="12"/><circle cx="247.1" cy="356.9" r="12"/>
+    <circle cx="269.8" cy="432.0" r="12"/><circle cx="222.4" cy="340.9" r="12"/><circle cx="80.0" cy="152.0" r="12"/>
+    <circle cx="409.8" cy="403.5" r="12"/><circle cx="303.9" cy="260.5" r="12"/><circle cx="225.6" cy="237.3" r="12"/>
+    <circle cx="978.1" cy="313.7" r="12"/><circle cx="935.5" cy="366.7" r="12"/><circle cx="807.1" cy="356.9" r="12"/>
+    <circle cx="829.8" cy="432.0" r="12"/><circle cx="782.4" cy="340.9" r="12"/><circle cx="640.0" cy="152.0" r="12"/>
+    <circle cx="969.8" cy="403.5" r="12"/><circle cx="863.9" cy="260.5" r="12"/><circle cx="785.6" cy="237.3" r="12"/>
+  </g>
+  <g font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="11" font-weight="700" fill="#1a1c1f" text-anchor="middle">
+    <text x="418.1" y="317.7">A1</text><text x="375.5" y="370.7">A2</text><text x="247.1" y="360.9">A3</text>
+    <text x="269.8" y="436.0">A4</text><text x="222.4" y="344.9">A5</text><text x="80.0" y="156.0">A6</text>
+    <text x="409.8" y="407.5">A7</text><text x="303.9" y="264.5">A8</text><text x="225.6" y="241.3">A9</text>
+    <text x="978.1" y="317.7">A1</text><text x="935.5" y="370.7">A2</text><text x="807.1" y="360.9">A3</text>
+    <text x="829.8" y="436.0">A4</text><text x="782.4" y="344.9">A5</text><text x="640.0" y="156.0">A6</text>
+    <text x="969.8" y="407.5">A7</text><text x="863.9" y="264.5">A8</text><text x="785.6" y="241.3">A9</text>
+  </g>
+  <circle cx="275.0" cy="462.6" r="7" fill="#15803d" stroke="white" stroke-width="2"/>
+  <circle cx="426.9" cy="414.2" r="7" fill="#a33a32" stroke="white" stroke-width="2"/>
+  <circle cx="626.1" cy="139.5" r="7" fill="#15803d" stroke="white" stroke-width="2"/>
+  <circle cx="835.0" cy="462.6" r="7" fill="#a33a32" stroke="white" stroke-width="2"/>
+  <rect x="40" y="504" width="1080" height="78" rx="14" fill="#fcfbf8" stroke="#ddd8cf"/>
+  <text x="64" y="535" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="15" fill="#5f666d">Greedy sequence</text>
+  <text x="190" y="535" font-family="IBM Plex Mono, Menlo, monospace" font-size="13" fill="#1a1c1f">A4F -&gt; A3 -&gt; A5F -&gt; A6F -&gt; A9F -&gt; A8F -&gt; A1 -&gt; A2F -&gt; A7F</text>
+  <text x="64" y="563" font-family="Avenir Next, Helvetica Neue, sans-serif" font-size="15" fill="#5f666d">Exact sequence</text>
+  <text x="190" y="563" font-family="IBM Plex Mono, Menlo, monospace" font-size="13" fill="#1a1c1f">A6 -&gt; A9F -&gt; A8F -&gt; A1 -&gt; A7 -&gt; A2 -&gt; A3F -&gt; A5 -&gt; A4</text>
+</svg>

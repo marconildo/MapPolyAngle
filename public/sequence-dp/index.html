@@ -227,13 +227,11 @@
         <div class="eyebrow">Engineering Blog</div>
         <h1>Optimizing Flight Area Traversal with Dynamic Programming</h1>
         <p class="deck">
-          This article explains the sequencing layer in the mission planner: once a large mapping site has already
-          been partitioned into smaller survey areas and each area already has an optimized local bearing, we still
-          need to decide the order in which those areas should be flown and whether each one should be reversed. This
-          blog focuses on that solution approach. If you want to jump ahead and try the workflow yourself, you can use
-          it in
-          <a href="https://map-poly-angle.vercel.app/" target="_blank" rel="noreferrer">Map Poly Angle</a>; the
-          sequencing optimization runs at export.
+          This article explains the sequencing layer in the mission planner as it exists now: once a large mapping
+          site has been partitioned into survey areas and each area already has an optimized local bearing, the app
+          still has to decide the order in which those areas should be flown and whether each area should be reversed.
+          The same backend optimizer is used by the in-memory <strong>Optimize Transit</strong> workflow and by export.
+          It supports both area-only missions and imported Wingtra missions with valid takeoff and landing anchors.
         </p>
       </header>
 
@@ -366,16 +364,18 @@
           </figure>
         </div>
         <p>
-          That leaves a different optimization problem. The earlier algorithms try to make the mapping itself better:
-          more consistent GSD, more suitable local bearings, and more manageable survey blocks. The sequencing layer
-          then tries to make the resulting mission cheaper to fly by reducing long transfers, avoidable climbs, and
-          bad area-to-area ordering.
+          That leaves a different optimization problem. The earlier algorithms make the mapping itself better: more
+          consistent GSD, more suitable local bearings, and more manageable survey blocks. The sequencing layer then
+          makes the resulting mission cheaper to fly by reducing long transfers, avoidable climbs, and bad
+          area-to-area ordering.
         </p>
         <p>
-          In other words, the sequencing layer receives a compressed version of the mission rather than the full
-          geometric planning problem. Each area has already been reduced to a small set of traversal modes, so the
-          remaining optimization can focus on one question: given <em>N</em> fixed survey areas, each with two
-          traversal modes, what ordering and per-area mode choice minimizes the total inter-area connector cost?
+          In other words, the sequencing layer receives a compressed mission rather than the full geometric planning
+          problem. Each area has already been reduced to two traversal modes: fly the fixed area path forward, or fly
+          that same path flipped. The optimizer then chooses a global order and a flip state for every area. If the
+          imported flightplan has valid takeoff and landing items, those endpoints are included as optional depot
+          constraints on the first and last legs. If it does not, the same solver naturally falls back to a free-start,
+          free-end area sequence.
         </p>
         <ol class="pipeline-list">
           <li>Start from a large region that needs to be mapped accurately.</li>
@@ -422,15 +422,17 @@
         <p class="section-kicker">3. Why DP is relevant here</p>
         <h2>This sequencing problem has exactly the structure DP likes</h2>
         <p>
-          The global problem is TSP-like, but not identical to the textbook tour formulation. We are solving for an
-          <strong>open path</strong>, not a cycle: the mission may start at any area and end at any area, with no
-          return-to-start constraint. That matters because the optimizer scores only the transfer legs between survey
-          areas after local bearing optimization has already finished.
+          The global problem is TSP-like, but not identical to the textbook tour formulation. We are solving for a
+          Hamiltonian path through the survey areas, not for a closed area-to-area cycle. In the simplest area-only
+          case that path is free to start and end at any area. In an imported Wingtra mission, valid takeoff and landing
+          endpoints become optional depot constraints: a takeoff endpoint constrains the first leg, a landing endpoint
+          constrains the last leg, and either one can be present without the other.
         </p>
         <p>
-          For <strong>11 areas</strong>, a brute-force solver would examine every permutation of areas
-          and every independent flip assignment. That is <strong>81,749,606,400</strong> mission variants.
-          Each area contributes one position in the permutation and one binary flip choice.
+          For <strong>11 areas</strong>, a brute-force solver would examine every permutation of areas and every
+          independent flip assignment. That is <strong>81,749,606,400</strong> mission variants before considering
+          any depot anchor. The anchors change the score of each candidate path, but they do not change the fundamental
+          combinatorics: each area still contributes one position in the permutation and one binary flip choice.
         </p>
         <div class="callout">
           <div class="section-kicker">Brute-force search space</div>
@@ -440,7 +442,8 @@
           <li>The order history matters only through the set of areas already visited.</li>
           <li>The continuation cost depends on the area we are currently ending on.</li>
           <li>The continuation cost also depends on whether that terminal area was flown forward or flipped.</li>
-          <li>It does not depend on the exact route prefix beyond those facts.</li>
+          <li>Optional takeoff and landing endpoints affect only the base and final edge costs.</li>
+          <li>The continuation does not depend on the exact route prefix beyond those facts.</li>
         </ul>
       </section>
 
@@ -460,8 +463,8 @@
           </div>
           <div class="formula-box">
             <div class="section-kicker">Base case</div>
-            <div class="equation"><span style="font-style:italic">DP</span>[{i}, i, f] = 0</div>
-            <p>In this formulation, we optimize only inter-area transfer legs and allow the mission to start at any area, so the single-area base cost is zero.</p>
+            <div class="equation"><span style="font-style:italic">DP</span>[{i}, i, f] = B(i,f)</div>
+            <p><em>B(i,f)</em> is the optional takeoff-to-area cost. For area-only missions it is zero, so free-start sequencing is just a special case.</p>
           </div>
           <div class="formula-box">
             <div class="section-kicker">Transition</div>
@@ -470,9 +473,10 @@
           </div>
         </div>
         <p>
-          If launch or depot positioning needs to be modeled, that cost would enter through the base case or an
-          additional endpoint term. In implementation terms this is a Held-Karp-style bitmask DP for a Hamiltonian
-          path, with one extra binary dimension per area to represent the flip choice.
+          After all areas have been visited, the solver adds an optional final edge from the last area mode to the
+          landing endpoint. With no landing endpoint, that final term is zero. In implementation terms this is still a
+          Held-Karp-style bitmask DP for a Hamiltonian path, but the current implementation treats depot costs as
+          first-class optional terms rather than as a future extension.
         </p>
       </section>
 
@@ -480,9 +484,10 @@
         <p class="section-kicker">5. Cost model</p>
         <h2>The optimizer scores only transfer legs, using an energy-like fixed-wing cost</h2>
         <p>
-          The DP itself does not know geometry. Before the subset search starts, the backend evaluates connector
-          candidates between every ordered pair of area traversal modes. Those connectors already include terrain-aware
-          start and end altitudes, so the cost captures more than 2D distance.
+          The DP itself does not draw geometry while it searches. Before the subset search starts, the backend evaluates
+          connector candidates between every ordered pair of area traversal modes. When takeoff or landing endpoints
+          are present, it also evaluates endpoint-to-area and area-to-endpoint connector costs. Those connectors include
+          terrain-aware start and end altitudes, so the score captures more than 2D distance.
         </p>
         <div class="callout">
           <div class="section-kicker">Transfer cost</div>
@@ -490,6 +495,8 @@
         </div>
         <p>
           Coverage quality inside each area is excluded here because it was already optimized in the earlier stages.
+          The sequence optimizer changes transit order and flip choices; it does not re-plan strip spacing, camera
+          triggering, overlap, GSD, or exact-region coverage.
         </p>
       </section>
 
@@ -516,9 +523,10 @@
           </div>
         </div>
         <p>
-          In product terms, that growth is why the export backend uses exact DP only for small to medium missions.
-          The recurrence has the usual <strong>O(N<sup>2</sup> 2<sup>N</sup>)</strong> scaling, so beyond a chosen
-          threshold we switch to a greedy fallback to keep export latency bounded.
+          In product terms, that growth is why the backend uses exact DP only up to a configured mission size. The
+          current default and validation cap for <code>exactSearchMaxAreas</code> is <strong>17 areas</strong>, which
+          keeps the known 17-area Wingtra mission on the exact path by default. Larger missions, or requests that set
+          a lower exact-search limit, use the greedy fallback to keep latency bounded.
         </p>
       </section>
 
@@ -569,7 +577,7 @@
         <strong>1646.6</strong>, an improvement of
         <strong>79.1%</strong>.
       </p>
-      <p>This instance is larger than the default exact-search threshold, so in production we currently use a fallback heuristic. We still solved the exact DP offline here so the article can show the true optimum.</p>
+      <p>This 17-area instance is now inside the current default exact-search limit, so the backend can solve it with exact DP by default. The comparison below is therefore representative of the production exact path for this mission size.</p>
       <div class="metric-grid">
         <div class="metric-box">
           <div class="metric-label">Current transfer cost</div>
@@ -596,34 +604,63 @@
   
 
       <section>
-        <p class="section-kicker">8. What happens beyond the exact threshold?</p>
-        <h2>Above 12 areas, we currently fall back to greedy</h2>
+        <p class="section-kicker">8. Fallback path</p>
+        <h2>Beyond 17 areas, the fallback stays depot-aware</h2>
         <p>
-          In the deployed export path, the exact DP is not used for arbitrarily large missions. The current default is
-          <strong>12 areas</strong>, after which the backend switches to a greedy heuristic. That fallback is pragmatic:
-          the subset DP scales exponentially, and we do not always want to pay that cost during export.
+          Exact DP is the preferred path when the mission is within the configured limit, because it gives the true
+          optimum under the current transfer-cost model. For larger missions, the backend uses a greedy fallback. The
+          important current detail is that this fallback optimizes the same depot-aware objective rather than building
+          a free-start path and scoring the depot legs only after the fact.
         </p>
         <p>
-          But a heuristic is still a heuristic. To show why the exact method remains valuable, we generated synthetic
-          flat-terrain missions and solved them with both implementations. The example below uses the same greedy and
-          exact solver logic as the backend; the terrain is only flattened to isolate the sequencing logic itself.
+          The fallback starts with the single area and flip state that minimizes the full one-area mission cost,
+          including the optional takeoff and landing legs. It then inserts each remaining area at the cheapest position
+          in the current sequence, evaluating every insertion against the full path delta. Insertions at the front use
+          the takeoff edge when one exists; insertions at the back use the landing edge when one exists. After the
+          initial construction, the backend still runs local flip and swap improvement passes, and those passes are
+          scored with the same full objective.
         </p>
         <div class="metric-grid">
           <div class="metric-box">
-            <div class="metric-label">Counterexample</div>
-            <div class="metric-value">Seed 17</div>
-            <div class="metric-detail">13 areas in a zigzag synthetic layout.</div>
+            <div class="metric-label">Exact default</div>
+            <div class="metric-value">17</div>
+            <div class="metric-detail">Missions up to 17 areas use exact DP by default.</div>
           </div>
           <div class="metric-box">
-            <div class="metric-label">Greedy penalty</div>
-            <div class="metric-value">14.2%</div>
-            <div class="metric-detail">137.9 transfer-cost units worse than the exact optimum.</div>
+            <div class="metric-label">Fallback heuristic</div>
+            <div class="metric-value">Depot-aware</div>
+            <div class="metric-detail">Cheapest insertion plus flip/swap refinement under the same objective.</div>
+          </div>
+        </div>
+        <p>
+          The fallback is deliberately much stronger than a simple nearest-neighbor route builder, but it is still not
+          exact. To make that concrete, the benchmark below isolates the sequencing layer on a synthetic 9-area
+          edge-cost stress test using the current fallback logic. A 9-area mission would normally be solved exactly in
+          production; here we force the fallback only so the two solvers can be compared directly on the same state
+          space.
+        </p>
+        <div class="metric-grid">
+          <div class="metric-box">
+            <div class="metric-label">Greedy fallback cost</div>
+            <div class="metric-value">3324.1</div>
+            <div class="metric-detail">Current cheapest-insertion fallback with flip/swap refinement.</div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Exact DP cost</div>
+            <div class="metric-value">2374.3</div>
+            <div class="metric-detail">949.8 cost units lower, a 40.0% greedy penalty.</div>
           </div>
         </div>
         <figure>
-          <div class="embedded-figure"><svg xmlns='http://www.w3.org/2000/svg' width='1860' height='1060' viewBox='0 0 1860 1060'><defs><marker id='blue' markerWidth='10' markerHeight='10' refX='7' refY='4' orient='auto'><path d='M0,0 L0,8 L8,4 z' fill='#2563eb'/></marker><marker id='orange' markerWidth='10' markerHeight='10' refX='7' refY='4' orient='auto'><path d='M0,0 L0,8 L8,4 z' fill='#ea580c'/></marker></defs><rect width='1860' height='1060' fill='#f8fafc'/><text x='56' y='62' font-family='Iowan Old Style, Georgia, serif' font-size='42' font-weight='700' fill='#0f172a'>Synthetic fallback counterexample seed 17 (13 areas, zigzag family)</text><text x='56' y='102' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='20' fill='#475569'>This sits just beyond the default exactSearchMaxAreas=12 threshold used by the deployed export path.</text><text x='56' y='134' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='20' fill='#0f172a'>Greedy cost 1106.1 vs exact cost 968.1 — gap 137.9 (14.2%)</text><rect x='60' y='150' width='800' height='780' rx='24' fill='white' stroke='#cbd5e1' stroke-width='2'/><text x='84' y='186' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='28' font-weight='700' fill='#0f172a'>Greedy fallback</text><rect x='84' y='208' width='752' height='610' rx='18' fill='#f8fafc' stroke='#e2e8f0' stroke-width='1.5'/><polygon points='241.3,456.8 266.7,408.4 201.6,374.2 176.2,422.6' fill='#0f766e' fill-opacity='0.13' stroke='#0f766e' stroke-width='2'/><line x1='198.2' y1='380.7' x2='244.7' y2='450.4' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='198.2' cy='380.7' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='244.7' cy='450.4' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='4928157.9' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A2 #1</text><polygon points='271.3,466.7 350.0,391.5 327.7,368.1 249.0,443.4' fill='#9333ea' fill-opacity='0.13' stroke='#9333ea' stroke-width='2'/><line x1='252.9' y1='447.4' x2='346.1' y2='387.4' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='252.9' cy='447.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='346.1' cy='387.4' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='13616899.6' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A4 #2F</text><polygon points='365.7,460.4 454.9,437.2 446.0,403.1 356.8,426.2' fill='#dc2626' fill-opacity='0.13' stroke='#dc2626' stroke-width='2'/><line x1='373.1' y1='458.5' x2='438.6' y2='405.0' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='373.1' cy='458.5' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='438.6' cy='405.0' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='25454826.0' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A6 #3F</text><polygon points='469.8,430.1 489.9,380.0 463.5,369.4 443.4,419.6' fill='#ca8a04' fill-opacity='0.13' stroke='#ca8a04' stroke-width='2'/><line x1='446.5' y1='420.8' x2='486.8' y2='378.7' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='446.5' cy='420.8' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='486.8' cy='378.7' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='32223078.6' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A8 #4F</text><polygon points='606.3,364.8 652.9,456.5 716.6,424.2 670.1,332.5' fill='#be123c' fill-opacity='0.13' stroke='#be123c' stroke-width='2'/><line x1='612.7' y1='377.4' x2='710.2' y2='411.6' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='612.7' cy='377.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='710.2' cy='411.6' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='53910051.5' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A10 #5F</text><polygon points='705.2,452.5 773.3,449.9 771.2,393.5 703.1,396.2' fill='#15803d' fill-opacity='0.13' stroke='#15803d' stroke-width='2'/><line x1='703.2' y1='400.4' x2='773.2' y2='445.7' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='703.2' cy='400.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='773.2' cy='445.7' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='62451699.2' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A12 #6</text><polygon points='660.0,674.1 691.2,668.8 680.0,602.2 648.9,607.4' fill='#b45309' fill-opacity='0.13' stroke='#b45309' stroke-width='2'/><line x1='649.2' y1='609.4' x2='690.8' y2='666.8' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='649.2' cy='609.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='690.8' cy='666.8' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='54863633.4' y='1504313.6' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A13 #7</text><polygon points='636.8,672.2 666.0,693.5 702.1,644.1 673.0,622.7' fill='#1d4ed8' fill-opacity='0.13' stroke='#1d4ed8' stroke-width='2'/><line x1='666.8' y1='692.3' x2='672.1' y2='624.0' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='666.8' cy='692.3' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='672.1' cy='624.0' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='54800217.8' y='2669117.1' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A11 #8F</text><polygon points='489.9,588.2 546.2,640.0 578.0,605.5 521.7,553.7' fill='#4f46e5' fill-opacity='0.13' stroke='#4f46e5' stroke-width='2'/><line x1='557.2' y1='628.0' x2='510.7' y2='565.7' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='557.2' cy='628.0' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='510.7' cy='565.7' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='39717042.7' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A9 #9F</text><polygon points='300.5,689.7 383.5,623.8 355.0,587.9 272.0,653.7' fill='#16a34a' fill-opacity='0.13' stroke='#16a34a' stroke-width='2'/><line x1='381.0' y1='620.7' x2='274.5' y2='656.9' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='381.0' cy='620.7' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='274.5' cy='656.9' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='16760990.9' y='1757117.1' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A5 #10</text><polygon points='179.6,639.6 225.7,614.5 192.7,554.0 146.7,579.1' fill='#2563eb' fill-opacity='0.13' stroke='#2563eb' stroke-width='2'/><line x1='189.3' y1='555.9' x2='183.0' y2='637.8' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='189.3' cy='555.9' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='183.0' cy='637.8' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='1000444.8' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A1 #11</text><polygon points='221.7,620.8 277.9,668.9 329.9,608.2 273.8,560.1' fill='#ea580c' fill-opacity='0.13' stroke='#ea580c' stroke-width='2'/><line x1='281.6' y1='664.6' x2='270.1' y2='564.3' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='281.6' cy='664.6' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='270.1' cy='564.3' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='10982623.0' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A3 #12F</text><polygon points='445.6,638.0 532.2,691.8 562.7,642.6 476.1,588.9' fill='#0891b2' fill-opacity='0.13' stroke='#0891b2' stroke-width='2'/><line x1='448.0' y1='639.5' x2='560.3' y2='641.1' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='448.0' cy='639.5' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='560.3' cy='641.1' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='36395589.3' y='2669117.1' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A7 #13</text><polyline points='244.7,450.4 243.7,452.0 247.8,447.9 252.9,447.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='346.1,387.4 347.7,389.4 372.9,457.8 373.1,458.5' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='438.6,405.0 438.2,403.8 448.8,422.7 446.5,420.8' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='486.8,378.7 485.7,378.6 611.7,377.3 612.7,377.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='710.2,411.6 705.4,416.0 703.2,399.2 703.2,400.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='773.2,445.7 766.1,442.6 642.2,606.0 649.2,609.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='690.8,666.8 683.5,663.9 666.4,694.6 666.8,692.3' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='672.1,624.0 668.1,628.4 554.4,629.2 557.2,628.0' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='510.7,565.7 509.4,566.6 377.9,620.6 381.0,620.7' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='274.5,656.9 275.9,658.0 188.9,555.2 189.3,555.9' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='183.0,637.8 178.8,643.6 278.3,661.2 281.6,664.6' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='270.1,564.3 267.7,561.2 446.3,639.2 448.0,639.5' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><text x='84' y='856' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='16' fill='#475569'>transfer cost 1106.1</text><text x='84' y='884' font-family='IBM Plex Mono, Menlo, monospace' font-size='12.5' fill='#0f172a'>A2 → A4F → A6F → A8F → A10F → A12 → A13 → A11F → A9F → A5 → A1 → A3F → A7</text><rect x='1000' y='150' width='800' height='780' rx='24' fill='white' stroke='#cbd5e1' stroke-width='2'/><text x='1024' y='186' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='28' font-weight='700' fill='#0f172a'>Exact DP benchmark</text><rect x='1024' y='208' width='752' height='610' rx='18' fill='#f8fafc' stroke='#e2e8f0' stroke-width='1.5'/><polygon points='1181.3,456.8 1206.7,408.4 1141.6,374.2 1116.2,422.6' fill='#0f766e' fill-opacity='0.13' stroke='#0f766e' stroke-width='2'/><line x1='1138.2' y1='380.7' x2='1184.7' y2='450.4' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1138.2' cy='380.7' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1184.7' cy='450.4' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='4929097.9' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A2 #1</text><polygon points='1211.3,466.7 1290.0,391.5 1267.7,368.1 1189.0,443.4' fill='#9333ea' fill-opacity='0.13' stroke='#9333ea' stroke-width='2'/><line x1='1192.9' y1='447.4' x2='1286.1' y2='387.4' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1192.9' cy='447.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1286.1' cy='387.4' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='13617839.6' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A4 #2F</text><polygon points='1305.7,460.4 1394.9,437.2 1386.0,403.1 1296.8,426.2' fill='#dc2626' fill-opacity='0.13' stroke='#dc2626' stroke-width='2'/><line x1='1313.1' y1='458.5' x2='1378.6' y2='405.0' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1313.1' cy='458.5' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1378.6' cy='405.0' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='25455766.0' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A6 #3F</text><polygon points='1409.8,430.1 1429.9,380.0 1403.5,369.4 1383.4,419.6' fill='#ca8a04' fill-opacity='0.13' stroke='#ca8a04' stroke-width='2'/><line x1='1386.5' y1='420.8' x2='1426.8' y2='378.7' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1386.5' cy='420.8' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1426.8' cy='378.7' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='32224018.6' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A8 #4F</text><polygon points='1546.3,364.8 1592.9,456.5 1656.6,424.2 1610.1,332.5' fill='#be123c' fill-opacity='0.13' stroke='#be123c' stroke-width='2'/><line x1='1552.7' y1='377.4' x2='1650.2' y2='411.6' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1552.7' cy='377.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1650.2' cy='411.6' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='53910991.5' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A10 #5F</text><polygon points='1645.2,452.5 1713.3,449.9 1711.2,393.5 1643.1,396.2' fill='#15803d' fill-opacity='0.13' stroke='#15803d' stroke-width='2'/><line x1='1643.2' y1='400.4' x2='1713.2' y2='445.7' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1643.2' cy='400.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1713.2' cy='445.7' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='62452639.2' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A12 #6</text><polygon points='1600.0,674.1 1631.2,668.8 1620.0,602.2 1588.9,607.4' fill='#b45309' fill-opacity='0.13' stroke='#b45309' stroke-width='2'/><line x1='1589.2' y1='609.4' x2='1630.8' y2='666.8' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1589.2' cy='609.4' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1630.8' cy='666.8' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='54864573.4' y='1504313.6' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A13 #7</text><polygon points='1576.8,672.2 1606.0,693.5 1642.1,644.1 1613.0,622.7' fill='#1d4ed8' fill-opacity='0.13' stroke='#1d4ed8' stroke-width='2'/><line x1='1606.8' y1='692.3' x2='1612.1' y2='624.0' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1606.8' cy='692.3' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1612.1' cy='624.0' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='54801157.8' y='2669117.1' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A11 #8F</text><polygon points='1429.9,588.2 1486.2,640.0 1518.0,605.5 1461.7,553.7' fill='#4f46e5' fill-opacity='0.13' stroke='#4f46e5' stroke-width='2'/><line x1='1450.7' y1='565.7' x2='1497.2' y2='628.0' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1450.7' cy='565.7' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1497.2' cy='628.0' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='39717982.7' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A9 #9</text><polygon points='1385.6,638.0 1472.2,691.8 1502.7,642.6 1416.1,588.9' fill='#0891b2' fill-opacity='0.13' stroke='#0891b2' stroke-width='2'/><line x1='1500.3' y1='641.1' x2='1388.0' y2='639.5' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1500.3' cy='641.1' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1388.0' cy='639.5' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='36396529.3' y='2669117.1' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A7 #10F</text><polygon points='1240.5,689.7 1323.5,623.8 1295.0,587.9 1212.0,653.7' fill='#16a34a' fill-opacity='0.13' stroke='#16a34a' stroke-width='2'/><line x1='1321.0' y1='620.7' x2='1214.5' y2='656.9' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1321.0' cy='620.7' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1214.5' cy='656.9' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='16761930.9' y='1757117.1' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A5 #11</text><polygon points='1161.7,620.8 1217.9,668.9 1269.9,608.2 1213.8,560.1' fill='#ea580c' fill-opacity='0.13' stroke='#ea580c' stroke-width='2'/><line x1='1221.6' y1='664.6' x2='1210.1' y2='564.3' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1221.6' cy='664.6' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1210.1' cy='564.3' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='10983563.0' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A3 #12F</text><polygon points='1119.6,639.6 1165.7,614.5 1132.7,554.0 1086.7,579.1' fill='#2563eb' fill-opacity='0.13' stroke='#2563eb' stroke-width='2'/><line x1='1129.3' y1='555.9' x2='1123.0' y2='637.8' stroke='#2563eb' stroke-width='3' marker-end='url(#blue)'/><circle cx='1129.3' cy='555.9' r='5.4' fill='#16a34a' stroke='white' stroke-width='1.8'/><circle cx='1123.0' cy='637.8' r='5.4' fill='#dc2626' stroke='white' stroke-width='1.8'/><text x='1001384.8' y='-2667859.7' text-anchor='middle' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='14' font-weight='700' fill='#0f172a'>A1 #13</text><polyline points='1184.7,450.4 1183.7,452.0 1187.8,447.9 1192.9,447.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1286.1,387.4 1287.7,389.4 1312.9,457.8 1313.1,458.5' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1378.6,405.0 1378.2,403.8 1388.8,422.7 1386.5,420.8' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1426.8,378.7 1425.7,378.6 1551.7,377.3 1552.7,377.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1650.2,411.6 1645.4,416.0 1643.2,399.2 1643.2,400.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1713.2,445.7 1706.1,442.6 1582.2,606.0 1589.2,609.4' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1630.8,666.8 1623.5,663.9 1606.4,694.6 1606.8,692.3' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1612.1,624.0 1606.5,628.0 1449.4,559.2 1450.7,565.7' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1497.2,628.0 1492.6,628.8 1502.0,633.6 1500.3,641.1' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1388.0,639.5 1386.8,639.4 1320.5,620.5 1321.0,620.7' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1214.5,656.9 1215.8,663.3 1215.2,664.0 1214.9,664.8 1214.8,665.6 1215.0,666.5 1215.3,667.3 1215.8,668.0 1216.5,668.5 1217.3,668.8 1218.2,668.9 1219.0,668.7 1219.8,668.4 1220.5,667.9 1221.6,664.6' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><polyline points='1210.1,564.3 1205.4,568.8 1126.6,553.9 1129.3,555.9' fill='none' stroke='#ea580c' stroke-width='3' marker-end='url(#orange)'/><text x='1024' y='856' font-family='Avenir Next, Helvetica Neue, sans-serif' font-size='16' fill='#475569'>transfer cost 968.1</text><text x='1024' y='884' font-family='IBM Plex Mono, Menlo, monospace' font-size='12.5' fill='#0f172a'>A2 → A4F → A6F → A8F → A10F → A12 → A13 → A11F → A9 → A7F → A5 → A3F → A1</text></svg></div>
-          <figcaption><strong>Greedy is not equivalent to exact DP.</strong> On this synthetic 13-area mission, greedy costs 1106.1 while the exact DP finds a solution at 968.1.</figcaption>
+          <img class="intro-photo" src="/sequence-dp/current-greedy-exact-synthetic.svg" alt="Synthetic 9-area comparison where current greedy fallback costs 3324.1 and exact dynamic programming costs 2374.3">
+          <figcaption><strong>Exact DP still matters.</strong> Even with the current depot-aware cheapest-insertion fallback and local refinement, the heuristic can settle into a route that is materially worse than the exact dynamic program.</figcaption>
         </figure>
+        <p>
+          This distinction matters most on imported Wingtra missions with a home takeoff and landing point. A greedy
+          sequence that ignores those anchors while it is being built can choose a path whose first and last areas are
+          convenient for inter-area travel but expensive to reach from home. The current fallback avoids that class of
+          mistake by making the depot edges part of every construction and refinement decision.
+        </p>
       </section>
 
       <section>
@@ -631,15 +668,15 @@
         <h2>What this DP layer contributes to the overall mission pipeline</h2>
         <p>
           The key design choice is separation of concerns. One set of algorithms decides how to split the terrain and
-          what bearing each area should use. This DP layer assumes that work has already been done and solves the
-          remaining combinatorial problem exactly: in what order should the fixed areas be flown, and which ones
-          should be reversed?
+          what bearing each area should use. This sequencing layer assumes that work has already been done and solves
+          the remaining combinatorial problem: in what order should the fixed areas be flown, which ones should be
+          reversed, and how should optional takeoff and landing anchors influence the first and last legs?
         </p>
         <p>
           That is what makes this a good engineering use of dynamic programming. The state is compact, the overlap
-          between subproblems is large, and the exact answer is feasible on realistic mission sizes. When the greedy
-          heuristic matches the exact solution, DP gives us a certificate that nothing better exists. When it does not,
-          DP tells us exactly how much quality the heuristic left on the table.
+          between subproblems is large, and the exact answer is feasible on realistic mission sizes up to the current
+          threshold. When the mission is larger, the depot-aware greedy fallback uses the same cost model so the product
+          still optimizes the right objective, even though it no longer has an exact optimality certificate.
         </p>
       </section>
     </main>
