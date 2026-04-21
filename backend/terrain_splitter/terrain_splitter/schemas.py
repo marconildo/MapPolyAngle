@@ -338,7 +338,7 @@ class MissionOptimizeAreaSequenceRequest(BaseModel):
     minClearanceM: float = Field(60, ge=0)
     turnExtendM: float = Field(96, ge=0)  # deprecated compatibility field; current optimizer ignores it
     maxHeightAboveGroundM: float = Field(120, gt=0)
-    exactSearchMaxAreas: int = Field(15, ge=1, le=16)
+    exactSearchMaxAreas: int = Field(17, ge=1, le=17)
     transferCost: "MissionTransferCostModel" = Field(default_factory=lambda: MissionTransferCostModel())
     startEndpoint: MissionSequenceEndpointModel | None = None
     endEndpoint: MissionSequenceEndpointModel | None = None

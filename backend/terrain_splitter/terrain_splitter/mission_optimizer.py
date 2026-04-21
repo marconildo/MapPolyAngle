@@ -2199,6 +2199,55 @@ def _total_path_cost(
     return total
 
 
+def _single_area_path_cost(
+    node: tuple[int, bool],
+    start_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+    end_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+) -> float:
+    total = 0.0
+    if start_edge_lookup is not None:
+        total += start_edge_lookup[node].objective_cost
+    if end_edge_lookup is not None:
+        total += end_edge_lookup[node].objective_cost
+    return total
+
+
+def _path_insertion_cost_delta(
+    sequence: list[tuple[int, bool]],
+    node: tuple[int, bool],
+    insert_index: int,
+    edge_lookup: dict[tuple[int, bool, int, bool], _ConnectionCandidate],
+    start_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+    end_edge_lookup: dict[tuple[int, bool], _ConnectionCandidate] | None = None,
+) -> float:
+    if not sequence:
+        return _single_area_path_cost(node, start_edge_lookup, end_edge_lookup)
+
+    if insert_index <= 0:
+        first = sequence[0]
+        delta = edge_lookup[(node[0], node[1], first[0], first[1])].objective_cost
+        if start_edge_lookup is not None:
+            delta += start_edge_lookup[node].objective_cost
+            delta -= start_edge_lookup[first].objective_cost
+        return delta
+
+    if insert_index >= len(sequence):
+        last = sequence[-1]
+        delta = edge_lookup[(last[0], last[1], node[0], node[1])].objective_cost
+        if end_edge_lookup is not None:
+            delta += end_edge_lookup[node].objective_cost
+            delta -= end_edge_lookup[last].objective_cost
+        return delta
+
+    previous = sequence[insert_index - 1]
+    following = sequence[insert_index]
+    return (
+        edge_lookup[(previous[0], previous[1], node[0], node[1])].objective_cost
+        + edge_lookup[(node[0], node[1], following[0], following[1])].objective_cost
+        - edge_lookup[(previous[0], previous[1], following[0], following[1])].objective_cost
+    )
+
+
 def _solve_exact_path(
     area_count: int,
     edge_lookup: dict[tuple[int, bool, int, bool], _ConnectionCandidate],
@@ -2273,54 +2322,96 @@ def _solve_greedy_path(
     if area_count <= 0:
         return []
 
-    best_sequence: list[tuple[int, bool]] | None = None
-    best_cost = math.inf
+    seed: tuple[int, bool] | None = None
+    seed_cost = math.inf
+    for area_index in range(area_count):
+        for flipped in (False, True):
+            node = (area_index, flipped)
+            candidate_cost = _single_area_path_cost(node, start_edge_lookup, end_edge_lookup)
+            if candidate_cost + 1e-9 < seed_cost:
+                seed = node
+                seed_cost = candidate_cost
 
-    for start_area_index in range(area_count):
-        for start_flipped in (False, True):
-            visited = {start_area_index}
-            sequence = [(start_area_index, start_flipped)]
-            while len(sequence) < area_count:
-                last_area_index, last_flipped = sequence[-1]
-                best_next: tuple[int, bool] | None = None
-                best_next_cost = math.inf
-                for next_area_index in range(area_count):
-                    if next_area_index in visited:
-                        continue
-                    for next_flipped in (False, True):
-                        edge = edge_lookup[(last_area_index, last_flipped, next_area_index, next_flipped)]
-                        if edge.objective_cost < best_next_cost:
-                            best_next_cost = edge.objective_cost
-                            best_next = (next_area_index, next_flipped)
-                if best_next is None:
-                    break
-                visited.add(best_next[0])
-                sequence.append(best_next)
+    if seed is None:
+        return [(index, False) for index in range(area_count)]
 
-            improved = True
-            while improved:
-                improved = False
-                for position in range(len(sequence)):
-                    candidate = list(sequence)
-                    area_index, flipped = candidate[position]
-                    candidate[position] = (area_index, not flipped)
-                    if _total_path_cost(candidate, edge_lookup, start_edge_lookup, end_edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup):
-                        sequence = candidate
-                        improved = True
+    visited = {seed[0]}
+    sequence = [seed]
 
-            for left_index in range(len(sequence)):
-                for right_index in range(left_index + 1, len(sequence)):
-                    candidate = list(sequence)
-                    candidate[left_index], candidate[right_index] = candidate[right_index], candidate[left_index]
-                    if _total_path_cost(candidate, edge_lookup, start_edge_lookup, end_edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup):
-                        sequence = candidate
+    while len(sequence) < area_count:
+        best_candidate: tuple[int, bool] | None = None
+        best_insert_index = 0
+        best_delta = math.inf
+        for next_area_index in range(area_count):
+            if next_area_index in visited:
+                continue
+            for next_flipped in (False, True):
+                candidate_node = (next_area_index, next_flipped)
+                for insert_index in range(len(sequence) + 1):
+                    delta = _path_insertion_cost_delta(
+                        sequence,
+                        candidate_node,
+                        insert_index,
+                        edge_lookup,
+                        start_edge_lookup,
+                        end_edge_lookup,
+                    )
+                    if delta + 1e-9 < best_delta:
+                        best_delta = delta
+                        best_candidate = candidate_node
+                        best_insert_index = insert_index
+        if best_candidate is None:
+            break
+        visited.add(best_candidate[0])
+        sequence.insert(best_insert_index, best_candidate)
 
-            sequence_cost = _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup)
-            if sequence_cost < best_cost:
-                best_cost = sequence_cost
-                best_sequence = sequence
+    current_cost = _total_path_cost(
+        sequence,
+        edge_lookup,
+        start_edge_lookup,
+        end_edge_lookup,
+    )
 
-    return best_sequence or [(index, False) for index in range(area_count)]
+    improved = True
+    while improved:
+        improved = False
+        for position in range(len(sequence)):
+            candidate = list(sequence)
+            area_index, flipped = candidate[position]
+            candidate[position] = (area_index, not flipped)
+            candidate_cost = _total_path_cost(
+                candidate,
+                edge_lookup,
+                start_edge_lookup,
+                end_edge_lookup,
+            )
+            if candidate_cost + 1e-9 < current_cost:
+                sequence = candidate
+                current_cost = candidate_cost
+                improved = True
+
+    improved = True
+    while improved:
+        improved = False
+        for left_index in range(len(sequence)):
+            for right_index in range(left_index + 1, len(sequence)):
+                candidate = list(sequence)
+                candidate[left_index], candidate[right_index] = (
+                    candidate[right_index],
+                    candidate[left_index],
+                )
+                candidate_cost = _total_path_cost(
+                    candidate,
+                    edge_lookup,
+                    start_edge_lookup,
+                    end_edge_lookup,
+                )
+                if candidate_cost + 1e-9 < current_cost:
+                    sequence = candidate
+                    current_cost = candidate_cost
+                    improved = True
+
+    return sequence
 
 
 def optimize_area_sequence(
