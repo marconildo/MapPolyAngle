@@ -2365,6 +2365,13 @@ def _solve_greedy_path(
         visited.add(best_candidate[0])
         sequence.insert(best_insert_index, best_candidate)
 
+    current_cost = _total_path_cost(
+        sequence,
+        edge_lookup,
+        start_edge_lookup,
+        end_edge_lookup,
+    )
+
     improved = True
     while improved:
         improved = False
@@ -2372,8 +2379,15 @@ def _solve_greedy_path(
             candidate = list(sequence)
             area_index, flipped = candidate[position]
             candidate[position] = (area_index, not flipped)
-            if _total_path_cost(candidate, edge_lookup, start_edge_lookup, end_edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup):
+            candidate_cost = _total_path_cost(
+                candidate,
+                edge_lookup,
+                start_edge_lookup,
+                end_edge_lookup,
+            )
+            if candidate_cost + 1e-9 < current_cost:
                 sequence = candidate
+                current_cost = candidate_cost
                 improved = True
 
     improved = True
@@ -2382,9 +2396,19 @@ def _solve_greedy_path(
         for left_index in range(len(sequence)):
             for right_index in range(left_index + 1, len(sequence)):
                 candidate = list(sequence)
-                candidate[left_index], candidate[right_index] = candidate[right_index], candidate[left_index]
-                if _total_path_cost(candidate, edge_lookup, start_edge_lookup, end_edge_lookup) + 1e-9 < _total_path_cost(sequence, edge_lookup, start_edge_lookup, end_edge_lookup):
+                candidate[left_index], candidate[right_index] = (
+                    candidate[right_index],
+                    candidate[left_index],
+                )
+                candidate_cost = _total_path_cost(
+                    candidate,
+                    edge_lookup,
+                    start_edge_lookup,
+                    end_edge_lookup,
+                )
+                if candidate_cost + 1e-9 < current_cost:
                     sequence = candidate
+                    current_cost = candidate_cost
                     improved = True
 
     return sequence
